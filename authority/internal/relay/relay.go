@@ -124,6 +124,29 @@ func GetActiveRelays(ctx context.Context, pool *pgxpool.Pool) ([]Relay, error) {
 		 ORDER BY created_at`)
 }
 
+// PickRandomActiveByRole returns one active relay with the requested role,
+// chosen uniformly at random from the eligible pool. It returns
+// pgx.ErrNoRows when no active relay of that role exists; callers should
+// map that to a 503 rather than a 500.
+func PickRandomActiveByRole(ctx context.Context, pool *pgxpool.Pool, role string) (*Relay, error) {
+	if !validRole(role) {
+		return nil, ErrInvalidRole
+	}
+	r := &Relay{}
+	err := pool.QueryRow(ctx,
+		`SELECT id, endpoint, region, role, status, last_heartbeat
+		 FROM relay_nodes
+		 WHERE role = $1 AND status = 'active'
+		 ORDER BY random()
+		 LIMIT 1`,
+		role,
+	).Scan(&r.ID, &r.Endpoint, &r.Region, &r.Role, &r.Status, &r.LastHeartbeat)
+	if err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
 // SweepInactiveRelays marks any active relay as inactive when its last heartbeat
 // is older than ttl (or absent). Returns the number of rows affected.
 func SweepInactiveRelays(ctx context.Context, pool *pgxpool.Pool, ttl time.Duration) (int64, error) {

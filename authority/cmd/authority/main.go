@@ -58,6 +58,7 @@ func main() {
 	ah := handlers.NewAuthHandler(database.Pool, jm)
 	rh := handlers.NewRelayHandler(database.Pool, cfg.RelayAPIKeySalt, cfg.AllowedRelayIPs)
 	th := handlers.NewTokenHandler(database.Pool, signer)
+	ch := handlers.NewCircuitHandler(database.Pool)
 
 	r := chi.NewRouter()
 	r.Get("/health", handlers.Health(database.Pool))
@@ -72,6 +73,7 @@ func main() {
 			r.Use(handlers.Authenticate(jm, database.Pool))
 			r.Post("/api/v1/auth/logout", ah.Logout)
 			r.Post("/api/v1/tokens/issue", th.HandleIssue)
+			r.Get("/api/v1/circuits/route", ch.HandleRoute)
 			r.Group(func(r chi.Router) {
 				r.Use(handlers.RequireRole("admin"))
 				r.Post("/api/v1/admin/relays/provision", rh.HandleProvisionRelay)
