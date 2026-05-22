@@ -149,6 +149,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
+	expires := time.Now().Add(8 * time.Hour)
 	http.SetCookie(w, &http.Cookie{
 		Name:     "session_id",
 		Value:    sessID,
@@ -156,7 +157,19 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		Secure:   true,
 		SameSite: http.SameSiteStrictMode,
 		Path:     "/",
-		Expires:  time.Now().Add(8 * time.Hour),
+		Expires:  expires,
+	})
+	// The JWT is delivered both in the response body (for API clients
+	// using Authorization: Bearer) and as an HttpOnly cookie (so the
+	// dashboard never touches the token value from JavaScript).
+	http.SetCookie(w, &http.Cookie{
+		Name:     "jwt",
+		Value:    tok,
+		HttpOnly: true,
+		Secure:   true,
+		SameSite: http.SameSiteStrictMode,
+		Path:     "/",
+		Expires:  expires,
 	})
 	writeJSON(w, http.StatusOK, map[string]string{"token": tok})
 }
@@ -168,15 +181,17 @@ func (h *AuthHandler) Logout(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	http.SetCookie(w, &http.Cookie{
-		Name:     "session_id",
-		Value:    "",
-		HttpOnly: true,
-		Secure:   true,
-		SameSite: http.SameSiteStrictMode,
-		Path:     "/",
-		MaxAge:   -1,
-	})
+	for _, name := range []string{"session_id", "jwt"} {
+		http.SetCookie(w, &http.Cookie{
+			Name:     name,
+			Value:    "",
+			HttpOnly: true,
+			Secure:   true,
+			SameSite: http.SameSiteStrictMode,
+			Path:     "/",
+			MaxAge:   -1,
+		})
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -212,9 +227,13 @@ func (h *AuthHandler) Register(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
+	// Phase 5 onboarding gate: status is omitted from the INSERT so the
+	// column default ('pending_review' after migration 003) applies. An
+	// admin must approve the subscriber via POST /api/v1/admin/subscribers/:id/approve
+	// before circuit access and token issuance unlock.
 	_, err = h.pool.Exec(r.Context(),
-		`INSERT INTO subscriptions (subscriber_id, tier, status, current_period_start, current_period_end)
-		 VALUES ($1, 'free', 'active', NOW(), NOW() + INTERVAL '30 days')`,
+		`INSERT INTO subscriptions (subscriber_id, tier, current_period_start, current_period_end)
+		 VALUES ($1, 'free', NOW(), NOW() + INTERVAL '30 days')`,
 		id,
 	)
 	if err != nil {
