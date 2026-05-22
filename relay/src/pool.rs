@@ -32,11 +32,11 @@ pub struct PooledConn {
 }
 
 impl PooledConn {
-    /// Constructor used by tests and by the (currently test-only) release
-    /// path. Production opens TcpStreams directly via dial+handshake and
-    /// hands them to the circuit owner; pooling for reuse is gated by a
-    /// future link/circuit-decoupling change.
-    #[cfg(test)]
+    /// Wrap a freshly handshaked TCP stream for storage in the pool.
+    /// Production callers create these when releasing an outbound
+    /// stream at the end of a circuit; the stream is in the
+    /// "between-circuits" protocol state (the listener side is blocked
+    /// reading the next CIRCUIT_START signal byte).
     pub fn new(stream: TcpStream) -> Self {
         Self {
             stream,
@@ -76,11 +76,11 @@ impl ConnectionPool {
         conn
     }
 
-    /// Return a connection to the pool for future reuse. Gated to test
-    /// builds while the binary's circuit lifecycle owns each outbound
-    /// TCP for the full circuit duration; a future link/circuit-
-    /// decoupling change will make this part of the production API.
-    #[cfg(test)]
+    /// Return a connection to the pool for future reuse. After Phase
+    /// 4c's CIRCUIT_START signal protocol, an outbound stream is in
+    /// the "listener waiting for next pk" state at circuit end and is
+    /// safe to hand back. The next `acquire` will write a fresh
+    /// CIRCUIT_START + client pubkey to reuse this stream.
     pub fn release(&self, addr: SocketAddr, mut conn: PooledConn) {
         conn.last_used = Instant::now();
         let mut guard = self
@@ -123,8 +123,9 @@ impl ConnectionPool {
         guard.values().map(|v| v.len()).sum()
     }
 
-    /// Test-only convenience around `len()`.
-    #[cfg(test)]
+    /// Convenience around `len()` — used by tests and by the pool-
+    /// sweep log to skip noisy "0 evicted" messages when nothing was
+    /// pooled to begin with.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }

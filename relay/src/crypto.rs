@@ -52,6 +52,12 @@ pub enum CryptoError {
 /// A derived AES-256-GCM session key. The bytes are kept on the stack via
 /// a fixed-size array; `Drop` zeroes them so the key does not persist in
 /// the relay's memory beyond the circuit's lifetime.
+///
+/// `Clone` is implemented so a circuit handler can hold a private copy
+/// for the duration of its bidirectional select loop without juggling
+/// borrows. Each clone has its own memory and zeroes independently on
+/// drop, so the cloned-key lifetime is the same as the original's.
+#[derive(Clone)]
 pub struct SessionKey([u8; AES_KEY_LEN]);
 
 impl SessionKey {
