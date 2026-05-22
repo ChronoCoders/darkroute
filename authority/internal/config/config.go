@@ -12,6 +12,7 @@ type Config struct {
 	JWTSecret       string
 	RSAKeyPath      string
 	RelayAPIKeySalt string
+	AllowedRelayIPs []string
 	Port            string
 	Environment     string
 }
@@ -30,9 +31,24 @@ func Load() *Config {
 		JWTSecret:       os.Getenv("JWT_SECRET"),
 		RSAKeyPath:      os.Getenv("RSA_KEY_PATH"),
 		RelayAPIKeySalt: os.Getenv("RELAY_API_KEY_SALT"),
+		AllowedRelayIPs: parseIPList(os.Getenv("ALLOWED_RELAY_IPS")),
 		Port:            port,
 		Environment:     os.Getenv("ENVIRONMENT"),
 	}
+}
+
+func parseIPList(raw string) []string {
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func (c *Config) Validate() error {

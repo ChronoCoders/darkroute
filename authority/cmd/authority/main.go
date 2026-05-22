@@ -19,6 +19,7 @@ import (
 	"github.com/dslabs/darkroute/authority/internal/config"
 	"github.com/dslabs/darkroute/authority/internal/db"
 	"github.com/dslabs/darkroute/authority/internal/handlers"
+	"github.com/dslabs/darkroute/authority/internal/relay"
 )
 
 func main() {
@@ -47,6 +48,7 @@ func main() {
 
 	jm := auth.NewJWTManager(cfg.JWTSecret)
 	ah := handlers.NewAuthHandler(database.Pool, jm)
+	rh := handlers.NewRelayHandler(database.Pool, cfg.RelayAPIKeySalt, cfg.AllowedRelayIPs)
 
 	r := chi.NewRouter()
 	r.Get("/health", handlers.Health(database.Pool))
@@ -55,16 +57,19 @@ func main() {
 		r.Use(handlers.RequestID, handlers.Logger)
 		r.Post("/api/v1/auth/register", ah.Register)
 		r.Post("/api/v1/auth/login", ah.Login)
+		r.Post("/api/v1/relay/heartbeat", rh.HandleRelayHeartbeat)
 		r.Group(func(r chi.Router) {
 			r.Use(handlers.Authenticate(jm, database.Pool))
 			r.Post("/api/v1/auth/logout", ah.Logout)
+			r.Post("/api/v1/admin/relays/provision", rh.HandleProvisionRelay)
+			r.Get("/api/v1/admin/relays", rh.HandleListRelays)
 		})
 	})
 
 	var bgWG sync.WaitGroup
 	bgWG.Add(2)
 	go runSessionCleanup(ctx, &bgWG, database.Pool)
-	go runRelayHealthSweep(ctx, &bgWG)
+	go runRelayHealthSweep(ctx, &bgWG, database.Pool)
 
 	srv := &http.Server{
 		Addr:              ":" + cfg.Port,
@@ -120,16 +125,26 @@ func runSessionCleanup(ctx context.Context, wg *sync.WaitGroup, pool *pgxpool.Po
 	}
 }
 
-func runRelayHealthSweep(ctx context.Context, wg *sync.WaitGroup) {
+func runRelayHealthSweep(ctx context.Context, wg *sync.WaitGroup, pool *pgxpool.Pool) {
 	defer wg.Done()
 	t := time.NewTicker(30 * time.Second)
 	defer t.Stop()
+	const inactivityTTL = 90 * time.Second
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			slog.Info("relay health sweep running")
+			cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			n, err := relay.SweepInactiveRelays(cctx, pool, inactivityTTL)
+			cancel()
+			if err != nil {
+				slog.Error("relay sweep failed", "err", err)
+				continue
+			}
+			if n > 0 {
+				slog.Info("relay sweep", "marked_inactive", n)
+			}
 		}
 	}
 }
