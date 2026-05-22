@@ -34,6 +34,7 @@ type RelayNode struct {
 	APIKeyHash    string
 	Endpoint      string
 	Region        string
+	Role          string
 	Status        string
 	LastHeartbeat *time.Time
 	CreatedAt     time.Time
