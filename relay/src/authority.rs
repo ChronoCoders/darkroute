@@ -21,9 +21,6 @@ pub enum AuthorityError {
 /// during operation — rotation requires a relay restart.
 #[derive(Debug)]
 pub struct AuthorityClient {
-    // Consumed in Phase 3 by token verification. Field is populated and pinned
-    // here so the relay refuses to start without a valid authority key.
-    #[allow(dead_code)]
     pubkey: RsaPublicKey,
 }
 
@@ -50,7 +47,6 @@ impl AuthorityClient {
         Ok(Self { pubkey })
     }
 
-    #[allow(dead_code)] // wired into token verification in Phase 3
     pub fn pubkey(&self) -> &RsaPublicKey {
         &self.pubkey
     }

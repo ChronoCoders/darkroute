@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/dslabs/darkroute/authority/internal/auth"
+	"github.com/dslabs/darkroute/authority/internal/blind"
 	"github.com/dslabs/darkroute/authority/internal/config"
 	"github.com/dslabs/darkroute/authority/internal/db"
 	"github.com/dslabs/darkroute/authority/internal/handlers"
@@ -46,21 +47,31 @@ func main() {
 	}
 	defer database.Close()
 
+	signer, err := blind.LoadOrGenerate(cfg.RSAKeyPath)
+	if err != nil {
+		slog.Error("rsa key load/generate failed", "err", err, "path", cfg.RSAKeyPath)
+		os.Exit(1)
+	}
+	slog.Info("rsa signing key ready", "path", cfg.RSAKeyPath, "modulus_bits", blind.RSAKeySize)
+
 	jm := auth.NewJWTManager(cfg.JWTSecret)
 	ah := handlers.NewAuthHandler(database.Pool, jm)
 	rh := handlers.NewRelayHandler(database.Pool, cfg.RelayAPIKeySalt, cfg.AllowedRelayIPs)
+	th := handlers.NewTokenHandler(database.Pool, signer)
 
 	r := chi.NewRouter()
 	r.Get("/health", handlers.Health(database.Pool))
 
 	r.Group(func(r chi.Router) {
 		r.Use(handlers.RequestID, handlers.Logger)
+		r.Get("/api/v1/authority/pubkey", th.HandlePubkey)
 		r.Post("/api/v1/auth/register", ah.Register)
 		r.Post("/api/v1/auth/login", ah.Login)
 		r.Post("/api/v1/relay/heartbeat", rh.HandleRelayHeartbeat)
 		r.Group(func(r chi.Router) {
 			r.Use(handlers.Authenticate(jm, database.Pool))
 			r.Post("/api/v1/auth/logout", ah.Logout)
+			r.Post("/api/v1/tokens/issue", th.HandleIssue)
 			r.Post("/api/v1/admin/relays/provision", rh.HandleProvisionRelay)
 			r.Get("/api/v1/admin/relays", rh.HandleListRelays)
 		})

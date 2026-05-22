@@ -232,6 +232,7 @@ dependencies = [
  "hex",
  "num-bigint",
  "prometheus",
+ "rand_core 0.6.4",
  "reqwest",
  "rsa",
  "rustls",

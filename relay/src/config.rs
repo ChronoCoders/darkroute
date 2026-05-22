@@ -52,17 +52,11 @@ pub struct RelayConfig {
     pub relay_port: u16,
     pub metrics_port: u16,
     pub replay_window_ttl: u64,
-    // Fields below are populated and validated here but consumed in later
-    // phases (circuit admission, exit dialing). They are kept in the public
-    // surface so Phase 3+ code does not need to re-parse the env.
-    #[allow(dead_code)]
     pub max_circuits: u32,
     pub node_id: String,
     /// Required when role == Exit.
-    #[allow(dead_code)]
     pub decodo_proxy_url: Option<String>,
     /// Required when role == Exit. Defaults to `[80, 443]` if unset.
-    #[allow(dead_code)]
     pub allowed_exit_ports: Vec<u16>,
 }
 
