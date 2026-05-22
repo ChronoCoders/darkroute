@@ -1,0 +1,8 @@
+.env
+.env.*
+!.env.example
+*.local
+target/
+dist/
+.next/
+node_modules/
