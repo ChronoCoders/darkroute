@@ -186,6 +186,87 @@ where
         .map_err(|_| CryptoError::Aead)
 }
 
+/// Encrypt `plaintext` to a complete wire-frame `Vec<u8>` rather than
+/// streaming it. Used by the integration test's mock client to construct
+/// layered onion-encrypted payloads before sending the outermost frame.
+#[cfg(test)]
+pub fn encrypt_frame(key: &SessionKey, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    if plaintext.len() > MAX_FRAME_PLAINTEXT {
+        return Err(CryptoError::FrameTooLarge(u32::MAX));
+    }
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    OsRng.fill_bytes(&mut nonce_bytes);
+    let nonce = Nonce::from_slice(&nonce_bytes);
+    let ciphertext = key
+        .cipher()
+        .encrypt(nonce, plaintext)
+        .map_err(|_| CryptoError::Aead)?;
+    let len = ciphertext.len() as u32;
+    let mut out = Vec::with_capacity(NONCE_LEN + 4 + ciphertext.len());
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+/// Decrypt a complete wire-frame from a byte slice rather than a reader.
+/// Mirror of `encrypt_frame` for the test client's onion-decryption path.
+#[cfg(test)]
+pub fn decrypt_frame(key: &SessionKey, frame: &[u8]) -> Result<Vec<u8>, CryptoError> {
+    if frame.len() < NONCE_LEN + 4 {
+        return Err(CryptoError::FrameTooShort);
+    }
+    let ct_len = u32::from_be_bytes([
+        frame[NONCE_LEN],
+        frame[NONCE_LEN + 1],
+        frame[NONCE_LEN + 2],
+        frame[NONCE_LEN + 3],
+    ]) as usize;
+    if ct_len < TAG_LEN {
+        return Err(CryptoError::FrameTooShort);
+    }
+    if NONCE_LEN + 4 + ct_len != frame.len() {
+        return Err(CryptoError::FrameTooShort);
+    }
+    let nonce = Nonce::from_slice(&frame[..NONCE_LEN]);
+    key.cipher()
+        .decrypt(nonce, &frame[NONCE_LEN + 4..])
+        .map_err(|_| CryptoError::Aead)
+}
+
+/// Read one frame from `reader` WITHOUT decrypting and return the raw
+/// on-wire bytes (`nonce || length || ciphertext+tag`). Used by relays in
+/// the backward direction: the receiving relay decrypts later layers, so
+/// this relay just forwards the bytes verbatim wrapped inside its own
+/// RELAY cell.
+///
+/// The length-cap check protects against an upstream peer lying about
+/// the ciphertext length and forcing this relay to allocate megabytes.
+pub async fn read_frame_bytes<R>(reader: &mut R) -> Result<Vec<u8>, CryptoError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut header = [0u8; NONCE_LEN + 4];
+    reader.read_exact(&mut header).await?;
+    let ct_len = u32::from_be_bytes([
+        header[NONCE_LEN],
+        header[NONCE_LEN + 1],
+        header[NONCE_LEN + 2],
+        header[NONCE_LEN + 3],
+    ]);
+    if (ct_len as usize) < TAG_LEN {
+        return Err(CryptoError::FrameTooShort);
+    }
+    if (ct_len as usize) > MAX_FRAME_CIPHERTEXT {
+        return Err(CryptoError::FrameTooLarge(ct_len));
+    }
+    let mut out = Vec::with_capacity(NONCE_LEN + 4 + ct_len as usize);
+    out.extend_from_slice(&header);
+    out.resize(NONCE_LEN + 4 + ct_len as usize, 0);
+    reader.read_exact(&mut out[NONCE_LEN + 4..]).await?;
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

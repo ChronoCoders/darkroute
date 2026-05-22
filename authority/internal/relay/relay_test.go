@@ -106,6 +106,59 @@ func TestProvisionAndSweep(t *testing.T) {
 	}
 }
 
+// TestPickRandomActiveByRoleExcludesIDs verifies the distinct-host
+// enforcement: PickRandomActiveByRole must never return a relay whose ID
+// is in the exclusion list, and must return pgx.ErrNoRows when the
+// eligible pool is empty after exclusion. This is the mechanism by which
+// the circuit-route handler guarantees three distinct hops per
+// SECURITY_MODEL §9.
+func TestPickRandomActiveByRoleExcludesIDs(t *testing.T) {
+	pool := testPool(t)
+	defer pool.Close()
+	ctx := context.Background()
+
+	seedActiveGuard := func() string {
+		var id string
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO relay_nodes (id, api_key_hash, endpoint, region, role, status, last_heartbeat)
+			 VALUES (gen_random_uuid(), $1, $2, 'us-east', 'guard', 'active', NOW())
+			 RETURNING id`,
+			"test-hash-exclude-"+time.Now().Format("150405.000000")+"-"+strings.Repeat("x", 4),
+			"10.0.0.99:9001",
+		).Scan(&id); err != nil {
+			t.Fatalf("seed guard: %v", err)
+		}
+		t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM relay_nodes WHERE id = $1`, id) })
+		return id
+	}
+
+	g1 := seedActiveGuard()
+	g2 := seedActiveGuard()
+
+	// With no exclusion, must return one of the two.
+	r, err := PickRandomActiveByRole(ctx, pool, "guard")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if r.ID != g1 && r.ID != g2 {
+		t.Fatalf("returned id %q is neither seeded guard", r.ID)
+	}
+
+	// Excluding g1 must return g2 deterministically (single eligible row).
+	r, err = PickRandomActiveByRole(ctx, pool, "guard", g1)
+	if err != nil {
+		t.Fatalf("unexpected error excluding g1: %v", err)
+	}
+	if r.ID != g2 {
+		t.Errorf("excluding g1 returned %q, expected g2 (%q)", r.ID, g2)
+	}
+
+	// Excluding both must return pgx.ErrNoRows.
+	if _, err := PickRandomActiveByRole(ctx, pool, "guard", g1, g2); err == nil {
+		t.Errorf("expected error when both guards excluded, got nil")
+	}
+}
+
 func TestProvisionRejectsInvalidRole(t *testing.T) {
 	// No DB needed — the role check happens before any query.
 	_, _, err := ProvisionRelay(context.Background(), nil, "salt", "endpoint", "region", "admin")

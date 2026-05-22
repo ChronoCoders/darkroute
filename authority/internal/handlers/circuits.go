@@ -36,17 +36,22 @@ type circuitRouteResponse struct {
 }
 
 func (h *CircuitHandler) HandleRoute(w http.ResponseWriter, r *http.Request) {
+	// SECURITY_MODEL §9 requires three distinct physical relays across
+	// guard/middle/exit. Each pick excludes IDs already chosen so the
+	// same node can never serve two roles in the same circuit; if any
+	// pick has no eligible relay (because the eligible pool is empty
+	// after exclusion), the whole request fails with 503.
 	guard, err := relay.PickRandomActiveByRole(r.Context(), h.pool, "guard")
 	if err != nil {
 		writeRouteError(w, err)
 		return
 	}
-	middle, err := relay.PickRandomActiveByRole(r.Context(), h.pool, "middle")
+	middle, err := relay.PickRandomActiveByRole(r.Context(), h.pool, "middle", guard.ID)
 	if err != nil {
 		writeRouteError(w, err)
 		return
 	}
-	exit, err := relay.PickRandomActiveByRole(r.Context(), h.pool, "exit")
+	exit, err := relay.PickRandomActiveByRole(r.Context(), h.pool, "exit", guard.ID, middle.ID)
 	if err != nil {
 		writeRouteError(w, err)
 		return
