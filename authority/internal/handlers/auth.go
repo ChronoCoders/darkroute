@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net/http"
 	"net/mail"
-	"strings"
 	"sync"
 	"time"
 
@@ -15,6 +14,20 @@ import (
 
 	"github.com/dslabs/darkroute/authority/internal/auth"
 )
+
+// dummyPasswordHash is a precomputed Argon2id hash used to equalize timing
+// when the login flow looks up an email that does not exist. Without it,
+// the absence of the Argon2id step on the unknown-user path is observable
+// via response timing, defeating the constant-time hash comparison.
+var dummyPasswordHash = func() string {
+	h, err := auth.HashPassword("dummy-password-only-for-timing-equalization")
+	if err != nil {
+		// HashPassword only fails if crypto/rand is broken, which is fatal
+		// for the whole authority anyway.
+		panic("init dummy password hash: " + err.Error())
+	}
+	return h
+}()
 
 type AuthHandler struct {
 	pool *pgxpool.Pool
@@ -56,7 +69,14 @@ func (r *rateLimiter) check(ip string) bool {
 			fresh = append(fresh, t)
 		}
 	}
-	r.attempts[ip] = fresh
+	// Bound the map: GC the entry entirely when no recent attempts remain.
+	// This keeps the table sized to the number of IPs with active attempts
+	// rather than every IP that ever connected.
+	if len(fresh) == 0 {
+		delete(r.attempts, ip)
+	} else {
+		r.attempts[ip] = fresh
+	}
 	return len(fresh) < r.limit
 }
 
@@ -64,17 +84,6 @@ func (r *rateLimiter) record(ip string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.attempts[ip] = append(r.attempts[ip], time.Now())
-}
-
-func clientIP(req *http.Request) string {
-	if f := req.Header.Get("X-Forwarded-For"); f != "" {
-		return strings.TrimSpace(strings.Split(f, ",")[0])
-	}
-	host := req.RemoteAddr
-	if i := strings.LastIndex(host, ":"); i != -1 {
-		host = host[:i]
-	}
-	return host
 }
 
 type credentials struct {
@@ -91,7 +100,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
-	ip := clientIP(r)
+	// peerIP is the TCP peer (net.SplitHostPort-safe). X-Forwarded-For is
+	// not honored because the authority listens directly on a public port
+	// and any client could supply that header to bypass the rate limiter.
+	ip := peerIP(r)
 	if !h.rl.check(ip) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate_limited"})
 		return
@@ -106,6 +118,10 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		`SELECT id, password, role FROM subscribers WHERE email = $1`, req.Email,
 	).Scan(&id, &hash, &role)
 	if err != nil {
+		// Equalize timing on unknown email — without this Argon2id run, the
+		// absence of the verify step on the missing-user path is observable
+		// via response timing and enumerates registered emails.
+		_, _ = auth.VerifyPassword(req.Password, dummyPasswordHash)
 		h.rl.record(ip)
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid_credentials"})
 		return

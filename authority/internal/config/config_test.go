@@ -91,14 +91,16 @@ func TestValidateRejectsLocalhostInProduction(t *testing.T) {
 	}
 }
 
-func TestValidateRejectsForbiddenJWTSecretsInProduction(t *testing.T) {
-	for _, bad := range forbiddenJWTSecrets() {
-		c := validBase()
-		c.Environment = "production"
-		c.JWTSecret = bad
-		// short secrets fail the length check first; that's acceptable — both reject.
-		if err := c.Validate(); err == nil {
-			t.Fatalf("expected error for forbidden JWT_SECRET %q in production", bad)
+func TestValidateRejectsForbiddenJWTSecretsInEveryEnvironment(t *testing.T) {
+	for _, env := range []string{"development", "production"} {
+		for _, bad := range forbiddenJWTSecrets() {
+			c := validBase()
+			c.Environment = env
+			c.JWTSecret = bad
+			// short secrets fail the length check first; that's acceptable — both reject.
+			if err := c.Validate(); err == nil {
+				t.Fatalf("expected error for forbidden JWT_SECRET %q in %s", bad, env)
+			}
 		}
 	}
 }

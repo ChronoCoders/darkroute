@@ -97,9 +97,23 @@ async fn main() -> ExitCode {
     };
     info!(addr = %metrics_addr, "metrics listener bound");
 
+    // Build the heartbeat HTTP client at startup. A builder failure here is
+    // fatal — the relay should not start with heartbeats permanently
+    // disabled, which would leave it invisible to the authority sweep.
+    let heartbeat_client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "failed to build heartbeat http client");
+            return ExitCode::from(1);
+        }
+    };
+
     // Step 6 — Start the heartbeat task.
     let shutdown = Arc::new(Notify::new());
-    let hb_handle = heartbeat::spawn(cfg.clone(), shutdown.clone());
+    let hb_handle = heartbeat::spawn(cfg.clone(), heartbeat_client, shutdown.clone());
 
     // Step 7 — Begin accepting connections. Every accepted socket runs
     // through token::verify() before any further processing; failure drops

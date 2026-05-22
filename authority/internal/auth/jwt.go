@@ -40,12 +40,22 @@ func (m *JWTManager) GenerateToken(sub, role, tier string) (string, error) {
 }
 
 func (m *JWTManager) ValidateToken(tokenStr string) (*Claims, error) {
-	parsed, err := jwt.ParseWithClaims(tokenStr, &Claims{}, func(t *jwt.Token) (interface{}, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, errors.New("invalid signing method")
-		}
-		return m.secret, nil
-	})
+	// Spec §4 / §7.1 mandates HS256. Accepting the broader HMAC family
+	// would widen the verifier surface to HS384/HS512 (same secret bytes,
+	// different hash); reject anything but HS256 explicitly. Likewise,
+	// require `exp` so a token crafted with the secret cannot live forever.
+	parsed, err := jwt.ParseWithClaims(
+		tokenStr,
+		&Claims{},
+		func(t *jwt.Token) (interface{}, error) {
+			if t.Method != jwt.SigningMethodHS256 {
+				return nil, errors.New("invalid signing method")
+			}
+			return m.secret, nil
+		},
+		jwt.WithValidMethods([]string{"HS256"}),
+		jwt.WithExpirationRequired(),
+	)
 	if err != nil {
 		return nil, err
 	}

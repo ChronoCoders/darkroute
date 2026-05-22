@@ -12,32 +12,32 @@ import (
 
 func TestValidRole(t *testing.T) {
 	for _, r := range []string{"guard", "middle", "exit"} {
-		if !ValidRole(r) {
-			t.Errorf("ValidRole(%q) = false", r)
+		if !validRole(r) {
+			t.Errorf("validRole(%q) = false", r)
 		}
 	}
 	for _, r := range []string{"", "GUARD", "admin", "client"} {
-		if ValidRole(r) {
-			t.Errorf("ValidRole(%q) = true (should be false)", r)
+		if validRole(r) {
+			t.Errorf("validRole(%q) = true (should be false)", r)
 		}
 	}
 }
 
 func TestHashAPIKeyIsDeterministic(t *testing.T) {
-	a := HashAPIKey("salt", "key")
-	b := HashAPIKey("salt", "key")
+	a := hashAPIKey("salt", "key")
+	b := hashAPIKey("salt", "key")
 	if a != b {
 		t.Errorf("expected hash to be deterministic")
 	}
-	if HashAPIKey("salt", "key") == HashAPIKey("different-salt", "key") {
+	if hashAPIKey("salt", "key") == hashAPIKey("different-salt", "key") {
 		t.Errorf("salt must affect hash")
 	}
-	if HashAPIKey("salt", "key1") == HashAPIKey("salt", "key2") {
+	if hashAPIKey("salt", "key1") == hashAPIKey("salt", "key2") {
 		t.Errorf("plaintext must affect hash")
 	}
 	// hex-encoded SHA-256 is 64 chars
-	if len(HashAPIKey("salt", "key")) != 64 {
-		t.Errorf("hash length: got %d want 64", len(HashAPIKey("salt", "key")))
+	if len(hashAPIKey("salt", "key")) != 64 {
+		t.Errorf("hash length: got %d want 64", len(hashAPIKey("salt", "key")))
 	}
 }
 
