@@ -97,8 +97,36 @@ impl RelayConfig {
             Some(s) => parse_ip_list(&s)?,
         };
 
-        if role == Role::Exit && decodo_proxy_url.as_deref().unwrap_or("").is_empty() {
-            return Err(ConfigError::ExitRequiresDecodoProxy);
+        if role == Role::Exit {
+            let raw = decodo_proxy_url.as_deref().unwrap_or("");
+            if raw.is_empty() {
+                return Err(ConfigError::ExitRequiresDecodoProxy);
+            }
+            // Validate the URL is parseable and uses socks5 scheme with a
+            // host:port — anything else means the exit cannot dial and
+            // must refuse to start. Phase 4c security requirement.
+            let parsed = ::url::Url::parse(raw).map_err(|e| ConfigError::Invalid {
+                var: "DECODO_PROXY_URL",
+                reason: format!("not a valid URL: {e}"),
+            })?;
+            if !parsed.scheme().eq_ignore_ascii_case("socks5") {
+                return Err(ConfigError::Invalid {
+                    var: "DECODO_PROXY_URL",
+                    reason: format!("scheme must be socks5, got {}", parsed.scheme()),
+                });
+            }
+            if parsed.host_str().is_none_or(str::is_empty) {
+                return Err(ConfigError::Invalid {
+                    var: "DECODO_PROXY_URL",
+                    reason: "missing host".to_string(),
+                });
+            }
+            if parsed.port().is_none() {
+                return Err(ConfigError::Invalid {
+                    var: "DECODO_PROXY_URL",
+                    reason: "missing port".to_string(),
+                });
+            }
         }
 
         Ok(Self {
@@ -267,6 +295,33 @@ mod tests {
         let cfg = RelayConfig::from_source(lookup(&env)).expect("valid exit config");
         assert_eq!(cfg.role, Role::Exit);
         assert_eq!(cfg.decodo_proxy_url.as_deref(), Some("socks5://user:pass@host:1080"));
+    }
+
+    #[test]
+    fn exit_role_rejects_garbage_decodo_url() {
+        let mut env = base_env();
+        env.insert("RELAY_ROLE", "exit");
+        env.insert("DECODO_PROXY_URL", "not a url at all");
+        let err = RelayConfig::from_source(lookup(&env)).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { var: "DECODO_PROXY_URL", .. }));
+    }
+
+    #[test]
+    fn exit_role_rejects_wrong_scheme() {
+        let mut env = base_env();
+        env.insert("RELAY_ROLE", "exit");
+        env.insert("DECODO_PROXY_URL", "http://user:pass@host:1080");
+        let err = RelayConfig::from_source(lookup(&env)).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { var: "DECODO_PROXY_URL", .. }));
+    }
+
+    #[test]
+    fn exit_role_rejects_missing_port() {
+        let mut env = base_env();
+        env.insert("RELAY_ROLE", "exit");
+        env.insert("DECODO_PROXY_URL", "socks5://user:pass@host");
+        let err = RelayConfig::from_source(lookup(&env)).unwrap_err();
+        assert!(matches!(err, ConfigError::Invalid { var: "DECODO_PROXY_URL", .. }));
     }
 
     #[test]

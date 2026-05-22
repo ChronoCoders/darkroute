@@ -6,6 +6,7 @@ mod cell;
 mod circuit;
 mod config;
 mod crypto;
+mod exit;
 mod heartbeat;
 mod metrics;
 mod pool;
@@ -28,15 +29,21 @@ use tracing::{error, info, warn};
 use crate::authority::AuthorityClient;
 use crate::cell::{Cell, CellType, ConnectPayload, ExtendForward};
 use crate::config::{RelayConfig, Role};
+use crate::crypto::SessionKey;
 use crate::pool::{ConnectionPool, PooledConn};
 use crate::token::ReplayWindow;
 
-/// Protocol byte sent as the first byte of any inbound TCP. Distinguishes
-/// a client circuit setup from a relay-to-relay link. The role of this
-/// relay determines which bytes are accepted: guard accepts only Client,
-/// middle and exit accept only Relay.
+/// First byte of any inbound TCP. PROTO_CLIENT proceeds to a Phase-3
+/// token presentation (guard only); PROTO_RELAY proceeds to the
+/// circuit-start signal stream (middle and exit, peer-allowlisted).
 const PROTO_CLIENT: u8 = 0x01;
 const PROTO_RELAY: u8 = 0x02;
+
+/// Per-circuit signal byte on a relay-to-relay link. The dialer writes
+/// this before each new circuit's client pubkey; the listener reads it
+/// to know whether the link is starting another circuit (`CIRCUIT_START`)
+/// or shutting down (any other byte / EOF).
+const CIRCUIT_START: u8 = 0xC1;
 
 const M_RAW_LEN: usize = 32;
 const TOKEN_LEN: usize = 256;
@@ -48,6 +55,7 @@ const POOL_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 const POOL_IDLE_TTL: Duration = Duration::from_secs(300);
 const X25519_PK_LEN: usize = 32;
 const CIRCUIT_ID: u32 = 1;
+const DEST_READ_BUF: usize = 16 * 1024;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -192,7 +200,7 @@ async fn accept_loop(
                     let pl = pool.clone();
                     tokio::spawn(async move {
                         if let Err(e) = handle_connection(sock, peer, cfg, auth, rep, pl).await {
-                            warn!(peer = %peer, reason = %e, "connection rejected");
+                            warn!(peer = %peer, reason = %e, "connection terminated");
                         }
                     });
                 }
@@ -218,6 +226,8 @@ enum HandleError {
     Circuit(#[from] circuit::CircuitError),
     #[error("cell: {0}")]
     Cell(#[from] cell::CellError),
+    #[error("exit: {0}")]
+    Exit(#[from] exit::ExitError),
     #[error("unexpected protocol byte 0x{0:02x}")]
     UnexpectedProtocol(u8),
     #[error("peer IP not in relay allowlist")]
@@ -226,6 +236,8 @@ enum HandleError {
     IllegalCellForRole(CellType, Role),
     #[error("circuit teardown by peer")]
     PeerClosed,
+    #[error("missing decodo proxy url at exit role")]
+    MissingDecodoUrl,
 }
 
 async fn handle_connection(
@@ -256,14 +268,14 @@ async fn handle_connection(
     }
 }
 
-/// Phase 3 + 4a: client presents token, ECDH handshake, then the cell
-/// loop on a guard relay. After accepting one EXTEND, this relay also
-/// runs a backward task on the outbound link to wrap inbound frames as
-/// RELAY cells back to the client.
+/// Client-mode inbound on the guard role. One circuit per TCP; after
+/// CLOSE_REQUEST the TCP is closed (clients reconnect for a new
+/// circuit). Token verification runs first; only then does the
+/// per-hop ECDH and cell loop start.
 async fn handle_client_connection(
     mut sock: TcpStream,
     peer: SocketAddr,
-    _cfg: Arc<RelayConfig>,
+    cfg: Arc<RelayConfig>,
     authority: Arc<AuthorityClient>,
     replay: Arc<ReplayWindow>,
     pool: Arc<ConnectionPool>,
@@ -282,14 +294,16 @@ async fn handle_client_connection(
     }
     metrics::record_verified();
 
-    drive_cell_loop(sock, peer, Role::Guard, pool).await
+    drive_circuit(&mut sock, peer, Role::Guard, cfg, pool).await
 }
 
 /// Relay-mode inbound (middle or exit). Peer IP must be in the
-/// configured allowlist; once accepted, the link performs the ECDH
-/// handshake and enters the cell loop with role-specific dispatch.
+/// configured allowlist; once accepted, the link supports multiple
+/// circuits in sequence, each preceded by a `CIRCUIT_START` byte. The
+/// outer loop returns when the dialer either closes the TCP or sends a
+/// non-CIRCUIT_START byte.
 async fn handle_relay_connection(
-    sock: TcpStream,
+    mut sock: TcpStream,
     peer: SocketAddr,
     cfg: Arc<RelayConfig>,
     pool: Arc<ConnectionPool>,
@@ -301,34 +315,52 @@ async fn handle_relay_connection(
     if !cfg.peer_allowlist.contains(&peer_ip) {
         return Err(HandleError::PeerNotAllowed);
     }
-    drive_cell_loop(sock, peer, cfg.role, pool).await
+
+    loop {
+        let mut signal = [0u8; 1];
+        match sock.read_exact(&mut signal).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+            Err(e) => return Err(HandleError::Io(e)),
+        }
+        if signal[0] != CIRCUIT_START {
+            // Any byte other than CIRCUIT_START terminates the link.
+            return Ok(());
+        }
+        drive_circuit(&mut sock, peer, cfg.role, cfg.clone(), pool.clone()).await?;
+    }
 }
 
-/// Shared cell loop: ECDH handshake, activate the circuit, then
-/// dispatch incoming cells until CLOSE_REQUEST or any error.
-async fn drive_cell_loop(
-    mut sock: TcpStream,
+/// Bring up one circuit on `sock`: run the per-hop X25519 handshake,
+/// activate the state machine, run the bidirectional cell loop. On
+/// CLOSE_REQUEST: send CLOSE_ACK, release the next-link to the pool
+/// (if any), drop the destination link (if any), close the circuit.
+async fn drive_circuit(
+    sock: &mut TcpStream,
     peer: SocketAddr,
     role: Role,
+    cfg: Arc<RelayConfig>,
     pool: Arc<ConnectionPool>,
 ) -> Result<(), HandleError> {
     let mut circuit = circuit::Circuit::new();
-    let (mut read_half, mut write_half) = sock.split();
 
-    let session_key = match tokio::time::timeout(
-        HANDSHAKE_READ_TIMEOUT,
-        crypto::relay_handshake(&mut read_half, &mut write_half),
-    )
-    .await
-    {
-        Ok(Ok(k)) => k,
-        Ok(Err(e)) => {
-            circuit.fail();
-            return Err(HandleError::Crypto(e));
-        }
-        Err(_) => {
-            circuit.fail();
-            return Err(HandleError::Timeout);
+    let session_key = {
+        let (mut read_half, mut write_half) = sock.split();
+        match tokio::time::timeout(
+            HANDSHAKE_READ_TIMEOUT,
+            crypto::relay_handshake(&mut read_half, &mut write_half),
+        )
+        .await
+        {
+            Ok(Ok(k)) => k,
+            Ok(Err(e)) => {
+                circuit.fail();
+                return Err(HandleError::Crypto(e));
+            }
+            Err(_) => {
+                circuit.fail();
+                return Err(HandleError::Timeout);
+            }
         }
     };
     if let Err(e) = circuit.activate(session_key) {
@@ -337,14 +369,18 @@ async fn drive_cell_loop(
     }
     info!(peer = %peer, role = %role, state = %circuit.state(), "circuit active");
 
-    let outcome =
-        run_cell_loop(&mut read_half, &mut write_half, &mut circuit, role, pool).await;
+    let key: SessionKey = circuit
+        .session_key()
+        .expect(
+            "drive_circuit just activated the circuit, so session_key() returns Some \
+             — this invariant is enforced by the state machine",
+        )
+        .clone();
 
+    let outcome = run_circuit_io(sock, &key, role, cfg, pool).await;
     match &outcome {
         Ok(()) => {
             if let Err(e) = circuit.close() {
-                // close() is infallible from Active; if we reach this branch
-                // it means state was already Closed/Failed which is benign.
                 warn!(error = %e, "circuit.close from terminal state");
             }
             info!(peer = %peer, role = %role, state = %circuit.state(), "circuit closed");
@@ -354,133 +390,178 @@ async fn drive_cell_loop(
     outcome
 }
 
-async fn run_cell_loop<R, W>(
-    reader: &mut R,
-    writer: &mut W,
-    circuit: &mut circuit::Circuit,
+/// One circuit's bidirectional control + data loop. Reads from three
+/// sources via `tokio::select!`:
+///
+///   1. `sock` (cells from the previous-hop client/relay)
+///   2. `next_link.stream` (raw frame bytes from the next-hop relay,
+///      forwarded as RELAY cells back toward the client)
+///   3. `dest_link` (bytes from the SOCKS5 destination, wrapped as
+///      DATA cells back toward the client; exit role only)
+///
+/// CLOSE_REQUEST triggers: send CLOSE_ACK, release next_link to the
+/// pool (so the underlying TCP can carry another circuit), drop
+/// dest_link, return. Any other error path drops both, terminating
+/// the dialer side cleanly via TCP FIN.
+async fn run_circuit_io(
+    sock: &mut TcpStream,
+    key: &SessionKey,
     role: Role,
+    cfg: Arc<RelayConfig>,
     pool: Arc<ConnectionPool>,
-) -> Result<(), HandleError>
-where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    // Outbound link state for this circuit. Populated by EXTEND; from
-    // that point on, RELAY cells write payloads here and a backward
-    // task wraps inbound frames as RELAY cells for the client.
-    let mut next_link: Option<NextLink> = None;
+) -> Result<(), HandleError> {
+    let (mut sock_read, mut sock_write) = sock.split();
+    let mut next_link: Option<NextLinkState> = None;
+    let mut dest_link: Option<TcpStream> = None;
 
     loop {
-        let key = circuit.session_key().expect(
-            "drive_cell_loop only enters run_cell_loop after activate, \
-             so session_key() returns Some for the entire loop",
-        );
-        let frame = match tokio::time::timeout(
-            CELL_READ_TIMEOUT,
-            crypto::read_frame(reader, key),
-        )
-        .await
-        {
-            Ok(Ok(f)) => f,
-            Ok(Err(e)) => return Err(HandleError::Crypto(e)),
-            Err(_) => return Err(HandleError::Timeout),
-        };
-        let cell = Cell::decode(&frame)?;
-
-        match (cell.cell_type, role) {
-            (CellType::Extend, Role::Guard) | (CellType::Extend, Role::Middle) => {
-                if next_link.is_some() {
-                    // Phase 4b: one EXTEND per circuit. A second EXTEND
-                    // is a protocol error from the client.
-                    return Err(HandleError::IllegalCellForRole(CellType::Extend, role));
-                }
-                let extend = ExtendForward::decode(&cell.payload)?;
-                let nl = open_next_link(&extend, &pool).await?;
-                // Reply EXTEND-backward to client with the next hop's pubkey.
-                let reply = Cell::new(
-                    CellType::Extend,
-                    CIRCUIT_ID,
-                    cell::extend_backward_payload(&nl.peer_pk),
-                )?;
-                crypto::write_frame(writer, key, &reply.encode()).await?;
-                next_link = Some(nl);
-            }
-            (CellType::Relay, Role::Guard) | (CellType::Relay, Role::Middle) => {
-                let nl = next_link
-                    .as_mut()
-                    .ok_or(HandleError::IllegalCellForRole(CellType::Relay, role))?;
-                nl.stream.write_all(&cell.payload).await?;
-                nl.stream.flush().await?;
-                // Read one frame back from next_link and wrap it as a
-                // RELAY cell for the client. This is the "backward step"
-                // that pairs with this forward RELAY.
-                let back_bytes = match tokio::time::timeout(
-                    CELL_READ_TIMEOUT,
-                    crypto::read_frame_bytes(&mut nl.stream),
-                )
-                .await
-                {
-                    Ok(Ok(b)) => b,
+        tokio::select! {
+            biased;
+            res = tokio::time::timeout(CELL_READ_TIMEOUT, crypto::read_frame(&mut sock_read, key)) => {
+                let frame = match res {
+                    Ok(Ok(f)) => f,
                     Ok(Err(e)) => return Err(HandleError::Crypto(e)),
                     Err(_) => return Err(HandleError::Timeout),
                 };
-                let wrap = Cell::new(CellType::Relay, CIRCUIT_ID, back_bytes)?;
-                crypto::write_frame(writer, key, &wrap.encode()).await?;
-            }
-            (CellType::Connect, Role::Exit) => {
-                let payload = ConnectPayload::decode(&cell.payload)?;
-                // Phase 4c will dial via Decodo SOCKS5; in Phase 4b we
-                // record the destination so the integration test can
-                // assert it reached exit untouched, and so the test hook
-                // (set via cfg(test)) can publish it to the test.
-                info!(host = %payload.host, port = payload.port, "exit received CONNECT");
-                publish_connect_for_tests(payload);
-            }
-            (CellType::Data, Role::Exit) => {
-                // Phase 4c forwards DATA to the destination via the SOCKS5
-                // proxy. In Phase 4b, DATA at the exit is recorded only.
-                info!(bytes = cell.payload.len(), "exit received DATA");
-            }
-            (CellType::CloseRequest, _) => {
-                let ack = Cell::new(CellType::CloseAck, CIRCUIT_ID, Vec::new())?;
-                crypto::write_frame(writer, key, &ack.encode()).await?;
-                if let Some(nl) = next_link.take() {
-                    drop(nl);
+                let cell = Cell::decode(&frame)?;
+                match (cell.cell_type, role) {
+                    (CellType::Extend, Role::Guard) | (CellType::Extend, Role::Middle) => {
+                        if next_link.is_some() {
+                            return Err(HandleError::IllegalCellForRole(CellType::Extend, role));
+                        }
+                        let extend = ExtendForward::decode(&cell.payload)?;
+                        let nl = open_next_link(&extend, &pool).await?;
+                        let reply = Cell::new(
+                            CellType::Extend,
+                            CIRCUIT_ID,
+                            cell::extend_backward_payload(&nl.peer_pk),
+                        )?;
+                        crypto::write_frame(&mut sock_write, key, &reply.encode()).await?;
+                        next_link = Some(nl);
+                    }
+                    (CellType::Relay, Role::Guard) | (CellType::Relay, Role::Middle) => {
+                        let nl = next_link
+                            .as_mut()
+                            .ok_or(HandleError::IllegalCellForRole(CellType::Relay, role))?;
+                        nl.stream.write_all(&cell.payload).await?;
+                        nl.stream.flush().await?;
+                    }
+                    (CellType::Connect, Role::Exit) => {
+                        if dest_link.is_some() {
+                            return Err(HandleError::IllegalCellForRole(CellType::Connect, role));
+                        }
+                        let payload = ConnectPayload::decode(&cell.payload)?;
+                        publish_connect_for_test(&payload);
+                        let proxy_url = cfg
+                            .decodo_proxy_url
+                            .as_deref()
+                            .ok_or(HandleError::MissingDecodoUrl)?;
+                        // Port validation happens inside dial_via_socks5
+                        // BEFORE any network I/O; the destination host
+                        // and port are deliberately not logged.
+                        let dest = exit::dial_via_socks5(
+                            proxy_url,
+                            &payload.host,
+                            payload.port,
+                            &cfg.allowed_exit_ports,
+                        )
+                        .await?;
+                        info!(role = %role, "exit dialed destination via SOCKS5");
+                        dest_link = Some(dest);
+                    }
+                    (CellType::Data, Role::Exit) => {
+                        let dl = dest_link
+                            .as_mut()
+                            .ok_or(HandleError::IllegalCellForRole(CellType::Data, role))?;
+                        dl.write_all(&cell.payload).await?;
+                        dl.flush().await?;
+                    }
+                    (CellType::CloseRequest, _) => {
+                        let ack = Cell::new(CellType::CloseAck, CIRCUIT_ID, Vec::new())?;
+                        crypto::write_frame(&mut sock_write, key, &ack.encode()).await?;
+                        if let Some(nl) = next_link.take() {
+                            // The link is in "listener waiting for next
+                            // CIRCUIT_START" state because the inner
+                            // CLOSE_REQUESTs were processed before this
+                            // outer CLOSE_REQUEST. Release to the pool
+                            // so a subsequent circuit can reuse it.
+                            pool.release(nl.addr, PooledConn::new(nl.stream));
+                        }
+                        drop(dest_link.take());
+                        return Ok(());
+                    }
+                    (CellType::CloseAck, _) => {
+                        // CLOSE_ACK on the forward path is unexpected;
+                        // treat as a peer-initiated teardown.
+                        return Err(HandleError::PeerClosed);
+                    }
+                    (t, r) => return Err(HandleError::IllegalCellForRole(t, r)),
                 }
-                return Ok(());
             }
-            (CellType::CloseAck, _) => {
-                // CLOSE_ACK on a forward path is unusual; treat as a peer-
-                // initiated teardown and exit cleanly.
-                return Err(HandleError::PeerClosed);
+
+            res = async {
+                match next_link.as_mut() {
+                    Some(nl) => crypto::read_frame_bytes(&mut nl.stream).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let back_bytes = res?;
+                let wrap = Cell::new(CellType::Relay, CIRCUIT_ID, back_bytes)?;
+                crypto::write_frame(&mut sock_write, key, &wrap.encode()).await?;
             }
-            (t, r) => {
-                return Err(HandleError::IllegalCellForRole(t, r));
+
+            res = async {
+                match dest_link.as_mut() {
+                    Some(dl) => {
+                        let mut buf = vec![0u8; DEST_READ_BUF];
+                        let n = dl.read(&mut buf).await?;
+                        buf.truncate(n);
+                        Ok::<_, std::io::Error>(buf)
+                    }
+                    None => std::future::pending().await,
+                }
+            } => {
+                let bytes = res?;
+                if bytes.is_empty() {
+                    // Destination closed its write half. Stop reading
+                    // from it but keep the circuit alive in case the
+                    // client still has bytes to send before CLOSE.
+                    drop(dest_link.take());
+                    continue;
+                }
+                let data_cell = Cell::new(CellType::Data, CIRCUIT_ID, bytes)?;
+                crypto::write_frame(&mut sock_write, key, &data_cell.encode()).await?;
             }
         }
     }
 }
 
-struct NextLink {
+struct NextLinkState {
     stream: TcpStream,
     peer_pk: [u8; X25519_PK_LEN],
+    addr: SocketAddr,
 }
 
-/// Open a fresh outbound TCP to `next_hop` via the pool. If an idle
-/// connection is available we reuse it (consuming the pool's protocol-
-/// handshake state implicitly — Phase 4b establishes a new handshake on
-/// every dial, so the pool only hits warm-but-unhandshaked sockets in
-/// practice). Otherwise dial fresh and run the relay-mode handshake.
+/// Acquire (or dial) an outbound TCP to `next_hop` and run the
+/// per-circuit bootstrap: write CIRCUIT_START + client pubkey, read
+/// peer pubkey. A fresh TCP gets the PROTO_RELAY prefix once; pooled
+/// streams are already past PROTO_RELAY and ready for the next
+/// CIRCUIT_START.
 async fn open_next_link(
     extend: &ExtendForward,
     pool: &ConnectionPool,
-) -> Result<NextLink, HandleError> {
+) -> Result<NextLinkState, HandleError> {
     let mut stream = match pool.acquire(&extend.next_hop) {
         Some(PooledConn { stream, .. }) => stream,
-        None => TcpStream::connect(extend.next_hop).await?,
+        None => {
+            let s = TcpStream::connect(extend.next_hop).await?;
+            s.set_nodelay(true)?;
+            let mut s = s;
+            s.write_all(&[PROTO_RELAY]).await?;
+            s
+        }
     };
-    stream.set_nodelay(true)?;
-    stream.write_all(&[PROTO_RELAY]).await?;
+    stream.write_all(&[CIRCUIT_START]).await?;
     stream.write_all(&extend.client_pk).await?;
     stream.flush().await?;
     let mut peer_pk = [0u8; X25519_PK_LEN];
@@ -489,44 +570,53 @@ async fn open_next_link(
         Ok(Err(e)) => return Err(HandleError::Io(e)),
         Err(_) => return Err(HandleError::Timeout),
     }
-    Ok(NextLink { stream, peer_pk })
+    Ok(NextLinkState {
+        stream,
+        peer_pk,
+        addr: extend.next_hop,
+    })
 }
 
-/// Test-only sink: when the exit relay receives a CONNECT cell, publish
-/// the destination on a oneshot-channel-style hook so the integration
-/// test can assert. Production builds compile this to a no-op.
 #[cfg(test)]
-fn publish_connect_for_tests(p: ConnectPayload) {
-    test_hooks::publish_connect(p);
-}
-
-#[cfg(not(test))]
-fn publish_connect_for_tests(_p: ConnectPayload) {}
-
-#[cfg(test)]
-mod test_hooks {
+pub(crate) mod test_hooks {
     use std::sync::Mutex;
     use std::sync::OnceLock;
     use tokio::sync::mpsc;
 
     use crate::cell::ConnectPayload;
 
-    static SINK: OnceLock<Mutex<Option<mpsc::UnboundedSender<ConnectPayload>>>> = OnceLock::new();
+    static CONNECT_SINK: OnceLock<Mutex<Option<mpsc::UnboundedSender<ConnectPayload>>>> =
+        OnceLock::new();
 
-    fn cell() -> &'static Mutex<Option<mpsc::UnboundedSender<ConnectPayload>>> {
-        SINK.get_or_init(|| Mutex::new(None))
+    fn cell_sink() -> &'static Mutex<Option<mpsc::UnboundedSender<ConnectPayload>>> {
+        CONNECT_SINK.get_or_init(|| Mutex::new(None))
     }
 
     pub fn install_sender(tx: mpsc::UnboundedSender<ConnectPayload>) {
-        *cell().lock().expect("test hook mutex") = Some(tx);
+        *cell_sink().lock().expect("test hook mutex") = Some(tx);
     }
 
-    pub fn publish_connect(p: ConnectPayload) {
-        if let Some(tx) = cell().lock().expect("test hook mutex").as_ref() {
+    fn publish_connect_inner(p: ConnectPayload) {
+        if let Some(tx) = cell_sink().lock().expect("test hook mutex").as_ref() {
             let _ = tx.send(p);
         }
     }
+
+    /// Called from the exit's CONNECT handler in test builds only.
+    /// Clones the payload because the handler still needs its own copy
+    /// to drive the SOCKS5 dial.
+    pub fn publish_connect(p: &ConnectPayload) {
+        publish_connect_inner(p.clone());
+    }
 }
+
+#[cfg(test)]
+fn publish_connect_for_test(p: &ConnectPayload) {
+    test_hooks::publish_connect(p);
+}
+
+#[cfg(not(test))]
+fn publish_connect_for_test(_p: &ConnectPayload) {}
 
 async fn pool_sweep_loop(pool: Arc<ConnectionPool>, shutdown: Arc<Notify>) {
     let mut ticker = tokio::time::interval(POOL_SWEEP_INTERVAL);
@@ -538,6 +628,9 @@ async fn pool_sweep_loop(pool: Arc<ConnectionPool>, shutdown: Arc<Notify>) {
                 return;
             }
             _ = ticker.tick() => {
+                if pool.is_empty() {
+                    continue;
+                }
                 let evicted = pool.evict_older_than(POOL_IDLE_TTL);
                 if evicted > 0 {
                     info!(evicted, remaining = pool.len(), "pool sweep");
