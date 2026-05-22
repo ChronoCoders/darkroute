@@ -73,14 +73,19 @@ func (c *Config) Validate() error {
 	if c.Environment == "" {
 		return errors.New("ENVIRONMENT is required")
 	}
+	// Forbidden-default JWT secrets are rejected in every environment per
+	// SECURITY_MODEL §7.1 ("the application will not start if this variable
+	// is absent or matches any known default string"). The 32-char minimum
+	// already screens the literal defaults below; this exact-match check is
+	// belt-and-braces against pattern-stuffing them to length.
+	for _, f := range forbiddenJWTSecrets() {
+		if c.JWTSecret == f {
+			return fmt.Errorf("JWT_SECRET matches a forbidden default value")
+		}
+	}
 	if c.Environment == "production" {
 		if strings.Contains(c.DatabaseURL, "localhost") || strings.Contains(c.DatabaseURL, "127.0.0.1") {
 			return errors.New("DATABASE_URL must not point to localhost or 127.0.0.1 in production")
-		}
-		for _, f := range forbiddenJWTSecrets() {
-			if c.JWTSecret == f {
-				return fmt.Errorf("JWT_SECRET matches a forbidden default value")
-			}
 		}
 	}
 	return nil

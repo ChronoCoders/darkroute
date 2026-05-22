@@ -8,6 +8,8 @@ use tracing::info;
 pub enum AuthorityError {
     #[error("http fetch failed: {0}")]
     Http(#[from] reqwest::Error),
+    #[error("authority pubkey url is not a valid URL: {0}")]
+    BadUrl(String),
     #[error("authority returned non-success status: {0}")]
     BadStatus(u16),
     #[error("authority returned empty body")]
@@ -26,8 +28,15 @@ pub struct AuthorityClient {
 
 impl AuthorityClient {
     pub async fn fetch_and_pin(url: &str) -> Result<Self, AuthorityError> {
+        // Derive transport policy from the URL scheme: if the configured
+        // AUTHORITY_PUBKEY_URL is https, refuse redirects to plaintext; if
+        // it is http (development against a local authority), allow it.
+        // The operator controls this entirely via the env var.
+        let parsed = ::url::Url::parse(url).map_err(|e| AuthorityError::BadUrl(e.to_string()))?;
+        let https_only = parsed.scheme().eq_ignore_ascii_case("https");
+
         let resp = reqwest::Client::builder()
-            .https_only(false) // dev environments may use http://localhost
+            .https_only(https_only)
             .build()?
             .get(url)
             .send()

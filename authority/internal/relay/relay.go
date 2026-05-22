@@ -26,7 +26,7 @@ type Relay struct {
 	LastHeartbeat *time.Time `json:"last_heartbeat,omitempty"`
 }
 
-func ValidRole(role string) bool {
+func validRole(role string) bool {
 	switch role {
 	case "guard", "middle", "exit":
 		return true
@@ -34,10 +34,10 @@ func ValidRole(role string) bool {
 	return false
 }
 
-// HashAPIKey computes SHA-256(salt || plaintext). The spec (SECURITY_MODEL §7.2)
+// hashAPIKey computes SHA-256(salt || plaintext). The spec (SECURITY_MODEL §7.2)
 // specifies SHA-256; the salt from RELAY_API_KEY_SALT is included so a database
 // dump alone does not enable offline brute-force against short or low-entropy keys.
-func HashAPIKey(salt, plaintext string) string {
+func hashAPIKey(salt, plaintext string) string {
 	h := sha256.New()
 	h.Write([]byte(salt))
 	h.Write([]byte(plaintext))
@@ -56,14 +56,14 @@ func generateAPIKey() (string, error) {
 // to the caller. The plaintext key is never persisted; only its salted SHA-256
 // hash is stored.
 func ProvisionRelay(ctx context.Context, pool *pgxpool.Pool, salt, endpoint, region, role string) (string, string, error) {
-	if !ValidRole(role) {
+	if !validRole(role) {
 		return "", "", ErrInvalidRole
 	}
 	plaintext, err := generateAPIKey()
 	if err != nil {
 		return "", "", err
 	}
-	hash := HashAPIKey(salt, plaintext)
+	hash := hashAPIKey(salt, plaintext)
 	var id string
 	err = pool.QueryRow(ctx,
 		`INSERT INTO relay_nodes (id, api_key_hash, endpoint, region, role, status)
@@ -78,7 +78,7 @@ func ProvisionRelay(ctx context.Context, pool *pgxpool.Pool, salt, endpoint, reg
 }
 
 func RecordHeartbeat(ctx context.Context, pool *pgxpool.Pool, salt, plaintext string) (string, error) {
-	hash := HashAPIKey(salt, plaintext)
+	hash := hashAPIKey(salt, plaintext)
 	var id string
 	err := pool.QueryRow(ctx,
 		`UPDATE relay_nodes
@@ -122,23 +122,6 @@ func GetActiveRelays(ctx context.Context, pool *pgxpool.Pool) ([]Relay, error) {
 		 FROM relay_nodes
 		 WHERE status = 'active'
 		 ORDER BY created_at`)
-}
-
-func GetRelaysByRole(ctx context.Context, pool *pgxpool.Pool, role string) ([]Relay, error) {
-	if !ValidRole(role) {
-		return nil, ErrInvalidRole
-	}
-	return scanRelays(ctx, pool,
-		`SELECT id, endpoint, region, role, status, last_heartbeat
-		 FROM relay_nodes
-		 WHERE role = $1 AND status = 'active'
-		 ORDER BY created_at`,
-		role)
-}
-
-func MarkRelayInactive(ctx context.Context, pool *pgxpool.Pool, id string) error {
-	_, err := pool.Exec(ctx, `UPDATE relay_nodes SET status = 'inactive' WHERE id = $1`, id)
-	return err
 }
 
 // SweepInactiveRelays marks any active relay as inactive when its last heartbeat

@@ -19,6 +19,7 @@ type ctxKey string
 const (
 	requestIDKey  ctxKey = "request_id"
 	subscriberKey ctxKey = "subscriber_id"
+	roleKey       ctxKey = "role"
 )
 
 func newRequestID() string {
@@ -106,7 +107,26 @@ func Authenticate(jm *auth.JWTManager, pool *pgxpool.Pool) func(http.Handler) ht
 				return
 			}
 			ctx := context.WithValue(r.Context(), subscriberKey, sess.SubscriberID)
+			ctx = context.WithValue(ctx, roleKey, claims.Role)
 			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// RequireRole rejects any request whose authenticated subscriber does not
+// have the named role. Must be applied AFTER Authenticate; it reads the
+// role placed in context by that middleware. Per SECURITY_MODEL §7.3,
+// admin-tier endpoints (relay provisioning, relay listing) are gated this
+// way.
+func RequireRole(required string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			role, ok := r.Context().Value(roleKey).(string)
+			if !ok || role != required {
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
+				return
+			}
+			next.ServeHTTP(w, r)
 		})
 	}
 }

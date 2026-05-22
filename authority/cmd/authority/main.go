@@ -72,8 +72,11 @@ func main() {
 			r.Use(handlers.Authenticate(jm, database.Pool))
 			r.Post("/api/v1/auth/logout", ah.Logout)
 			r.Post("/api/v1/tokens/issue", th.HandleIssue)
-			r.Post("/api/v1/admin/relays/provision", rh.HandleProvisionRelay)
-			r.Get("/api/v1/admin/relays", rh.HandleListRelays)
+			r.Group(func(r chi.Router) {
+				r.Use(handlers.RequireRole("admin"))
+				r.Post("/api/v1/admin/relays/provision", rh.HandleProvisionRelay)
+				r.Get("/api/v1/admin/relays", rh.HandleListRelays)
+			})
 		})
 	})
 
