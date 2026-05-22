@@ -2,7 +2,9 @@
 #![forbid(unsafe_code)]
 
 mod authority;
+mod circuit;
 mod config;
+mod crypto;
 mod heartbeat;
 mod metrics;
 mod token;
@@ -204,7 +206,22 @@ enum HandleError {
     Timeout,
     #[error("token verification failed: {0}")]
     Token(token::TokenError),
+    #[error("crypto: {0}")]
+    Crypto(#[from] crypto::CryptoError),
+    #[error("circuit: {0}")]
+    Circuit(#[from] circuit::CircuitError),
+    #[error("protocol: unexpected control frame contents")]
+    Protocol,
 }
+
+/// Phase 4a relay control protocol. After ECDH, the only legal frame the
+/// client may send is `CLOSE_REQUEST`; the relay acknowledges with
+/// `CLOSE_ACK` and closes the circuit. Phase 4b adds EXTEND/RELAY/CONNECT
+/// commands to this same frame channel.
+const CLOSE_REQUEST: &[u8] = b"DKRT-CLOSE\x01\x00";
+const CLOSE_ACK: &[u8] = b"DKRT-CLOSED\x01";
+const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const CONTROL_FRAME_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn handle_connection(
     mut sock: TcpStream,
@@ -214,26 +231,85 @@ async fn handle_connection(
 ) -> Result<(), HandleError> {
     sock.set_nodelay(true)?;
 
+    // ----- Phase 3: token presentation + verification (mandatory) -----
     let mut buf = [0u8; PRESENTATION_LEN];
     match tokio::time::timeout(PRESENTATION_READ_TIMEOUT, sock.read_exact(&mut buf)).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => return Err(HandleError::Io(e)),
         Err(_) => return Err(HandleError::Timeout),
     }
-
     let m_raw = &buf[..M_RAW_LEN];
     let token = &buf[M_RAW_LEN..];
-
-    // Token verification is mandatory and runs before anything else. On
-    // error we record the reason in the metrics counter and return; the
-    // socket closes when this function exits.
     if let Err(e) = token::verify(m_raw, token, authority.pubkey(), &replay) {
         metrics::record_rejected(&e);
         return Err(HandleError::Token(e));
     }
     metrics::record_verified();
 
-    info!(peer = %peer, "token verified");
+    // ----- Phase 4a: per-hop key exchange + circuit state machine -----
+    let mut circuit = circuit::Circuit::new();
+    let (mut read_half, mut write_half) = sock.split();
+
+    let session_key = match tokio::time::timeout(
+        HANDSHAKE_READ_TIMEOUT,
+        crypto::relay_handshake(&mut read_half, &mut write_half),
+    )
+    .await
+    {
+        Ok(Ok(k)) => k,
+        Ok(Err(e)) => {
+            circuit.fail();
+            return Err(HandleError::Crypto(e));
+        }
+        Err(_) => {
+            circuit.fail();
+            return Err(HandleError::Timeout);
+        }
+    };
+
+    if let Err(e) = circuit.activate(session_key) {
+        circuit.fail();
+        return Err(HandleError::Circuit(e));
+    }
+    info!(peer = %peer, state = %circuit.state(), "circuit active");
+
+    // Phase 4a accepts exactly one control frame: CLOSE_REQUEST. The
+    // session key lives on the Circuit and is borrowed (not cloned) for
+    // each frame operation.
+    let key = circuit.session_key().expect(
+        "circuit.activate just succeeded so session_key() returns Some — \
+         this invariant is enforced by the state machine",
+    );
+
+    let plaintext = match tokio::time::timeout(
+        CONTROL_FRAME_READ_TIMEOUT,
+        crypto::read_frame(&mut read_half, key),
+    )
+    .await
+    {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => {
+            circuit.fail();
+            return Err(HandleError::Crypto(e));
+        }
+        Err(_) => {
+            circuit.fail();
+            return Err(HandleError::Timeout);
+        }
+    };
+
+    if plaintext != CLOSE_REQUEST {
+        circuit.fail();
+        return Err(HandleError::Protocol);
+    }
+
+    if let Err(e) = crypto::write_frame(&mut write_half, key, CLOSE_ACK).await {
+        circuit.fail();
+        return Err(HandleError::Crypto(e));
+    }
+
+    circuit.close()?;
+    info!(peer = %peer, state = %circuit.state(), "circuit closed");
     Ok(())
 }
 
