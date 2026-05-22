@@ -122,29 +122,31 @@ pub fn verify(
     Ok(())
 }
 
+/// Compute s = m^d mod n using num-bigint, bypassing the rsa crate's
+/// padded sign path. This is the raw operation a client would perform
+/// (in production, with blinding) when redeeming a Chaum signature.
+/// Used by the integration test and the in-module unit tests below.
+#[cfg(test)]
+pub(crate) fn raw_sign(m_raw: &[u8], priv_key: &rsa::RsaPrivateKey) -> Vec<u8> {
+    use num_bigint::BigUint as NbBigUint;
+    use rsa::traits::{PrivateKeyParts, PublicKeyParts};
+    let m_hash = Sha256::digest(m_raw);
+    let m_int = NbBigUint::from_bytes_be(&m_hash);
+    let n = NbBigUint::from_bytes_be(&priv_key.n().to_bytes_be());
+    let d = NbBigUint::from_bytes_be(&priv_key.d().to_bytes_be());
+    let s = m_int.modpow(&d, &n);
+
+    let modsize = priv_key.n().bits().div_ceil(8);
+    let mut out = vec![0u8; modsize];
+    let s_bytes = s.to_bytes_be();
+    out[modsize - s_bytes.len()..].copy_from_slice(&s_bytes);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use num_bigint::BigUint as NbBigUint;
-    use rsa::traits::PrivateKeyParts;
     use rsa::{RsaPrivateKey, RsaPublicKey};
-
-    /// Compute s = m^d mod n using num-bigint, bypassing the rsa crate's
-    /// padded sign path. This is the raw operation a client would perform
-    /// (in production, with blinding) when redeeming a Chaum signature.
-    fn raw_sign(m_raw: &[u8], priv_key: &RsaPrivateKey) -> Vec<u8> {
-        let m_hash = Sha256::digest(m_raw);
-        let m_int = NbBigUint::from_bytes_be(&m_hash);
-        let n = NbBigUint::from_bytes_be(&priv_key.n().to_bytes_be());
-        let d = NbBigUint::from_bytes_be(&priv_key.d().to_bytes_be());
-        let s = m_int.modpow(&d, &n);
-
-        let modsize = priv_key.n().bits().div_ceil(8);
-        let mut out = vec![0u8; modsize];
-        let s_bytes = s.to_bytes_be();
-        out[modsize - s_bytes.len()..].copy_from_slice(&s_bytes);
-        out
-    }
 
     fn fresh_keypair() -> (RsaPrivateKey, RsaPublicKey) {
         // 1024-bit for test speed. The verify() code path is identical for

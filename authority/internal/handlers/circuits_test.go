@@ -12,6 +12,54 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+// TestCircuitRouteRequiresThreeDistinctNodes seeds one active relay per
+// role but configures two of them with the SAME UUID, so two of the three
+// picks land on the same physical node. The handler must reject this with
+// 503 per SECURITY_MODEL §9 (same host as guard and exit collapses the
+// unlinkability between client IP and destination).
+//
+// Because we cannot make two rows share a primary key, this test instead
+// seeds two distinct nodes total and exercises the path where the third
+// pick has no eligible row after the first two IDs are excluded.
+func TestCircuitRouteRequiresThreeDistinctNodes(t *testing.T) {
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping DB-backed distinct-host test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+
+	seedAs := func(role string) string {
+		var id string
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO relay_nodes (id, api_key_hash, endpoint, region, role, status, last_heartbeat)
+			 VALUES (gen_random_uuid(), $1, $2, 'us-east', $3, 'active', NOW())
+			 RETURNING id`,
+			"test-hash-distinct-"+role+"-"+time.Now().Format("150405.000000"),
+			"10.0.0.50:9001", role,
+		).Scan(&id); err != nil {
+			t.Fatalf("seed %s: %v", role, err)
+		}
+		t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM relay_nodes WHERE id = $1`, id) })
+		return id
+	}
+	// Only seed guard and middle — no exit row at all.
+	seedAs("guard")
+	seedAs("middle")
+
+	h := NewCircuitHandler(pool)
+	rec := httptest.NewRecorder()
+	h.HandleRoute(rec, httptest.NewRequest(http.MethodGet, "/api/v1/circuits/route", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when exit role has no row, got %d", rec.Code)
+	}
+}
+
 // TestCircuitRouteRequiresAllThreeRoles seeds two of the three required
 // relay roles, then asserts that HandleRoute returns 503 when the missing
 // role has no active relay. Requires a real database.

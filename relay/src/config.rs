@@ -1,5 +1,6 @@
 use std::env;
 use std::fmt;
+use std::net::IpAddr;
 
 use thiserror::Error;
 
@@ -58,6 +59,11 @@ pub struct RelayConfig {
     pub decodo_proxy_url: Option<String>,
     /// Required when role == Exit. Defaults to `[80, 443]` if unset.
     pub allowed_exit_ports: Vec<u16>,
+    /// IPs allowed to initiate relay-to-relay (protocol byte 0x02)
+    /// connections to this relay. Consulted only by middle and exit
+    /// roles, where inbound peer relays bypass the client token check.
+    /// Empty list = no peer relay is accepted (guard runs this way).
+    pub peer_allowlist: Vec<IpAddr>,
 }
 
 impl RelayConfig {
@@ -86,6 +92,10 @@ impl RelayConfig {
             None => vec![80, 443],
             Some(s) => parse_port_list(&s)?,
         };
+        let peer_allowlist = match get("RELAY_PEER_ALLOWLIST") {
+            None => Vec::new(),
+            Some(s) => parse_ip_list(&s)?,
+        };
 
         if role == Role::Exit && decodo_proxy_url.as_deref().unwrap_or("").is_empty() {
             return Err(ConfigError::ExitRequiresDecodoProxy);
@@ -103,8 +113,24 @@ impl RelayConfig {
             node_id,
             decodo_proxy_url,
             allowed_exit_ports,
+            peer_allowlist,
         })
     }
+}
+
+fn parse_ip_list(raw: &str) -> Result<Vec<IpAddr>, ConfigError> {
+    let mut out = Vec::new();
+    for piece in raw.split(',') {
+        let t = piece.trim();
+        if t.is_empty() {
+            continue;
+        }
+        out.push(t.parse::<IpAddr>().map_err(|e| ConfigError::Invalid {
+            var: "RELAY_PEER_ALLOWLIST",
+            reason: e.to_string(),
+        })?);
+    }
+    Ok(out)
 }
 
 fn required<F: Fn(&str) -> Option<String>>(get: &F, key: &'static str) -> Result<String, ConfigError> {

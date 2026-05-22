@@ -125,10 +125,16 @@ func GetActiveRelays(ctx context.Context, pool *pgxpool.Pool) ([]Relay, error) {
 }
 
 // PickRandomActiveByRole returns one active relay with the requested role,
-// chosen uniformly at random from the eligible pool. It returns
-// pgx.ErrNoRows when no active relay of that role exists; callers should
-// map that to a 503 rather than a 500.
-func PickRandomActiveByRole(ctx context.Context, pool *pgxpool.Pool, role string) (*Relay, error) {
+// chosen uniformly at random from the eligible pool. Any relay whose ID is
+// in excludeIDs is filtered out, so the circuit-route handler can require
+// three distinct physical nodes across guard/middle/exit. This is mandatory
+// per SECURITY_MODEL §9: the same host serving both guard and exit would
+// collapse the unlinkability between client IP (guard's view) and
+// destination (exit's view).
+//
+// Returns pgx.ErrNoRows when no active relay of the requested role exists
+// outside the excluded set; callers map that to a 503.
+func PickRandomActiveByRole(ctx context.Context, pool *pgxpool.Pool, role string, excludeIDs ...string) (*Relay, error) {
 	if !validRole(role) {
 		return nil, ErrInvalidRole
 	}
@@ -136,10 +142,12 @@ func PickRandomActiveByRole(ctx context.Context, pool *pgxpool.Pool, role string
 	err := pool.QueryRow(ctx,
 		`SELECT id, endpoint, region, role, status, last_heartbeat
 		 FROM relay_nodes
-		 WHERE role = $1 AND status = 'active'
+		 WHERE role = $1
+		   AND status = 'active'
+		   AND NOT (id = ANY($2::uuid[]))
 		 ORDER BY random()
 		 LIMIT 1`,
-		role,
+		role, excludeIDs,
 	).Scan(&r.ID, &r.Endpoint, &r.Region, &r.Role, &r.Status, &r.LastHeartbeat)
 	if err != nil {
 		return nil, err

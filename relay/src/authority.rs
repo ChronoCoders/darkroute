@@ -59,6 +59,15 @@ impl AuthorityClient {
     pub fn pubkey(&self) -> &RsaPublicKey {
         &self.pubkey
     }
+
+    /// Test-only constructor. Production code MUST pin via fetch_and_pin
+    /// over HTTPS so a misconfigured relay cannot start with a forged key.
+    /// This entry point exists solely so the in-process integration tests
+    /// can wire up three relays without standing up an HTTP server.
+    #[cfg(test)]
+    pub fn from_pubkey_for_test(pubkey: RsaPublicKey) -> Self {
+        Self { pubkey }
+    }
 }
 
 fn parse_pubkey(body: &str) -> Result<RsaPublicKey, AuthorityError> {
