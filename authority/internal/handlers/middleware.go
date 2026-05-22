@@ -81,12 +81,23 @@ func Logger(next http.Handler) http.Handler {
 func Authenticate(jm *auth.JWTManager, pool *pgxpool.Pool) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Two token-bearer paths: Authorization: Bearer for API
+			// clients, and the HttpOnly "jwt" cookie for the dashboard.
+			// Either is sufficient; the session-id cookie is required
+			// in both cases.
 			h := r.Header.Get("Authorization")
-			if !strings.HasPrefix(h, "Bearer ") {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
-				return
+			var tokenStr string
+			switch {
+			case strings.HasPrefix(h, "Bearer "):
+				tokenStr = strings.TrimPrefix(h, "Bearer ")
+			default:
+				c, err := r.Cookie("jwt")
+				if err != nil || c.Value == "" {
+					writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+					return
+				}
+				tokenStr = c.Value
 			}
-			tokenStr := strings.TrimPrefix(h, "Bearer ")
 			claims, err := jm.ValidateToken(tokenStr)
 			if err != nil {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})

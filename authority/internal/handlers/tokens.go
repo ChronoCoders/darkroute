@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -107,7 +108,10 @@ func (h *TokenHandler) HandleIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// SECURITY_MODEL §5.2 step 8: counter only, no token value.
+	// SECURITY_MODEL §5.2 step 8: counter only, no token value. We also
+	// insert a row into token_issuance_events with the timestamp only
+	// (no token bytes) so the dashboard can show a list of recent
+	// issuances per the user-facing Phase 5 Tokens page.
 	if _, err := h.pool.Exec(r.Context(),
 		`UPDATE subscriptions
 		 SET tokens_issued = tokens_issued + 1
@@ -117,8 +121,77 @@ func (h *TokenHandler) HandleIssue(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
+	if _, err := h.pool.Exec(r.Context(),
+		`INSERT INTO token_issuance_events (subscriber_id) VALUES ($1)`,
+		subID,
+	); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
 
 	writeJSON(w, http.StatusOK, map[string]string{
 		"signed": hex.EncodeToString(signed),
 	})
+}
+
+type tokenIssuanceListItem struct {
+	ID       string `json:"id"`
+	IssuedAt string `json:"issued_at"`
+}
+
+type tokenListResponse struct {
+	TokensIssued int64                  `json:"tokens_issued"`
+	Recent       []tokenIssuanceListItem `json:"recent"`
+}
+
+// HandleListTokens returns the subscriber's lifetime issuance counter
+// and the most recent N issuance timestamps. No token bytes are stored
+// or returned — this is purely an audit/visualisation surface.
+func (h *TokenHandler) HandleListTokens(w http.ResponseWriter, r *http.Request) {
+	subID, ok := r.Context().Value(subscriberKey).(string)
+	if !ok || subID == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	var count int64
+	if err := h.pool.QueryRow(r.Context(),
+		`SELECT COALESCE(SUM(tokens_issued), 0)::bigint
+		 FROM subscriptions
+		 WHERE subscriber_id = $1`,
+		subID,
+	).Scan(&count); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	rows, err := h.pool.Query(r.Context(),
+		`SELECT id, issued_at
+		 FROM token_issuance_events
+		 WHERE subscriber_id = $1
+		 ORDER BY issued_at DESC
+		 LIMIT 50`,
+		subID,
+	)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	defer rows.Close()
+	out := tokenListResponse{TokensIssued: count, Recent: []tokenIssuanceListItem{}}
+	for rows.Next() {
+		var id string
+		var issued time.Time
+		if err := rows.Scan(&id, &issued); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+			return
+		}
+		out.Recent = append(out.Recent, tokenIssuanceListItem{
+			ID:       id,
+			IssuedAt: issued.UTC().Format(time.RFC3339),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
 }
