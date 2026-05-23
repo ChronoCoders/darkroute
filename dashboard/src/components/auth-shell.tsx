@@ -4,6 +4,7 @@ import { motion } from "framer-motion";
 import type { ReactNode } from "react";
 
 import { Marketing } from "@/components/marketing";
+import { NetworkMesh } from "@/components/visuals/network-mesh";
 
 export function AuthShell({
   title,
@@ -21,17 +22,18 @@ export function AuthShell({
       {/* Left side — branding */}
       <div className="relative hidden overflow-hidden border-r border-border/60 bg-background lg:block">
         <Marketing.BackgroundGrid />
+        <NetworkMesh />
+        <div
+          aria-hidden
+          className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_30%_40%,rgba(120,140,200,0.10),transparent_60%)]"
+        />
         <div className="relative z-10 flex h-full flex-col p-10">
           <Marketing.Logo />
           <div className="mt-auto max-w-md">
             <blockquote className="text-2xl font-medium tracking-tight text-zinc-200">
-              &ldquo;No single party can link an access key to the account
-              that requested it. Each network point sees only the layer in
-              front of it.&rdquo;
+              &ldquo;Nobody can trace a connection back to you. Not even
+              us.&rdquo;
             </blockquote>
-            <p className="mt-4 text-sm text-muted-foreground">
-              — Security principle
-            </p>
           </div>
         </div>
       </div>
