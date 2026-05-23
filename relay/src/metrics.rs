@@ -103,7 +103,9 @@ pub async fn serve(mut sock: TcpStream) -> io::Result<()> {
         Err(e) => {
             // Best-effort 400, then close.
             let _ = sock
-                .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
                 .await;
             let _ = sock.shutdown().await;
             return Err(e);
@@ -133,7 +135,12 @@ async fn read_request_path(sock: &mut TcpStream) -> io::Result<String> {
     loop {
         let n = match timeout(REQUEST_READ_TIMEOUT, sock.read(&mut buf[read..])).await {
             Ok(r) => r?,
-            Err(_) => return Err(io::Error::new(io::ErrorKind::TimedOut, "request read timeout")),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "request read timeout",
+                ))
+            }
         };
         if n == 0 {
             break;

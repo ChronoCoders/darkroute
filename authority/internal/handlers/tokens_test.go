@@ -69,9 +69,9 @@ func TestPubkeyHandlerReturnsValidPEM(t *testing.T) {
 	}
 }
 
-// TestIssueRejectsExpiredJWT exercises the Authenticate middleware path that
-// guards /api/v1/tokens/issue. An expired token must produce 401, and the
-// handler must never run (pool is nil so a handler call would panic).
+// An expired token must produce 401, and the handler must never run
+// (pool is nil so a handler call would panic if the middleware lets it
+// through).
 func TestIssueRejectsExpiredJWT(t *testing.T) {
 	jm := auth.NewJWTManager(testJWTSecret)
 	signer := testSignerForHandler(t)
@@ -101,8 +101,6 @@ func TestIssueRejectsExpiredJWT(t *testing.T) {
 	}
 }
 
-// mintExpiredJWT crafts an HS256 JWT signed with testJWTSecret whose iat/exp
-// are firmly in the past. The middleware must reject it as expired.
 func mintExpiredJWT(t *testing.T) string {
 	t.Helper()
 	past := time.Now().Add(-2 * time.Hour)
@@ -124,9 +122,6 @@ func mintExpiredJWT(t *testing.T) string {
 	return signed
 }
 
-// TestIssueIncrementsTokensIssued requires a real DB (TEST_DATABASE_URL).
-// It seeds a subscriber + active subscription, calls HandleIssue with a
-// valid blinded value, and verifies the counter advanced by exactly one.
 func TestIssueIncrementsTokensIssued(t *testing.T) {
 	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {
@@ -156,8 +151,7 @@ func TestIssueIncrementsTokensIssued(t *testing.T) {
 	signer := testSignerForHandler(t)
 	th := NewTokenHandler(pool, signer)
 
-	// Build a valid blinded value: pick m = 2, r = 3 (both coprime to n);
-	// b = m * r^e mod n.
+	// m = 2, r = 3 are both coprime to n; b = m * r^e mod n.
 	pub := signer.PublicKey()
 	m := big.NewInt(2)
 	r := big.NewInt(3)
@@ -193,7 +187,6 @@ func TestIssueIncrementsTokensIssued(t *testing.T) {
 		t.Errorf("tokens_issued = %d, want 1", count)
 	}
 
-	// And it must actually be a valid blind signature: sBlind^e mod n == b.
 	sBlind, err := hex.DecodeString(got.Signed)
 	if err != nil {
 		t.Fatal(err)
@@ -204,4 +197,3 @@ func TestIssueIncrementsTokensIssued(t *testing.T) {
 		t.Error("returned signature does not verify against b")
 	}
 }
-

@@ -10,10 +10,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// AdminHandler serves the admin-tier surfaces: subscriber listing and
-// the pending-review approval action. All routes are mounted behind
-// RequireRole("admin") in main.go; this handler does not re-check the
-// role itself.
+// All routes are mounted behind RequireRole("admin") in main.go; this
+// handler does not re-check the role itself.
 type AdminHandler struct {
 	pool *pgxpool.Pool
 }
@@ -102,10 +100,6 @@ func (h *AdminHandler) HandleListSubscribers(w http.ResponseWriter, r *http.Requ
 	writeJSON(w, http.StatusOK, out)
 }
 
-// HandleApproveSubscriber flips a subscriber's latest subscription
-// from pending_review (or any non-active state) to active. The
-// onboarding gate the dashboard surfaces (Account: "pending review")
-// is released by this action and only this action.
 func (h *AdminHandler) HandleApproveSubscriber(w http.ResponseWriter, r *http.Request) {
 	id := chi.URLParam(r, "id")
 	if id == "" {

@@ -117,14 +117,9 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_url_missing_port_is_rejected() {
-        let err = dial_via_socks5(
-            "socks5://user:pass@proxy",
-            "example.com",
-            443,
-            &[80, 443],
-        )
-        .await
-        .unwrap_err();
+        let err = dial_via_socks5("socks5://user:pass@proxy", "example.com", 443, &[80, 443])
+            .await
+            .unwrap_err();
         assert!(matches!(err, ExitError::BadProxyUrl));
     }
 }

@@ -7,9 +7,9 @@ import (
 	"testing"
 )
 
-// fakeNoDB is used to prove the IP check happens before any DB access. If the
-// handler ever reaches RecordHeartbeat with allowedIPs empty, the test will
-// fail with a nil-pointer panic instead of returning a clean 401.
+// The IP check must happen before any DB access. If the handler ever
+// reaches RecordHeartbeat with allowedIPs empty, the test will fail with
+// a nil-pointer panic instead of returning a clean 401.
 func TestHeartbeatRejectsUnlistedIPBeforeAPIKeyCheck(t *testing.T) {
 	h := NewRelayHandler(nil, "salt-x", nil) // allowedIPs empty
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/relay/heartbeat", nil)
@@ -46,7 +46,6 @@ func TestHeartbeatRejectsMissingAuthorizationHeader(t *testing.T) {
 	h := NewRelayHandler(nil, "salt-x", []string{"10.0.0.5"})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/relay/heartbeat", nil)
 	req.RemoteAddr = "10.0.0.5:55000"
-	// No Authorization header
 	rec := httptest.NewRecorder()
 
 	h.HandleRelayHeartbeat(rec, req)

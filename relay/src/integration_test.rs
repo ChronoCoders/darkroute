@@ -113,7 +113,9 @@ async fn read_frame_raw(sock: &mut TcpStream) -> Vec<u8> {
 
 #[tokio::test]
 async fn end_to_end_three_hop_circuit() {
-    tokio::time::timeout(TEST_TIMEOUT, run_test()).await.expect("test timed out");
+    tokio::time::timeout(TEST_TIMEOUT, run_test())
+        .await
+        .expect("test timed out");
 }
 
 async fn run_test() {
@@ -126,7 +128,6 @@ async fn run_test() {
     let mut rng = OsRng;
     let auth_priv = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
 
-    // Spawn the three relays.
     let over = default_override();
     let guard_addr = spawn_relay(Role::Guard, &auth_priv, &over).await;
     let middle_addr = spawn_relay(Role::Middle, &auth_priv, &over).await;
@@ -135,31 +136,31 @@ async fn run_test() {
     // Give the relays a moment to begin accepting.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Mock client: open TCP to guard.
     let mut sock = TcpStream::connect(guard_addr).await.expect("connect guard");
     sock.set_nodelay(true).expect("nodelay");
 
-    // ----- Phase 3: client-mode protocol byte + token presentation -----
-    sock.write_all(&[super::PROTO_CLIENT]).await.expect("proto byte");
+    sock.write_all(&[super::PROTO_CLIENT])
+        .await
+        .expect("proto byte");
     let m_raw: [u8; 32] = [0xA5; 32];
     let token = raw_sign(&m_raw, &auth_priv);
     sock.write_all(&m_raw).await.expect("m_raw");
     sock.write_all(&token).await.expect("token");
     sock.flush().await.expect("flush");
 
-    // ----- ECDH with guard -----
     let client_secret_guard = EphemeralSecret::random_from_rng(OsRng);
     let client_pk_guard = PublicKey::from(&client_secret_guard);
-    sock.write_all(client_pk_guard.as_bytes()).await.expect("write client pk guard");
+    sock.write_all(client_pk_guard.as_bytes())
+        .await
+        .expect("write client pk guard");
     sock.flush().await.expect("flush");
     let mut guard_pk_bytes = [0u8; X25519_PUBKEY_LEN];
-    sock.read_exact(&mut guard_pk_bytes).await.expect("read guard pk");
+    sock.read_exact(&mut guard_pk_bytes)
+        .await
+        .expect("read guard pk");
     let guard_pk = PublicKey::from(guard_pk_bytes);
-    let k_guard = derive_session_key(
-        client_secret_guard.diffie_hellman(&guard_pk).as_bytes(),
-    );
+    let k_guard = derive_session_key(client_secret_guard.diffie_hellman(&guard_pk).as_bytes());
 
-    // ----- EXTEND to middle -----
     let client_secret_middle = EphemeralSecret::random_from_rng(OsRng);
     let client_pk_middle = PublicKey::from(&client_secret_middle);
     let extend_for_middle = ExtendForward {
@@ -172,19 +173,18 @@ async fn run_test() {
     sock.write_all(&frame).await.expect("send extend");
     sock.flush().await.expect("flush");
 
-    // ----- Read EXTEND-backward from guard -----
     let back_frame = read_frame_raw(&mut sock).await;
     let back_plain = decrypt_frame(&k_guard, &back_frame).expect("decrypt extend-back");
     let back_cell = Cell::decode(&back_plain).expect("decode extend-back");
-    assert_eq!(back_cell.cell_type, CellType::Extend, "expected EXTEND-backward");
-    let middle_pk_bytes =
-        parse_extend_backward(&back_cell.payload).expect("parse middle pk");
-    let middle_pk = PublicKey::from(middle_pk_bytes);
-    let k_middle = derive_session_key(
-        client_secret_middle.diffie_hellman(&middle_pk).as_bytes(),
+    assert_eq!(
+        back_cell.cell_type,
+        CellType::Extend,
+        "expected EXTEND-backward"
     );
+    let middle_pk_bytes = parse_extend_backward(&back_cell.payload).expect("parse middle pk");
+    let middle_pk = PublicKey::from(middle_pk_bytes);
+    let k_middle = derive_session_key(client_secret_middle.diffie_hellman(&middle_pk).as_bytes());
 
-    // ----- EXTEND to exit, wrapped in RELAY+K_guard -----
     let client_secret_exit = EphemeralSecret::random_from_rng(OsRng);
     let client_pk_exit = PublicKey::from(&client_secret_exit);
     let extend_for_exit = ExtendForward {
@@ -198,31 +198,37 @@ async fn run_test() {
     let relay_cell =
         Cell::new(CellType::Relay, CIRCUIT_ID, inner_extend_frame).expect("relay wrap");
     let outer_frame = encrypt_frame(&k_guard, &relay_cell.encode()).expect("encrypt outer");
-    sock.write_all(&outer_frame).await.expect("send relay-extend");
+    sock.write_all(&outer_frame)
+        .await
+        .expect("send relay-extend");
     sock.flush().await.expect("flush");
 
-    // ----- Read RELAY(EXTEND-backward) for exit -----
     let outer_back = read_frame_raw(&mut sock).await;
     let outer_back_plain = decrypt_frame(&k_guard, &outer_back).expect("decrypt outer-back");
     let outer_back_cell = Cell::decode(&outer_back_plain).expect("decode outer-back");
-    assert_eq!(outer_back_cell.cell_type, CellType::Relay, "expected RELAY-back from guard");
+    assert_eq!(
+        outer_back_cell.cell_type,
+        CellType::Relay,
+        "expected RELAY-back from guard"
+    );
     let inner_back_plain =
         decrypt_frame(&k_middle, &outer_back_cell.payload).expect("decrypt inner-back");
     let inner_back_cell = Cell::decode(&inner_back_plain).expect("decode inner-back");
-    assert_eq!(inner_back_cell.cell_type, CellType::Extend, "expected EXTEND-back from middle");
+    assert_eq!(
+        inner_back_cell.cell_type,
+        CellType::Extend,
+        "expected EXTEND-back from middle"
+    );
     let exit_pk_bytes = parse_extend_backward(&inner_back_cell.payload).expect("parse exit pk");
     let exit_pk = PublicKey::from(exit_pk_bytes);
-    let k_exit = derive_session_key(
-        client_secret_exit.diffie_hellman(&exit_pk).as_bytes(),
-    );
+    let k_exit = derive_session_key(client_secret_exit.diffie_hellman(&exit_pk).as_bytes());
 
-    // ----- Send CONNECT triple-wrapped to exit -----
     let connect_payload = ConnectPayload {
         host: "example.com".to_string(),
         port: 443,
     };
-    let connect_cell = Cell::new(CellType::Connect, CIRCUIT_ID, connect_payload.encode())
-        .expect("connect cell");
+    let connect_cell =
+        Cell::new(CellType::Connect, CIRCUIT_ID, connect_payload.encode()).expect("connect cell");
     let exit_frame = encrypt_frame(&k_exit, &connect_cell.encode()).expect("encrypt connect");
     let mid_relay = Cell::new(CellType::Relay, CIRCUIT_ID, exit_frame).expect("mid relay wrap");
     let mid_frame = encrypt_frame(&k_middle, &mid_relay.encode()).expect("encrypt middle relay");
@@ -241,10 +247,7 @@ async fn run_test() {
     // CONNECT through. Loop until we see the host we sent.
     let received = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let p = connect_rx
-                .recv()
-                .await
-                .expect("connect channel closed");
+            let p = connect_rx.recv().await.expect("connect channel closed");
             if p.host == "example.com" {
                 return p;
             }
@@ -261,10 +264,6 @@ async fn run_test() {
     // is implicitly verified by the test process not crashing.
     drop(sock);
 }
-
-// ============================================================
-// Phase 4c: DATA round-trip through SOCKS5-mediated exit dial
-// ============================================================
 
 /// Minimal SOCKS5 server stub used by the Phase 4c test only. Accepts
 /// either no-auth or username/password auth (echoing success without
@@ -291,11 +290,7 @@ async fn handle_socks5_session(sock: &mut TcpStream) -> std::io::Result<()> {
     let mut methods = vec![0u8; nmethods];
     sock.read_exact(&mut methods).await?;
 
-    let chosen: u8 = if methods.contains(&0x02) {
-        0x02
-    } else {
-        0x00
-    };
+    let chosen: u8 = if methods.contains(&0x02) { 0x02 } else { 0x00 };
     sock.write_all(&[0x05, chosen]).await?;
 
     if chosen == 0x02 {
@@ -347,7 +342,8 @@ async fn handle_socks5_session(sock: &mut TcpStream) -> std::io::Result<()> {
     let target = TcpStream::connect(target_addr).await?;
 
     // SOCKS5 success reply: VER, REP=00, RSV=00, ATYP=01, BND.ADDR=0.0.0.0, BND.PORT=0
-    sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+    sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await?;
 
     let (mut sr, mut sw) = sock.split();
     let (mut tr, mut tw) = target.into_split();
@@ -377,7 +373,9 @@ async fn run_echo_server(listener: TcpListener) {
 
 #[tokio::test]
 async fn end_to_end_data_round_trip_via_socks5() {
-    tokio::time::timeout(TEST_TIMEOUT, run_data_test()).await.expect("test timed out");
+    tokio::time::timeout(TEST_TIMEOUT, run_data_test())
+        .await
+        .expect("test timed out");
 }
 
 async fn run_data_test() {
@@ -385,12 +383,10 @@ async fn run_data_test() {
     // previously-installed sender in place so parallel tests do not
     // race over the global OnceLock.
 
-    // 1. Echo server on a random localhost port.
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
     let echo_addr = echo_listener.local_addr().expect("echo addr");
     tokio::spawn(run_echo_server(echo_listener));
 
-    // 2. SOCKS5 stub on a random localhost port.
     let socks_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind socks");
     let socks_addr = socks_listener.local_addr().expect("socks addr");
     tokio::spawn(run_socks5_stub(socks_listener));
@@ -398,7 +394,6 @@ async fn run_data_test() {
     let socks_url = format!("socks5://user:pass@{socks_addr}");
     let over = RelayOverride {
         decodo_proxy_url: Some(socks_url),
-        // Allow the echo server's ephemeral port.
         allowed_exit_ports: vec![echo_addr.port(), 80, 443],
     };
 
@@ -412,7 +407,6 @@ async fn run_data_test() {
     let mut sock = TcpStream::connect(guard_addr).await.expect("connect guard");
     sock.set_nodelay(true).expect("nodelay");
 
-    // Phase 3 + Phase 4a handshake on the guard
     sock.write_all(&[super::PROTO_CLIENT]).await.expect("proto");
     let m_raw: [u8; 32] = [0x77; 32];
     let token = raw_sign(&m_raw, &auth_priv);
@@ -420,15 +414,18 @@ async fn run_data_test() {
     sock.write_all(&token).await.expect("token");
     let client_secret_guard = EphemeralSecret::random_from_rng(OsRng);
     let client_pk_guard = PublicKey::from(&client_secret_guard);
-    sock.write_all(client_pk_guard.as_bytes()).await.expect("client pk");
+    sock.write_all(client_pk_guard.as_bytes())
+        .await
+        .expect("client pk");
     sock.flush().await.expect("flush");
     let mut guard_pk = [0u8; X25519_PUBKEY_LEN];
     sock.read_exact(&mut guard_pk).await.expect("guard pk");
     let k_guard = derive_session_key(
-        client_secret_guard.diffie_hellman(&PublicKey::from(guard_pk)).as_bytes(),
+        client_secret_guard
+            .diffie_hellman(&PublicKey::from(guard_pk))
+            .as_bytes(),
     );
 
-    // EXTEND to middle
     let client_secret_middle = EphemeralSecret::random_from_rng(OsRng);
     let client_pk_middle = PublicKey::from(&client_secret_middle);
     let extend_for_middle = ExtendForward {
@@ -447,7 +444,6 @@ async fn run_data_test() {
             .as_bytes(),
     );
 
-    // EXTEND to exit, wrapped in RELAY+K_guard
     let client_secret_exit = EphemeralSecret::random_from_rng(OsRng);
     let client_pk_exit = PublicKey::from(&client_secret_exit);
     let extend_for_exit = ExtendForward {
@@ -470,13 +466,11 @@ async fn run_data_test() {
             .as_bytes(),
     );
 
-    // CONNECT triple-wrapped: target is the echo server's address
     let connect_payload = ConnectPayload {
         host: format!("{}", echo_addr.ip()),
         port: echo_addr.port(),
     };
-    let connect_cell =
-        Cell::new(CellType::Connect, CIRCUIT_ID, connect_payload.encode()).unwrap();
+    let connect_cell = Cell::new(CellType::Connect, CIRCUIT_ID, connect_payload.encode()).unwrap();
     let f_exit = encrypt_frame(&k_exit, &connect_cell.encode()).unwrap();
     let r_mid = Cell::new(CellType::Relay, CIRCUIT_ID, f_exit).unwrap();
     let f_mid = encrypt_frame(&k_middle, &r_mid.encode()).unwrap();
@@ -487,7 +481,6 @@ async fn run_data_test() {
     // Wait briefly so the exit completes the SOCKS5 dial before DATA arrives.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    // DATA triple-wrapped: payload = "hello-darkroute"
     let payload_bytes = b"hello-darkroute".to_vec();
     let data_cell = Cell::new(CellType::Data, CIRCUIT_ID, payload_bytes.clone()).unwrap();
     let f_exit = encrypt_frame(&k_exit, &data_cell.encode()).unwrap();

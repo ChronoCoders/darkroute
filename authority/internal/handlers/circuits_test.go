@@ -12,15 +12,11 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// TestCircuitRouteRequiresThreeDistinctNodes seeds one active relay per
-// role but configures two of them with the SAME UUID, so two of the three
-// picks land on the same physical node. The handler must reject this with
-// 503 per SECURITY_MODEL §9 (same host as guard and exit collapses the
-// unlinkability between client IP and destination).
-//
-// Because we cannot make two rows share a primary key, this test instead
-// seeds two distinct nodes total and exercises the path where the third
-// pick has no eligible row after the first two IDs are excluded.
+// Per SECURITY_MODEL §9: same host as guard and exit collapses the
+// unlinkability between client IP and destination. Because we cannot make
+// two rows share a primary key, this test seeds two distinct nodes total
+// and exercises the path where the third pick has no eligible row after
+// the first two IDs are excluded.
 func TestCircuitRouteRequiresThreeDistinctNodes(t *testing.T) {
 	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {
@@ -48,7 +44,6 @@ func TestCircuitRouteRequiresThreeDistinctNodes(t *testing.T) {
 		t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM relay_nodes WHERE id = $1`, id) })
 		return id
 	}
-	// Only seed guard and middle — no exit row at all.
 	seedAs("guard")
 	seedAs("middle")
 
@@ -60,9 +55,6 @@ func TestCircuitRouteRequiresThreeDistinctNodes(t *testing.T) {
 	}
 }
 
-// TestCircuitRouteRequiresAllThreeRoles seeds two of the three required
-// relay roles, then asserts that HandleRoute returns 503 when the missing
-// role has no active relay. Requires a real database.
 func TestCircuitRouteRequiresAllThreeRoles(t *testing.T) {
 	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {
@@ -92,7 +84,6 @@ func TestCircuitRouteRequiresAllThreeRoles(t *testing.T) {
 	}
 	seed("guard")
 	seed("middle")
-	// Deliberately omit exit.
 
 	h := NewCircuitHandler(pool)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/circuits/route", nil)

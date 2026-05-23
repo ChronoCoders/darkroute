@@ -35,7 +35,6 @@ func TestHashAPIKeyIsDeterministic(t *testing.T) {
 	if hashAPIKey("salt", "key1") == hashAPIKey("salt", "key2") {
 		t.Errorf("plaintext must affect hash")
 	}
-	// hex-encoded SHA-256 is 64 chars
 	if len(hashAPIKey("salt", "key")) != 64 {
 		t.Errorf("hash length: got %d want 64", len(hashAPIKey("salt", "key")))
 	}
@@ -87,7 +86,6 @@ func TestProvisionAndSweep(t *testing.T) {
 		t.Errorf("expected unknown relay error for bad key")
 	}
 
-	// Sweep with a TTL of 1 nanosecond should mark this active relay inactive.
 	n, err := SweepInactiveRelays(ctx, pool, time.Nanosecond)
 	if err != nil {
 		t.Fatalf("Sweep: %v", err)
@@ -96,7 +94,6 @@ func TestProvisionAndSweep(t *testing.T) {
 		t.Errorf("expected at least 1 relay swept inactive, got %d", n)
 	}
 
-	// A second sweep should affect 0 rows (already inactive).
 	n2, err := SweepInactiveRelays(ctx, pool, time.Nanosecond)
 	if err != nil {
 		t.Fatalf("Sweep 2: %v", err)
@@ -106,12 +103,8 @@ func TestProvisionAndSweep(t *testing.T) {
 	}
 }
 
-// TestPickRandomActiveByRoleExcludesIDs verifies the distinct-host
-// enforcement: PickRandomActiveByRole must never return a relay whose ID
-// is in the exclusion list, and must return pgx.ErrNoRows when the
-// eligible pool is empty after exclusion. This is the mechanism by which
-// the circuit-route handler guarantees three distinct hops per
-// SECURITY_MODEL §9.
+// Per SECURITY_MODEL §9: this exclusion mechanism is how the circuit-route
+// handler guarantees three distinct physical hops.
 func TestPickRandomActiveByRoleExcludesIDs(t *testing.T) {
 	pool := testPool(t)
 	defer pool.Close()
@@ -135,7 +128,6 @@ func TestPickRandomActiveByRoleExcludesIDs(t *testing.T) {
 	g1 := seedActiveGuard()
 	g2 := seedActiveGuard()
 
-	// With no exclusion, must return one of the two.
 	r, err := PickRandomActiveByRole(ctx, pool, "guard")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -144,7 +136,6 @@ func TestPickRandomActiveByRoleExcludesIDs(t *testing.T) {
 		t.Fatalf("returned id %q is neither seeded guard", r.ID)
 	}
 
-	// Excluding g1 must return g2 deterministically (single eligible row).
 	r, err = PickRandomActiveByRole(ctx, pool, "guard", g1)
 	if err != nil {
 		t.Fatalf("unexpected error excluding g1: %v", err)
@@ -153,7 +144,6 @@ func TestPickRandomActiveByRoleExcludesIDs(t *testing.T) {
 		t.Errorf("excluding g1 returned %q, expected g2 (%q)", r.ID, g2)
 	}
 
-	// Excluding both must return pgx.ErrNoRows.
 	if _, err := PickRandomActiveByRole(ctx, pool, "guard", g1, g2); err == nil {
 		t.Errorf("expected error when both guards excluded, got nil")
 	}

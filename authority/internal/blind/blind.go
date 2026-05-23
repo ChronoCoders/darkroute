@@ -28,23 +28,20 @@ import (
 	"path/filepath"
 )
 
-// RSAKeySize is the required modulus size in bits per SECURITY_MODEL §4.
+// Required modulus size in bits per SECURITY_MODEL §4.
 const RSAKeySize = 2048
 
 var (
 	ErrInvalidBlindedValue = errors.New("blinded value is out of range [1, n-1]")
 )
 
-// Signer holds the authority's RSA keypair and exposes the raw blind
-// signature primitive. It is safe for concurrent use by multiple goroutines.
 type Signer struct {
 	key    *rsa.PrivateKey
 	pemPub []byte
 }
 
-// LoadOrGenerate reads an RSA private key from path. If the file does not
-// exist, a fresh RSA-2048 keypair is generated and persisted with 0600
-// permissions. Any other I/O or parse error is surfaced.
+// Persists generated keys with 0600 file mode so the private key is never
+// world-readable on disk.
 func LoadOrGenerate(path string) (*Signer, error) {
 	data, err := os.ReadFile(path)
 	if err == nil {
@@ -126,25 +123,18 @@ func newSigner(priv *rsa.PrivateKey) (*Signer, error) {
 	return &Signer{key: priv, pemPub: pemPub}, nil
 }
 
-// PublicKeyPEM returns a copy of the PKIX PEM-encoded public key. The
-// returned slice is safe to send to relays without further synchronization.
+// Returns a fresh copy so callers can mutate or transmit it without racing
+// the shared signer state.
 func (s *Signer) PublicKeyPEM() []byte {
 	out := make([]byte, len(s.pemPub))
 	copy(out, s.pemPub)
 	return out
 }
 
-// ModulusSize returns the modulus length in bytes.
 func (s *Signer) ModulusSize() int {
 	return (s.key.N.BitLen() + 7) / 8
 }
 
-// Sign computes s = b^d mod n where b is the blinded message bytes. The
-// returned slice is zero-padded to the modulus size so downstream callers
-// can treat it as a fixed-length value.
-//
-// b is interpreted as an unsigned big-endian integer. Values outside the
-// open range (0, n) are rejected with ErrInvalidBlindedValue.
 func (s *Signer) Sign(blinded []byte) ([]byte, error) {
 	if len(blinded) == 0 {
 		return nil, ErrInvalidBlindedValue
@@ -159,8 +149,7 @@ func (s *Signer) Sign(blinded []byte) ([]byte, error) {
 	return out, nil
 }
 
-// PublicKey exposes the public half so tests and the pubkey handler can
-// derive the modulus and exponent. The returned pointer must not be mutated.
+// Returns a pointer to the live key; callers must not mutate it.
 func (s *Signer) PublicKey() *rsa.PublicKey {
 	return &s.key.PublicKey
 }

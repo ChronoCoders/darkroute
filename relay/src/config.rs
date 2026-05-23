@@ -161,7 +161,10 @@ fn parse_ip_list(raw: &str) -> Result<Vec<IpAddr>, ConfigError> {
     Ok(out)
 }
 
-fn required<F: Fn(&str) -> Option<String>>(get: &F, key: &'static str) -> Result<String, ConfigError> {
+fn required<F: Fn(&str) -> Option<String>>(
+    get: &F,
+    key: &'static str,
+) -> Result<String, ConfigError> {
     match get(key) {
         Some(v) if !v.is_empty() => Ok(v),
         _ => Err(ConfigError::Missing(key)),
@@ -239,14 +242,19 @@ mod tests {
         let mut m = HashMap::new();
         m.insert("RELAY_ROLE", "guard");
         m.insert("AUTHORITY_PUBKEY_URL", "https://authority.example/pubkey");
-        m.insert("AUTHORITY_HEARTBEAT_URL", "https://authority.example/api/v1/relay/heartbeat");
+        m.insert(
+            "AUTHORITY_HEARTBEAT_URL",
+            "https://authority.example/api/v1/relay/heartbeat",
+        );
         m.insert("RELAY_API_KEY", "key-xyz");
         m.insert("MAX_CIRCUITS", "256");
         m.insert("NODE_ID", "relay-001");
         m
     }
 
-    fn lookup<'a>(m: &'a HashMap<&'static str, &'static str>) -> impl Fn(&str) -> Option<String> + 'a {
+    fn lookup<'a>(
+        m: &'a HashMap<&'static str, &'static str>,
+    ) -> impl Fn(&str) -> Option<String> + 'a {
         move |k: &str| m.get(k).map(|v| (*v).to_string())
     }
 
@@ -282,7 +290,6 @@ mod tests {
     fn exit_role_requires_decodo_proxy_url() {
         let mut env = base_env();
         env.insert("RELAY_ROLE", "exit");
-        // DECODO_PROXY_URL not set
         let err = RelayConfig::from_source(lookup(&env)).unwrap_err();
         assert!(matches!(err, ConfigError::ExitRequiresDecodoProxy));
     }
@@ -294,7 +301,10 @@ mod tests {
         env.insert("DECODO_PROXY_URL", "socks5://user:pass@host:1080");
         let cfg = RelayConfig::from_source(lookup(&env)).expect("valid exit config");
         assert_eq!(cfg.role, Role::Exit);
-        assert_eq!(cfg.decodo_proxy_url.as_deref(), Some("socks5://user:pass@host:1080"));
+        assert_eq!(
+            cfg.decodo_proxy_url.as_deref(),
+            Some("socks5://user:pass@host:1080")
+        );
     }
 
     #[test]
@@ -303,7 +313,13 @@ mod tests {
         env.insert("RELAY_ROLE", "exit");
         env.insert("DECODO_PROXY_URL", "not a url at all");
         let err = RelayConfig::from_source(lookup(&env)).unwrap_err();
-        assert!(matches!(err, ConfigError::Invalid { var: "DECODO_PROXY_URL", .. }));
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "DECODO_PROXY_URL",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -312,7 +328,13 @@ mod tests {
         env.insert("RELAY_ROLE", "exit");
         env.insert("DECODO_PROXY_URL", "http://user:pass@host:1080");
         let err = RelayConfig::from_source(lookup(&env)).unwrap_err();
-        assert!(matches!(err, ConfigError::Invalid { var: "DECODO_PROXY_URL", .. }));
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "DECODO_PROXY_URL",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -321,7 +343,13 @@ mod tests {
         env.insert("RELAY_ROLE", "exit");
         env.insert("DECODO_PROXY_URL", "socks5://user:pass@host");
         let err = RelayConfig::from_source(lookup(&env)).unwrap_err();
-        assert!(matches!(err, ConfigError::Invalid { var: "DECODO_PROXY_URL", .. }));
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "DECODO_PROXY_URL",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -371,6 +399,12 @@ mod tests {
         let mut env = base_env();
         env.insert("RELAY_PORT", "not-a-number");
         let err = RelayConfig::from_source(lookup(&env)).unwrap_err();
-        assert!(matches!(err, ConfigError::Invalid { var: "RELAY_PORT", .. }));
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "RELAY_PORT",
+                ..
+            }
+        ));
     }
 }

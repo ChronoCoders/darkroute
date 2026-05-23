@@ -34,9 +34,9 @@ func validRole(role string) bool {
 	return false
 }
 
-// hashAPIKey computes SHA-256(salt || plaintext). The spec (SECURITY_MODEL §7.2)
-// specifies SHA-256; the salt from RELAY_API_KEY_SALT is included so a database
-// dump alone does not enable offline brute-force against short or low-entropy keys.
+// SECURITY_MODEL §7.2 specifies SHA-256; the salt from RELAY_API_KEY_SALT
+// is included so a database dump alone does not enable offline brute-force
+// against short or low-entropy keys.
 func hashAPIKey(salt, plaintext string) string {
 	h := sha256.New()
 	h.Write([]byte(salt))
@@ -52,9 +52,8 @@ func generateAPIKey() (string, error) {
 	return hex.EncodeToString(buf), nil
 }
 
-// ProvisionRelay inserts a new relay row and returns the plaintext API key
-// to the caller. The plaintext key is never persisted; only its salted SHA-256
-// hash is stored.
+// The plaintext key is returned to the caller exactly once and never
+// persisted; only its salted SHA-256 hash is stored.
 func ProvisionRelay(ctx context.Context, pool *pgxpool.Pool, salt, endpoint, region, role string) (string, string, error) {
 	if !validRole(role) {
 		return "", "", ErrInvalidRole
@@ -155,8 +154,6 @@ func PickRandomActiveByRole(ctx context.Context, pool *pgxpool.Pool, role string
 	return r, nil
 }
 
-// SweepInactiveRelays marks any active relay as inactive when its last heartbeat
-// is older than ttl (or absent). Returns the number of rows affected.
 func SweepInactiveRelays(ctx context.Context, pool *pgxpool.Pool, ttl time.Duration) (int64, error) {
 	seconds := int64(ttl.Seconds())
 	if seconds < 1 {
