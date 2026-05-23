@@ -35,7 +35,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Notify};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_rustls::TlsConnector;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use crate::authority::AuthorityClient;
@@ -70,12 +70,12 @@ fn make_pki() -> TestPki {
     TestPki { cert_der, key_der }
 }
 
-fn make_acceptor(pki: &TestPki) -> TlsAcceptor {
+fn make_server_config(pki: &TestPki) -> Arc<ServerConfig> {
     let server_config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![pki.cert_der.clone()], pki.key_der.clone_key())
         .expect("server config");
-    TlsAcceptor::from(Arc::new(server_config))
+    Arc::new(server_config)
 }
 
 fn make_connector(pki: &TestPki) -> TlsConnector {
@@ -142,7 +142,7 @@ async fn spawn_relay(
     authority_priv: &RsaPrivateKey,
     over: &RelayOverride,
     peers: HashMap<SocketAddr, String>,
-    acceptor: TlsAcceptor,
+    server_config: Arc<ServerConfig>,
     connector: Arc<TlsConnector>,
 ) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -154,8 +154,20 @@ async fn spawn_relay(
     let cfg = make_config(role, over, peers);
     let pool = Arc::new(ConnectionPool::new());
     let shutdown = Arc::new(Notify::new());
+    // Tests use the same self-signed config for both the normal-traffic
+    // path and the (unused) ACME-TLS-ALPN-01 challenge path. Test
+    // clients never advertise the challenge ALPN, so accept_routed
+    // always selects the default config.
     tokio::spawn(super::accept_loop(
-        listener, acceptor, shutdown, cfg, authority, replay, pool, connector,
+        listener,
+        server_config.clone(),
+        server_config,
+        shutdown,
+        cfg,
+        authority,
+        replay,
+        pool,
+        connector,
     ));
     addr
 }
@@ -195,7 +207,7 @@ async fn run_test() {
     let auth_priv = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
 
     let pki = make_pki();
-    let acceptor = make_acceptor(&pki);
+    let server_config = make_server_config(&pki);
     let connector = Arc::new(make_connector(&pki));
 
     let over = default_override();
@@ -207,7 +219,7 @@ async fn run_test() {
         &auth_priv,
         &over,
         HashMap::new(),
-        acceptor.clone(),
+        server_config.clone(),
         connector.clone(),
     )
     .await;
@@ -218,7 +230,7 @@ async fn run_test() {
         &auth_priv,
         &over,
         middle_peers,
-        acceptor.clone(),
+        server_config.clone(),
         connector.clone(),
     )
     .await;
@@ -229,7 +241,7 @@ async fn run_test() {
         &auth_priv,
         &over,
         guard_peers,
-        acceptor.clone(),
+        server_config.clone(),
         connector.clone(),
     )
     .await;
@@ -497,7 +509,7 @@ async fn run_data_test() {
     let auth_priv = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
 
     let pki = make_pki();
-    let acceptor = make_acceptor(&pki);
+    let server_config = make_server_config(&pki);
     let connector = Arc::new(make_connector(&pki));
 
     let exit_addr = spawn_relay(
@@ -505,7 +517,7 @@ async fn run_data_test() {
         &auth_priv,
         &over,
         HashMap::new(),
-        acceptor.clone(),
+        server_config.clone(),
         connector.clone(),
     )
     .await;
@@ -516,7 +528,7 @@ async fn run_data_test() {
         &auth_priv,
         &over,
         middle_peers,
-        acceptor.clone(),
+        server_config.clone(),
         connector.clone(),
     )
     .await;
@@ -527,7 +539,7 @@ async fn run_data_test() {
         &auth_priv,
         &over,
         guard_peers,
-        acceptor.clone(),
+        server_config.clone(),
         connector.clone(),
     )
     .await;

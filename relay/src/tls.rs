@@ -15,20 +15,17 @@ use std::fs;
 use std::sync::Arc;
 
 use rustls::pki_types::ServerName;
-use rustls::{ClientConfig, RootCertStore};
+use rustls::server::Acceptor;
+use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use rustls_acme::caches::DirCache;
-use rustls_acme::AcmeConfig;
+use rustls_acme::{is_tls_alpn_challenge, AcmeConfig};
 use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream as ClientTlsStream;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_rustls::server::TlsStream as ServerTlsStream;
+use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
 use tracing::{info, warn};
 
 use crate::config::RelayConfig;
-
-/// ALPN identifier for the ACME TLS-ALPN-01 challenge (RFC 8737 §3).
-/// Connections advertising this ALPN are challenge probes and must be
-/// dropped without entering the relay protocol.
-pub const ACME_TLS_ALPN: &[u8] = b"acme-tls/1";
 
 /// Connection-fatal at minimum; startup variants are process-fatal.
 #[derive(Debug, thiserror::Error)]
@@ -41,16 +38,27 @@ pub enum TlsError {
     InvalidServerName(String),
     #[error("tls handshake to {0}: {1}")]
     Handshake(String, std::io::Error),
+    #[error("tls accept: {0}")]
+    Accept(std::io::Error),
 }
 
 pub struct AcmeBundle {
-    pub acceptor: TlsAcceptor,
+    /// rustls config for normal client traffic. Used when the
+    /// ClientHello does NOT advertise the `acme-tls/1` ALPN.
+    pub default_config: Arc<ServerConfig>,
+    /// rustls config that answers the TLS-ALPN-01 challenge with the
+    /// challenge cert resolver, advertising `acme-tls/1` ALPN so LE's
+    /// validator accepts the response (RFC 8737 §3). Used when
+    /// `is_tls_alpn_challenge(client_hello)` returns true.
+    pub challenge_config: Arc<ServerConfig>,
     /// Drives ACME issuance + renewal. Aborting it disables renewals.
     pub driver: tokio::task::JoinHandle<()>,
 }
 
-/// Build the inbound TLS acceptor backed by an ACME-managed cert
-/// resolver. The returned `driver` MUST stay alive for renewals to run.
+/// Build the two rustls configs needed for inbound TLS: one for real
+/// traffic, one for ACME-TLS-ALPN-01 challenges. The caller sniffs the
+/// ClientHello via [`accept_routed`] to pick which config completes the
+/// handshake. The returned `driver` MUST stay alive for renewals to run.
 pub fn acme_setup(cfg: &RelayConfig) -> Result<AcmeBundle, TlsError> {
     fs::create_dir_all(&cfg.acme_dir)
         .map_err(|e| TlsError::CacheDir(cfg.acme_dir.display().to_string(), e))?;
@@ -61,11 +69,9 @@ pub fn acme_setup(cfg: &RelayConfig) -> Result<AcmeBundle, TlsError> {
         .directory_lets_encrypt(!cfg.acme_staging)
         .state();
 
-    let rustls_config = state.default_rustls_config();
-    let acceptor = TlsAcceptor::from(rustls_config);
+    let default_config = state.default_rustls_config();
+    let challenge_config = state.challenge_rustls_config();
 
-    // state must be drained for ACME orders to make progress; this
-    // task is the only owner that does that draining.
     let driver = tokio::spawn(async move {
         use futures_util::StreamExt;
         while let Some(result) = state.next().await {
@@ -76,7 +82,34 @@ pub fn acme_setup(cfg: &RelayConfig) -> Result<AcmeBundle, TlsError> {
         }
     });
 
-    Ok(AcmeBundle { acceptor, driver })
+    Ok(AcmeBundle {
+        default_config,
+        challenge_config,
+        driver,
+    })
+}
+
+/// Per-connection TLS accept that peeks at the ClientHello, routes
+/// ACME-TLS-ALPN-01 probes to the challenge config (which advertises
+/// the `acme-tls/1` ALPN required for issuance) and everything else to
+/// the default config. Returns `Ok(None)` for challenge connections
+/// that completed handshake but must not be processed as real clients.
+pub async fn accept_routed(
+    tcp: TcpStream,
+    default_config: Arc<ServerConfig>,
+    challenge_config: Arc<ServerConfig>,
+) -> Result<Option<ServerTlsStream<TcpStream>>, TlsError> {
+    let lazy = LazyConfigAcceptor::new(Acceptor::default(), tcp);
+    let start = lazy.await.map_err(TlsError::Accept)?;
+    if is_tls_alpn_challenge(&start.client_hello()) {
+        let _ = start.into_stream(challenge_config).await;
+        return Ok(None);
+    }
+    let tls = start
+        .into_stream(default_config)
+        .await
+        .map_err(TlsError::Accept)?;
+    Ok(Some(tls))
 }
 
 /// Build the shared outbound TLS connector. Verification uses the OS
