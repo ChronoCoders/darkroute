@@ -54,7 +54,7 @@ fn make_config(role: Role, over: &RelayOverride) -> Arc<RelayConfig> {
         authority_heartbeat_url: "http://localhost/".to_string(),
         relay_api_key: "test-relay-api-key".to_string(),
         relay_port: 0,
-        metrics_port: 0,
+        metrics_bind: "127.0.0.1:0".parse().unwrap(),
         replay_window_ttl: 86_400,
         max_circuits: 16,
         node_id: format!("test-relay-{}", role),
