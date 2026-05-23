@@ -29,13 +29,19 @@ func NewRelayHandler(pool *pgxpool.Pool, salt string, allowedIPs []string) *Rela
 	return &RelayHandler{pool: pool, salt: salt, allowedIPs: set}
 }
 
-// peerIP returns the TCP peer address only. X-Forwarded-For is deliberately
-// ignored — relay heartbeats must come directly from the relay host so the
-// allowlist enforces network position, not a client-controllable header.
+// peerIP returns the real caller IP. Cloudflare Tunnel terminates on
+// loopback, so when the TCP peer is loopback we trust CF-Connecting-IP
+// — and only then. Any other peer is the legacy direct-listen path and
+// the header is ignored as client-controllable.
 func peerIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	if host == "127.0.0.1" || host == "::1" {
+		if cf := r.Header.Get("CF-Connecting-IP"); cf != "" {
+			return cf
+		}
 	}
 	return host
 }
