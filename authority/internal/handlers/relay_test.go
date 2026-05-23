@@ -55,6 +55,37 @@ func TestHeartbeatRejectsMissingAuthorizationHeader(t *testing.T) {
 	}
 }
 
+func TestPeerIPTrustsCFConnectingIPFromLoopback(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "127.0.0.1:55000"
+	req.Header.Set("CF-Connecting-IP", "203.0.113.7")
+	if got := peerIP(req); got != "203.0.113.7" {
+		t.Fatalf("loopback + CF header: got %q want 203.0.113.7", got)
+	}
+}
+
+func TestPeerIPIgnoresCFConnectingIPFromNonLoopback(t *testing.T) {
+	// CF-Connecting-IP from a non-loopback peer is client-controllable
+	// and must not be honored. Otherwise the rate limiter and the
+	// heartbeat allowlist would be bypassable by anyone who can reach
+	// the authority directly (i.e., everyone, before Cloudflare is in
+	// front).
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "203.0.113.5:55000"
+	req.Header.Set("CF-Connecting-IP", "10.0.0.5")
+	if got := peerIP(req); got != "203.0.113.5" {
+		t.Fatalf("non-loopback peer with CF header: got %q want 203.0.113.5", got)
+	}
+}
+
+func TestPeerIPFallsBackToTCPPeerWhenNoCFHeader(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	req.RemoteAddr = "127.0.0.1:55000"
+	if got := peerIP(req); got != "127.0.0.1" {
+		t.Fatalf("loopback no CF header: got %q want 127.0.0.1", got)
+	}
+}
+
 func TestHeartbeatRejectsNonBearerAuthorization(t *testing.T) {
 	h := NewRelayHandler(nil, "salt-x", []string{"10.0.0.5"})
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/relay/heartbeat", nil)
