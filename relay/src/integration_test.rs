@@ -20,15 +20,22 @@
 //! cell encode/decode, EXTEND processing, and RELAY forwarding all
 //! work end to end across three independent relay processes.
 
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use rand_core::OsRng;
+use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rsa::{RsaPrivateKey, RsaPublicKey};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
+use rustls::{ClientConfig, RootCertStore, ServerConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Notify};
+use tokio_rustls::client::TlsStream as ClientTlsStream;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 use crate::authority::AuthorityClient;
@@ -39,6 +46,57 @@ use crate::pool::ConnectionPool;
 use crate::test_hooks;
 use crate::token::{raw_sign, ReplayWindow};
 
+const TEST_HOSTNAME: &str = "localhost";
+
+static CRYPTO_PROVIDER_INSTALL: OnceLock<()> = OnceLock::new();
+
+fn ensure_crypto_provider() {
+    CRYPTO_PROVIDER_INSTALL.get_or_init(|| {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    });
+}
+
+struct TestPki {
+    cert_der: CertificateDer<'static>,
+    key_der: PrivateKeyDer<'static>,
+}
+
+fn make_pki() -> TestPki {
+    let CertifiedKey { cert, key_pair } =
+        generate_simple_self_signed(vec![TEST_HOSTNAME.to_string()]).expect("rcgen self-signed");
+    let cert_der = cert.der().clone();
+    let key_der = PrivateKeyDer::try_from(key_pair.serialize_der())
+        .expect("rcgen-emitted key parses as PKCS8");
+    TestPki { cert_der, key_der }
+}
+
+fn make_acceptor(pki: &TestPki) -> TlsAcceptor {
+    let server_config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(vec![pki.cert_der.clone()], pki.key_der.clone_key())
+        .expect("server config");
+    TlsAcceptor::from(Arc::new(server_config))
+}
+
+fn make_connector(pki: &TestPki) -> TlsConnector {
+    let mut roots = RootCertStore::empty();
+    roots.add(pki.cert_der.clone()).expect("add cert to roots");
+    let client_config = ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    TlsConnector::from(Arc::new(client_config))
+}
+
+async fn tls_connect(connector: &TlsConnector, addr: SocketAddr) -> ClientTlsStream<TcpStream> {
+    let tcp = TcpStream::connect(addr).await.expect("tcp connect");
+    tcp.set_nodelay(true).expect("nodelay");
+    let server_name = ServerName::try_from(TEST_HOSTNAME).expect("server name");
+    connector
+        .connect(server_name, tcp)
+        .await
+        .expect("client tls handshake")
+}
+
 const TEST_TIMEOUT: Duration = Duration::from_secs(20);
 const CIRCUIT_ID: u32 = 1;
 
@@ -47,7 +105,11 @@ struct RelayOverride {
     allowed_exit_ports: Vec<u16>,
 }
 
-fn make_config(role: Role, over: &RelayOverride) -> Arc<RelayConfig> {
+fn make_config(
+    role: Role,
+    over: &RelayOverride,
+    peers: HashMap<SocketAddr, String>,
+) -> Arc<RelayConfig> {
     Arc::new(RelayConfig {
         role,
         authority_pubkey_url: "http://localhost/".to_string(),
@@ -67,6 +129,11 @@ fn make_config(role: Role, over: &RelayOverride) -> Arc<RelayConfig> {
         },
         allowed_exit_ports: over.allowed_exit_ports.clone(),
         peer_allowlist: vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))],
+        relay_hostname: TEST_HOSTNAME.to_string(),
+        acme_contact_email: "test@example.invalid".to_string(),
+        acme_dir: PathBuf::from("/tmp/darkroute-relay-test-acme-unused"),
+        acme_staging: true,
+        peer_hostnames: peers,
     })
 }
 
@@ -74,6 +141,9 @@ async fn spawn_relay(
     role: Role,
     authority_priv: &RsaPrivateKey,
     over: &RelayOverride,
+    peers: HashMap<SocketAddr, String>,
+    acceptor: TlsAcceptor,
+    connector: Arc<TlsConnector>,
 ) -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
@@ -81,11 +151,11 @@ async fn spawn_relay(
         authority_priv,
     )));
     let replay = Arc::new(ReplayWindow::new(Duration::from_secs(86_400)));
-    let cfg = make_config(role, over);
+    let cfg = make_config(role, over, peers);
     let pool = Arc::new(ConnectionPool::new());
     let shutdown = Arc::new(Notify::new());
     tokio::spawn(super::accept_loop(
-        listener, shutdown, cfg, authority, replay, pool,
+        listener, acceptor, shutdown, cfg, authority, replay, pool, connector,
     ));
     addr
 }
@@ -97,9 +167,7 @@ fn default_override() -> RelayOverride {
     }
 }
 
-/// Read one full encrypted frame from `sock` into a Vec<u8> (raw on-wire
-/// bytes). Length-bounded mirror of `crypto::read_frame_bytes`.
-async fn read_frame_raw(sock: &mut TcpStream) -> Vec<u8> {
+async fn read_frame_raw(sock: &mut ClientTlsStream<TcpStream>) -> Vec<u8> {
     let mut head = [0u8; 12 + 4];
     sock.read_exact(&mut head).await.expect("read frame head");
     let ct_len = u32::from_be_bytes([head[12], head[13], head[14], head[15]]) as usize;
@@ -119,25 +187,56 @@ async fn end_to_end_three_hop_circuit() {
 }
 
 async fn run_test() {
-    // Install a fresh sink so this test sees the exit relay's CONNECT
-    // events. Other tests that touch the hook should reinstall.
+    ensure_crypto_provider();
     let (tx, mut connect_rx) = mpsc::unbounded_channel::<ConnectPayload>();
     test_hooks::install_sender(tx);
 
-    // RSA-2048 to match the wire token length (TOKEN_LEN = 256 bytes).
     let mut rng = OsRng;
     let auth_priv = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
 
-    let over = default_override();
-    let guard_addr = spawn_relay(Role::Guard, &auth_priv, &over).await;
-    let middle_addr = spawn_relay(Role::Middle, &auth_priv, &over).await;
-    let exit_addr = spawn_relay(Role::Exit, &auth_priv, &over).await;
+    let pki = make_pki();
+    let acceptor = make_acceptor(&pki);
+    let connector = Arc::new(make_connector(&pki));
 
-    // Give the relays a moment to begin accepting.
+    let over = default_override();
+    // Bootstrapping order: spawn exit and middle first (no peers
+    // needed for exit; middle's peer is exit) so addresses are known
+    // before guard's peer map.
+    let exit_addr = spawn_relay(
+        Role::Exit,
+        &auth_priv,
+        &over,
+        HashMap::new(),
+        acceptor.clone(),
+        connector.clone(),
+    )
+    .await;
+    let middle_peers: HashMap<SocketAddr, String> =
+        std::iter::once((exit_addr, TEST_HOSTNAME.to_string())).collect();
+    let middle_addr = spawn_relay(
+        Role::Middle,
+        &auth_priv,
+        &over,
+        middle_peers,
+        acceptor.clone(),
+        connector.clone(),
+    )
+    .await;
+    let guard_peers: HashMap<SocketAddr, String> =
+        std::iter::once((middle_addr, TEST_HOSTNAME.to_string())).collect();
+    let guard_addr = spawn_relay(
+        Role::Guard,
+        &auth_priv,
+        &over,
+        guard_peers,
+        acceptor.clone(),
+        connector.clone(),
+    )
+    .await;
+
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let mut sock = TcpStream::connect(guard_addr).await.expect("connect guard");
-    sock.set_nodelay(true).expect("nodelay");
+    let mut sock = tls_connect(&connector, guard_addr).await;
 
     sock.write_all(&[super::PROTO_CLIENT])
         .await
@@ -379,10 +478,7 @@ async fn end_to_end_data_round_trip_via_socks5() {
 }
 
 async fn run_data_test() {
-    // Phase 4c does not assert on the connect-hook sink; leave any
-    // previously-installed sender in place so parallel tests do not
-    // race over the global OnceLock.
-
+    ensure_crypto_provider();
     let echo_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
     let echo_addr = echo_listener.local_addr().expect("echo addr");
     tokio::spawn(run_echo_server(echo_listener));
@@ -399,13 +495,45 @@ async fn run_data_test() {
 
     let mut rng = OsRng;
     let auth_priv = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
-    let guard_addr = spawn_relay(Role::Guard, &auth_priv, &over).await;
-    let middle_addr = spawn_relay(Role::Middle, &auth_priv, &over).await;
-    let exit_addr = spawn_relay(Role::Exit, &auth_priv, &over).await;
+
+    let pki = make_pki();
+    let acceptor = make_acceptor(&pki);
+    let connector = Arc::new(make_connector(&pki));
+
+    let exit_addr = spawn_relay(
+        Role::Exit,
+        &auth_priv,
+        &over,
+        HashMap::new(),
+        acceptor.clone(),
+        connector.clone(),
+    )
+    .await;
+    let middle_peers: HashMap<SocketAddr, String> =
+        std::iter::once((exit_addr, TEST_HOSTNAME.to_string())).collect();
+    let middle_addr = spawn_relay(
+        Role::Middle,
+        &auth_priv,
+        &over,
+        middle_peers,
+        acceptor.clone(),
+        connector.clone(),
+    )
+    .await;
+    let guard_peers: HashMap<SocketAddr, String> =
+        std::iter::once((middle_addr, TEST_HOSTNAME.to_string())).collect();
+    let guard_addr = spawn_relay(
+        Role::Guard,
+        &auth_priv,
+        &over,
+        guard_peers,
+        acceptor.clone(),
+        connector.clone(),
+    )
+    .await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let mut sock = TcpStream::connect(guard_addr).await.expect("connect guard");
-    sock.set_nodelay(true).expect("nodelay");
+    let mut sock = tls_connect(&connector, guard_addr).await;
 
     sock.write_all(&[super::PROTO_CLIENT]).await.expect("proto");
     let m_raw: [u8; 32] = [0x77; 32];

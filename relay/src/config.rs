@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::env;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
 
 use thiserror::Error;
 
@@ -69,6 +71,29 @@ pub struct RelayConfig {
     /// roles, where inbound peer relays bypass the client token check.
     /// Empty list = no peer relay is accepted (guard runs this way).
     pub peer_allowlist: Vec<IpAddr>,
+    /// Fully-qualified DNS name this relay answers on. Used as the
+    /// rustls-acme cert subject (one cert per relay), as the redirect
+    /// target on the port-80 redirector, and as the expected SNI
+    /// presented to clients. ARCHITECTURE §5.8.
+    pub relay_hostname: String,
+    /// ACME registration contact email (RFC 8555 §7.3). Let's Encrypt
+    /// uses this for expiry warnings and policy notifications.
+    pub acme_contact_email: String,
+    /// Filesystem directory where rustls-acme persists account keys,
+    /// issued certs, and challenge state across restarts.
+    pub acme_dir: PathBuf,
+    /// When true, ACME issuance uses the Let's Encrypt *staging*
+    /// directory (rate limits are looser; certs are not browser-trusted).
+    /// Defaults to false (production directory).
+    pub acme_staging: bool,
+    /// Map from next-hop relay socket address to the hostname the
+    /// outbound TLS client must present as SNI and verify against the
+    /// peer's certificate. Required because the EXTEND wire payload
+    /// carries only a SocketAddr but TLS verification requires a
+    /// hostname. Empty for `guard` (guard never extends outward via
+    /// another relay-to-relay link in the current topology) but
+    /// validated for `middle`.
+    pub peer_hostnames: HashMap<SocketAddr, String>,
 }
 
 impl RelayConfig {
@@ -100,6 +125,17 @@ impl RelayConfig {
         let peer_allowlist = match get("RELAY_PEER_ALLOWLIST") {
             None => Vec::new(),
             Some(s) => parse_ip_list(&s)?,
+        };
+        let relay_hostname = required(&get, "RELAY_HOSTNAME")?;
+        let acme_contact_email = required(&get, "ACME_CONTACT_EMAIL")?;
+        let acme_dir = match get("ACME_DIR") {
+            Some(s) if !s.is_empty() => PathBuf::from(s),
+            _ => PathBuf::from("/opt/darkroute/secrets/acme-cache"),
+        };
+        let acme_staging = parse_bool(&get, "ACME_STAGING", false)?;
+        let peer_hostnames = match get("PEER_HOSTNAMES") {
+            None => HashMap::new(),
+            Some(s) => parse_peer_hostnames(&s)?,
         };
 
         if role == Role::Exit {
@@ -147,8 +183,61 @@ impl RelayConfig {
             decodo_proxy_url,
             allowed_exit_ports,
             peer_allowlist,
+            relay_hostname,
+            acme_contact_email,
+            acme_dir,
+            acme_staging,
+            peer_hostnames,
         })
     }
+}
+
+fn parse_bool<F: Fn(&str) -> Option<String>>(
+    get: &F,
+    key: &'static str,
+    default: bool,
+) -> Result<bool, ConfigError> {
+    match get(key) {
+        None => Ok(default),
+        Some(s) if s.is_empty() => Ok(default),
+        Some(s) => match s.to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            other => Err(ConfigError::Invalid {
+                var: key,
+                reason: format!("expected boolean, got {other:?}"),
+            }),
+        },
+    }
+}
+
+fn parse_peer_hostnames(raw: &str) -> Result<HashMap<SocketAddr, String>, ConfigError> {
+    let mut out = HashMap::new();
+    for piece in raw.split(',') {
+        let t = piece.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let (addr_str, host_str) = t.split_once('=').ok_or(ConfigError::Invalid {
+            var: "PEER_HOSTNAMES",
+            reason: format!("entry {t:?} missing '='"),
+        })?;
+        let addr = addr_str
+            .parse::<SocketAddr>()
+            .map_err(|e| ConfigError::Invalid {
+                var: "PEER_HOSTNAMES",
+                reason: format!("{addr_str:?} is not host:port: {e}"),
+            })?;
+        let host = host_str.trim();
+        if host.is_empty() {
+            return Err(ConfigError::Invalid {
+                var: "PEER_HOSTNAMES",
+                reason: format!("entry {t:?} has empty hostname"),
+            });
+        }
+        out.insert(addr, host.to_string());
+    }
+    Ok(out)
 }
 
 fn parse_ip_list(raw: &str) -> Result<Vec<IpAddr>, ConfigError> {
@@ -269,6 +358,8 @@ mod tests {
         m.insert("RELAY_API_KEY", "key-xyz");
         m.insert("MAX_CIRCUITS", "256");
         m.insert("NODE_ID", "relay-001");
+        m.insert("RELAY_HOSTNAME", "node01.example");
+        m.insert("ACME_CONTACT_EMAIL", "ops@example.com");
         m
     }
 
@@ -429,6 +520,85 @@ mod tests {
             err,
             ConfigError::Invalid {
                 var: "METRICS_BIND",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_relay_hostname() {
+        let mut env = base_env();
+        env.remove("RELAY_HOSTNAME");
+        let err = RelayConfig::from_source(lookup(&env)).unwrap_err();
+        assert!(matches!(err, ConfigError::Missing("RELAY_HOSTNAME")));
+    }
+
+    #[test]
+    fn rejects_missing_acme_contact_email() {
+        let mut env = base_env();
+        env.remove("ACME_CONTACT_EMAIL");
+        let err = RelayConfig::from_source(lookup(&env)).unwrap_err();
+        assert!(matches!(err, ConfigError::Missing("ACME_CONTACT_EMAIL")));
+    }
+
+    #[test]
+    fn acme_dir_default_when_unset() {
+        let env = base_env();
+        let cfg = RelayConfig::from_source(lookup(&env)).expect("valid");
+        assert_eq!(
+            cfg.acme_dir,
+            std::path::PathBuf::from("/opt/darkroute/secrets/acme-cache")
+        );
+    }
+
+    #[test]
+    fn acme_staging_parses_truthy() {
+        let mut env = base_env();
+        env.insert("ACME_STAGING", "true");
+        let cfg = RelayConfig::from_source(lookup(&env)).expect("valid");
+        assert!(cfg.acme_staging);
+    }
+
+    #[test]
+    fn acme_staging_rejects_garbage() {
+        let mut env = base_env();
+        env.insert("ACME_STAGING", "maybe");
+        let err = RelayConfig::from_source(lookup(&env)).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "ACME_STAGING",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn peer_hostnames_parses_pairs() {
+        let mut env = base_env();
+        env.insert(
+            "PEER_HOSTNAMES",
+            "10.0.0.5:443=node02.example, 10.0.0.6:443=node03.example",
+        );
+        let cfg = RelayConfig::from_source(lookup(&env)).expect("valid");
+        assert_eq!(cfg.peer_hostnames.len(), 2);
+        assert_eq!(
+            cfg.peer_hostnames
+                .get(&"10.0.0.5:443".parse::<SocketAddr>().unwrap())
+                .map(String::as_str),
+            Some("node02.example")
+        );
+    }
+
+    #[test]
+    fn peer_hostnames_rejects_missing_equals() {
+        let mut env = base_env();
+        env.insert("PEER_HOSTNAMES", "10.0.0.5:443");
+        let err = RelayConfig::from_source(lookup(&env)).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "PEER_HOSTNAMES",
                 ..
             }
         ));
