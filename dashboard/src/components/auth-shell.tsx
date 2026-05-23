@@ -29,8 +29,8 @@ export function AuthShell({
         />
         <div className="relative z-10 flex h-full flex-col p-10">
           <Marketing.Logo />
-          <div className="mt-auto max-w-md">
-            <blockquote className="text-2xl font-medium tracking-tight text-zinc-200">
+          <div className="flex flex-1 items-center justify-center">
+            <blockquote className="max-w-md text-center text-2xl font-medium tracking-tight text-zinc-200">
               &ldquo;Nobody can trace a connection back to you. Not even
               us.&rdquo;
             </blockquote>
