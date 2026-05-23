@@ -10,6 +10,8 @@ mod exit;
 mod heartbeat;
 mod metrics;
 mod pool;
+mod port80;
+mod tls;
 mod token;
 
 #[cfg(test)]
@@ -20,10 +22,13 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
 use tokio::sync::Notify;
+use tokio_rustls::client::TlsStream as ClientTlsStream;
+use tokio_rustls::server::TlsStream as ServerTlsStream;
+use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{error, info, warn};
 
 use crate::authority::AuthorityClient;
@@ -33,16 +38,14 @@ use crate::crypto::SessionKey;
 use crate::pool::{ConnectionPool, PooledConn};
 use crate::token::ReplayWindow;
 
-/// First byte of any inbound TCP. PROTO_CLIENT proceeds to a Phase-3
-/// token presentation (guard only); PROTO_RELAY proceeds to the
-/// circuit-start signal stream (middle and exit, peer-allowlisted).
+/// First byte after TLS termination. Selects between Phase-3 token
+/// presentation (guard) and the relay-to-relay circuit-start protocol
+/// (middle/exit, peer-allowlisted).
 const PROTO_CLIENT: u8 = 0x01;
 const PROTO_RELAY: u8 = 0x02;
 
-/// Per-circuit signal byte on a relay-to-relay link. The dialer writes
-/// this before each new circuit's client pubkey; the listener reads it
-/// to know whether the link is starting another circuit (`CIRCUIT_START`)
-/// or shutting down (any other byte / EOF).
+/// On a relay-to-relay link, any byte other than CIRCUIT_START
+/// (including EOF) terminates the link instead of starting a circuit.
 const CIRCUIT_START: u8 = 0xC1;
 
 const M_RAW_LEN: usize = 32;
@@ -50,12 +53,16 @@ const TOKEN_LEN: usize = 256;
 const PRESENTATION_LEN: usize = M_RAW_LEN + TOKEN_LEN;
 const PRESENTATION_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CELL_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const POOL_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 const POOL_IDLE_TTL: Duration = Duration::from_secs(300);
 const X25519_PK_LEN: usize = 32;
 const CIRCUIT_ID: u32 = 1;
 const DEST_READ_BUF: usize = 16 * 1024;
+
+pub type InboundStream = ServerTlsStream<TcpStream>;
+pub type OutboundStream = ClientTlsStream<TcpStream>;
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -66,6 +73,16 @@ async fn main() -> ExitCode {
         )
         .json()
         .init();
+
+    // rustls 0.23 panics on first ClientConfig/ServerConfig build if
+    // no process-global CryptoProvider is installed. Install ring once
+    // here so later rustls/rustls-acme calls do not panic.
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+    {
+        warn!("rustls crypto provider was already installed");
+    }
 
     let cfg = match RelayConfig::from_env() {
         Ok(c) => Arc::new(c),
@@ -83,6 +100,9 @@ async fn main() -> ExitCode {
         replay_window_ttl_seconds = cfg.replay_window_ttl,
         allowed_exit_ports = ?cfg.allowed_exit_ports,
         peer_allowlist_size = cfg.peer_allowlist.len(),
+        relay_hostname = %cfg.relay_hostname,
+        acme_staging = cfg.acme_staging,
+        peer_hostnames_size = cfg.peer_hostnames.len(),
         "config loaded"
     );
     if cfg.role == Role::Exit {
@@ -109,7 +129,30 @@ async fn main() -> ExitCode {
     );
     metrics::init();
 
-    let outbound_pool = Arc::new(ConnectionPool::new());
+    let outbound_pool: Arc<ConnectionPool<OutboundStream>> = Arc::new(ConnectionPool::new());
+
+    let acme = match tls::acme_setup(&cfg) {
+        Ok(a) => a,
+        Err(e) => {
+            error!(error = %e, "failed to start acme acceptor");
+            return ExitCode::from(1);
+        }
+    };
+    info!(
+        hostname = %cfg.relay_hostname,
+        acme_dir = %cfg.acme_dir.display(),
+        staging = cfg.acme_staging,
+        "acme acceptor ready (issuance happens on first inbound TLS handshake)"
+    );
+
+    let outbound_connector = match tls::outbound_connector() {
+        Ok(c) => Arc::new(c),
+        Err(e) => {
+            error!(error = %e, "failed to build outbound tls connector");
+            return ExitCode::from(1);
+        }
+    };
+    info!("outbound tls connector ready (native root store)");
 
     let relay_addr = format!("0.0.0.0:{}", cfg.relay_port);
     let relay_listener = match TcpListener::bind(&relay_addr).await {
@@ -130,6 +173,15 @@ async fn main() -> ExitCode {
     };
     info!(addr = %cfg.metrics_bind, "metrics listener bound");
 
+    let port80_listener = match TcpListener::bind("0.0.0.0:80").await {
+        Ok(l) => l,
+        Err(e) => {
+            error!(error = %e, "failed to bind port 80 redirector");
+            return ExitCode::from(1);
+        }
+    };
+    info!("port 80 redirector bound");
+
     let heartbeat_client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
@@ -146,14 +198,21 @@ async fn main() -> ExitCode {
 
     let accept_handle = tokio::spawn(accept_loop(
         relay_listener,
+        acme.acceptor,
         shutdown.clone(),
         cfg.clone(),
         authority.clone(),
         replay.clone(),
         outbound_pool.clone(),
+        outbound_connector.clone(),
     ));
     let metrics_handle = tokio::spawn(metrics_accept_loop(metrics_listener, shutdown.clone()));
     let pool_sweep_handle = tokio::spawn(pool_sweep_loop(outbound_pool.clone(), shutdown.clone()));
+    let port80_handle = tokio::spawn(port80::redirect_loop(
+        port80_listener,
+        cfg.relay_hostname.clone(),
+        shutdown.clone(),
+    ));
 
     match signal::ctrl_c().await {
         Ok(()) => info!("shutdown signal received"),
@@ -165,6 +224,9 @@ async fn main() -> ExitCode {
     let _ = accept_handle.await;
     let _ = metrics_handle.await;
     let _ = pool_sweep_handle.await;
+    let _ = port80_handle.await;
+    acme.driver.abort();
+    let _ = acme.driver.await;
     info!("shutdown complete");
     ExitCode::SUCCESS
 }
@@ -182,13 +244,16 @@ fn redact_proxy_url(raw: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn accept_loop(
     listener: TcpListener,
+    acceptor: TlsAcceptor,
     shutdown: Arc<Notify>,
     cfg: Arc<RelayConfig>,
     authority: Arc<AuthorityClient>,
     replay: Arc<ReplayWindow>,
-    pool: Arc<ConnectionPool>,
+    pool: Arc<ConnectionPool<OutboundStream>>,
+    connector: Arc<TlsConnector>,
 ) {
     loop {
         tokio::select! {
@@ -197,13 +262,34 @@ async fn accept_loop(
                 return;
             }
             res = listener.accept() => match res {
-                Ok((sock, peer)) => {
+                Ok((tcp, peer)) => {
                     let cfg = cfg.clone();
                     let auth = authority.clone();
                     let rep = replay.clone();
                     let pl = pool.clone();
+                    let conn = connector.clone();
+                    let acc = acceptor.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(sock, peer, cfg, auth, rep, pl).await {
+                        let _ = tcp.set_nodelay(true);
+                        let tls = match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acc.accept(tcp)).await {
+                            Ok(Ok(s)) => s,
+                            Ok(Err(e)) => {
+                                warn!(peer = %peer, error = %e, "tls handshake failed");
+                                return;
+                            }
+                            Err(_) => {
+                                warn!(peer = %peer, "tls handshake timeout");
+                                return;
+                            }
+                        };
+                        // RFC 8737 §3: drop ACME-TLS-ALPN-01 probes
+                        // before the relay protocol path. They are not
+                        // real clients and would otherwise generate a
+                        // spurious "connection terminated" warning.
+                        if tls.get_ref().1.alpn_protocol() == Some(tls::ACME_TLS_ALPN) {
+                            return;
+                        }
+                        if let Err(e) = handle_connection(tls, peer, cfg, auth, rep, pl, conn).await {
                             warn!(peer = %peer, reason = %e, "connection terminated");
                         }
                     });
@@ -242,20 +328,25 @@ enum HandleError {
     PeerClosed,
     #[error("missing decodo proxy url at exit role")]
     MissingDecodoUrl,
+    #[error("no peer hostname configured for next-hop {0}")]
+    PeerHostnameMissing(SocketAddr),
+    #[error("tls error: {0}")]
+    Tls(#[from] tls::TlsError),
 }
 
 async fn handle_connection(
-    mut sock: TcpStream,
+    sock: InboundStream,
     peer: SocketAddr,
     cfg: Arc<RelayConfig>,
     authority: Arc<AuthorityClient>,
     replay: Arc<ReplayWindow>,
-    pool: Arc<ConnectionPool>,
+    pool: Arc<ConnectionPool<OutboundStream>>,
+    connector: Arc<TlsConnector>,
 ) -> Result<(), HandleError> {
-    sock.set_nodelay(true)?;
+    let (mut r, mut w) = tokio::io::split(sock);
 
     let mut proto = [0u8; 1];
-    match tokio::time::timeout(PRESENTATION_READ_TIMEOUT, sock.read_exact(&mut proto)).await {
+    match tokio::time::timeout(PRESENTATION_READ_TIMEOUT, r.read_exact(&mut proto)).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => return Err(HandleError::Io(e)),
         Err(_) => return Err(HandleError::Timeout),
@@ -263,29 +354,36 @@ async fn handle_connection(
 
     match (proto[0], cfg.role) {
         (PROTO_CLIENT, Role::Guard) => {
-            handle_client_connection(sock, peer, cfg, authority, replay, pool).await
+            handle_client_connection(r, w, peer, cfg, authority, replay, pool, connector).await
         }
         (PROTO_RELAY, Role::Middle) | (PROTO_RELAY, Role::Exit) => {
-            handle_relay_connection(sock, peer, cfg, pool).await
+            handle_relay_connection(r, w, peer, cfg, pool, connector).await
         }
-        (b, _) => Err(HandleError::UnexpectedProtocol(b)),
+        (b, _) => {
+            // Ignore shutdown errors — we're already rejecting.
+            let _ = w.shutdown().await;
+            Err(HandleError::UnexpectedProtocol(b))
+        }
     }
 }
 
-/// Client-mode inbound on the guard role. One circuit per TCP; after
-/// CLOSE_REQUEST the TCP is closed (clients reconnect for a new
-/// circuit). Token verification runs first; only then does the
+/// Client-mode inbound on the guard role. One circuit per TLS stream;
+/// after CLOSE_REQUEST the stream is closed (clients reconnect for a
+/// new circuit). Token verification runs first; only then does the
 /// per-hop ECDH and cell loop start.
+#[allow(clippy::too_many_arguments)]
 async fn handle_client_connection(
-    mut sock: TcpStream,
+    mut r: ReadHalf<InboundStream>,
+    mut w: WriteHalf<InboundStream>,
     peer: SocketAddr,
     cfg: Arc<RelayConfig>,
     authority: Arc<AuthorityClient>,
     replay: Arc<ReplayWindow>,
-    pool: Arc<ConnectionPool>,
+    pool: Arc<ConnectionPool<OutboundStream>>,
+    connector: Arc<TlsConnector>,
 ) -> Result<(), HandleError> {
     let mut buf = [0u8; PRESENTATION_LEN];
-    match tokio::time::timeout(PRESENTATION_READ_TIMEOUT, sock.read_exact(&mut buf)).await {
+    match tokio::time::timeout(PRESENTATION_READ_TIMEOUT, r.read_exact(&mut buf)).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => return Err(HandleError::Io(e)),
         Err(_) => return Err(HandleError::Timeout),
@@ -298,19 +396,21 @@ async fn handle_client_connection(
     }
     metrics::record_verified();
 
-    drive_circuit(&mut sock, peer, Role::Guard, cfg, pool).await
+    drive_circuit(&mut r, &mut w, peer, Role::Guard, cfg, pool, connector).await
 }
 
 /// Relay-mode inbound (middle or exit). Peer IP must be in the
 /// configured allowlist; once accepted, the link supports multiple
 /// circuits in sequence, each preceded by a `CIRCUIT_START` byte. The
-/// outer loop returns when the dialer either closes the TCP or sends a
-/// non-CIRCUIT_START byte.
+/// outer loop returns when the dialer either closes the stream or
+/// sends a non-CIRCUIT_START byte.
 async fn handle_relay_connection(
-    mut sock: TcpStream,
+    mut r: ReadHalf<InboundStream>,
+    mut w: WriteHalf<InboundStream>,
     peer: SocketAddr,
     cfg: Arc<RelayConfig>,
-    pool: Arc<ConnectionPool>,
+    pool: Arc<ConnectionPool<OutboundStream>>,
+    connector: Arc<TlsConnector>,
 ) -> Result<(), HandleError> {
     let peer_ip = match peer {
         SocketAddr::V4(a) => IpAddr::V4(*a.ip()),
@@ -322,7 +422,7 @@ async fn handle_relay_connection(
 
     loop {
         let mut signal = [0u8; 1];
-        match sock.read_exact(&mut signal).await {
+        match r.read_exact(&mut signal).await {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => return Err(HandleError::Io(e)),
@@ -331,31 +431,37 @@ async fn handle_relay_connection(
             // Any byte other than CIRCUIT_START terminates the link.
             return Ok(());
         }
-        drive_circuit(&mut sock, peer, cfg.role, cfg.clone(), pool.clone()).await?;
+        drive_circuit(
+            &mut r,
+            &mut w,
+            peer,
+            cfg.role,
+            cfg.clone(),
+            pool.clone(),
+            connector.clone(),
+        )
+        .await?;
     }
 }
 
-/// Bring up one circuit on `sock`: run the per-hop X25519 handshake,
-/// activate the state machine, run the bidirectional cell loop. On
-/// CLOSE_REQUEST: send CLOSE_ACK, release the next-link to the pool
-/// (if any), drop the destination link (if any), close the circuit.
+/// Bring up one circuit: run the per-hop X25519 handshake, activate the
+/// state machine, run the bidirectional cell loop. On CLOSE_REQUEST:
+/// send CLOSE_ACK, release the next-link to the pool (if any), drop
+/// the destination link (if any), close the circuit.
+#[allow(clippy::too_many_arguments)]
 async fn drive_circuit(
-    sock: &mut TcpStream,
+    r: &mut ReadHalf<InboundStream>,
+    w: &mut WriteHalf<InboundStream>,
     peer: SocketAddr,
     role: Role,
     cfg: Arc<RelayConfig>,
-    pool: Arc<ConnectionPool>,
+    pool: Arc<ConnectionPool<OutboundStream>>,
+    connector: Arc<TlsConnector>,
 ) -> Result<(), HandleError> {
     let mut circuit = circuit::Circuit::new();
 
-    let session_key = {
-        let (mut read_half, mut write_half) = sock.split();
-        match tokio::time::timeout(
-            HANDSHAKE_READ_TIMEOUT,
-            crypto::relay_handshake(&mut read_half, &mut write_half),
-        )
-        .await
-        {
+    let session_key =
+        match tokio::time::timeout(HANDSHAKE_READ_TIMEOUT, crypto::relay_handshake(r, w)).await {
             Ok(Ok(k)) => k,
             Ok(Err(e)) => {
                 circuit.fail();
@@ -365,8 +471,7 @@ async fn drive_circuit(
                 circuit.fail();
                 return Err(HandleError::Timeout);
             }
-        }
-    };
+        };
     if let Err(e) = circuit.activate(session_key) {
         circuit.fail();
         return Err(HandleError::Circuit(e));
@@ -381,7 +486,7 @@ async fn drive_circuit(
         )
         .clone();
 
-    let outcome = run_circuit_io(sock, &key, role, cfg, pool).await;
+    let outcome = run_circuit_io(r, w, &key, role, cfg, pool, connector).await;
     match &outcome {
         Ok(()) => {
             if let Err(e) = circuit.close() {
@@ -397,31 +502,33 @@ async fn drive_circuit(
 /// One circuit's bidirectional control + data loop. Reads from three
 /// sources via `tokio::select!`:
 ///
-///   1. `sock` (cells from the previous-hop client/relay)
-///   2. `next_link.stream` (raw frame bytes from the next-hop relay,
+///   1. inbound read half (cells from the previous-hop client/relay)
+///   2. `next_link.read` (raw frame bytes from the next-hop relay,
 ///      forwarded as RELAY cells back toward the client)
 ///   3. `dest_link` (bytes from the SOCKS5 destination, wrapped as
 ///      DATA cells back toward the client; exit role only)
 ///
 /// CLOSE_REQUEST triggers: send CLOSE_ACK, release next_link to the
-/// pool (so the underlying TCP can carry another circuit), drop
+/// pool (so the underlying TLS stream can carry another circuit), drop
 /// dest_link, return. Any other error path drops both, terminating
-/// the dialer side cleanly via TCP FIN.
+/// the dialer side cleanly.
+#[allow(clippy::too_many_arguments)]
 async fn run_circuit_io(
-    sock: &mut TcpStream,
+    sock_read: &mut ReadHalf<InboundStream>,
+    sock_write: &mut WriteHalf<InboundStream>,
     key: &SessionKey,
     role: Role,
     cfg: Arc<RelayConfig>,
-    pool: Arc<ConnectionPool>,
+    pool: Arc<ConnectionPool<OutboundStream>>,
+    connector: Arc<TlsConnector>,
 ) -> Result<(), HandleError> {
-    let (mut sock_read, mut sock_write) = sock.split();
     let mut next_link: Option<NextLinkState> = None;
     let mut dest_link: Option<TcpStream> = None;
 
     loop {
         tokio::select! {
             biased;
-            res = tokio::time::timeout(CELL_READ_TIMEOUT, crypto::read_frame(&mut sock_read, key)) => {
+            res = tokio::time::timeout(CELL_READ_TIMEOUT, crypto::read_frame(sock_read, key)) => {
                 let frame = match res {
                     Ok(Ok(f)) => f,
                     Ok(Err(e)) => return Err(HandleError::Crypto(e)),
@@ -434,21 +541,21 @@ async fn run_circuit_io(
                             return Err(HandleError::IllegalCellForRole(CellType::Extend, role));
                         }
                         let extend = ExtendForward::decode(&cell.payload)?;
-                        let nl = open_next_link(&extend, &pool).await?;
+                        let nl = open_next_link(&extend, &pool, &cfg, &connector).await?;
                         let reply = Cell::new(
                             CellType::Extend,
                             CIRCUIT_ID,
                             cell::extend_backward_payload(&nl.peer_pk),
                         )?;
-                        crypto::write_frame(&mut sock_write, key, &reply.encode()).await?;
+                        crypto::write_frame(sock_write, key, &reply.encode()).await?;
                         next_link = Some(nl);
                     }
                     (CellType::Relay, Role::Guard) | (CellType::Relay, Role::Middle) => {
                         let nl = next_link
                             .as_mut()
                             .ok_or(HandleError::IllegalCellForRole(CellType::Relay, role))?;
-                        nl.stream.write_all(&cell.payload).await?;
-                        nl.stream.flush().await?;
+                        nl.write.write_all(&cell.payload).await?;
+                        nl.write.flush().await?;
                     }
                     (CellType::Connect, Role::Exit) => {
                         if dest_link.is_some() {
@@ -482,14 +589,15 @@ async fn run_circuit_io(
                     }
                     (CellType::CloseRequest, _) => {
                         let ack = Cell::new(CellType::CloseAck, CIRCUIT_ID, Vec::new())?;
-                        crypto::write_frame(&mut sock_write, key, &ack.encode()).await?;
+                        crypto::write_frame(sock_write, key, &ack.encode()).await?;
                         if let Some(nl) = next_link.take() {
-                            // The link is in "listener waiting for next
-                            // CIRCUIT_START" state because the inner
-                            // CLOSE_REQUESTs were processed before this
-                            // outer CLOSE_REQUEST. Release to the pool
-                            // so a subsequent circuit can reuse it.
-                            pool.release(nl.addr, PooledConn::new(nl.stream));
+                            // The inner CLOSE_REQUESTs ran before this
+                            // outer one, so the next-hop link is back
+                            // in "waiting for CIRCUIT_START" state and
+                            // safe to reuse.
+                            let addr = nl.addr;
+                            let stream = nl.read.unsplit(nl.write);
+                            pool.release(addr, PooledConn::new(stream));
                         }
                         drop(dest_link.take());
                         return Ok(());
@@ -505,13 +613,13 @@ async fn run_circuit_io(
 
             res = async {
                 match next_link.as_mut() {
-                    Some(nl) => crypto::read_frame_bytes(&mut nl.stream).await,
+                    Some(nl) => crypto::read_frame_bytes(&mut nl.read).await,
                     None => std::future::pending().await,
                 }
             } => {
                 let back_bytes = res?;
                 let wrap = Cell::new(CellType::Relay, CIRCUIT_ID, back_bytes)?;
-                crypto::write_frame(&mut sock_write, key, &wrap.encode()).await?;
+                crypto::write_frame(sock_write, key, &wrap.encode()).await?;
             }
 
             res = async {
@@ -534,48 +642,55 @@ async fn run_circuit_io(
                     continue;
                 }
                 let data_cell = Cell::new(CellType::Data, CIRCUIT_ID, bytes)?;
-                crypto::write_frame(&mut sock_write, key, &data_cell.encode()).await?;
+                crypto::write_frame(sock_write, key, &data_cell.encode()).await?;
             }
         }
     }
 }
 
 struct NextLinkState {
-    stream: TcpStream,
+    read: ReadHalf<OutboundStream>,
+    write: WriteHalf<OutboundStream>,
     peer_pk: [u8; X25519_PK_LEN],
     addr: SocketAddr,
 }
 
-/// Acquire (or dial) an outbound TCP to `next_hop` and run the
-/// per-circuit bootstrap: write CIRCUIT_START + client pubkey, read
-/// peer pubkey. A fresh TCP gets the PROTO_RELAY prefix once; pooled
-/// streams are already past PROTO_RELAY and ready for the next
-/// CIRCUIT_START.
+/// Acquire (or dial+TLS-handshake) an outbound link to `next_hop` and
+/// run the per-circuit bootstrap: write CIRCUIT_START + client pubkey,
+/// read peer pubkey. A fresh outbound stream gets the PROTO_RELAY
+/// prefix once; pooled streams are already past PROTO_RELAY and ready
+/// for the next CIRCUIT_START.
 async fn open_next_link(
     extend: &ExtendForward,
-    pool: &ConnectionPool,
+    pool: &ConnectionPool<OutboundStream>,
+    cfg: &RelayConfig,
+    connector: &TlsConnector,
 ) -> Result<NextLinkState, HandleError> {
-    let mut stream = match pool.acquire(&extend.next_hop) {
+    let stream: OutboundStream = match pool.acquire(&extend.next_hop) {
         Some(PooledConn { stream, .. }) => stream,
         None => {
-            let s = TcpStream::connect(extend.next_hop).await?;
-            s.set_nodelay(true)?;
-            let mut s = s;
+            let sni = cfg
+                .peer_hostnames
+                .get(&extend.next_hop)
+                .ok_or(HandleError::PeerHostnameMissing(extend.next_hop))?;
+            let mut s = tls::dial_tls(connector, extend.next_hop, sni).await?;
             s.write_all(&[PROTO_RELAY]).await?;
             s
         }
     };
-    stream.write_all(&[CIRCUIT_START]).await?;
-    stream.write_all(&extend.client_pk).await?;
-    stream.flush().await?;
+    let (mut read, mut write) = tokio::io::split(stream);
+    write.write_all(&[CIRCUIT_START]).await?;
+    write.write_all(&extend.client_pk).await?;
+    write.flush().await?;
     let mut peer_pk = [0u8; X25519_PK_LEN];
-    match tokio::time::timeout(HANDSHAKE_READ_TIMEOUT, stream.read_exact(&mut peer_pk)).await {
+    match tokio::time::timeout(HANDSHAKE_READ_TIMEOUT, read.read_exact(&mut peer_pk)).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => return Err(HandleError::Io(e)),
         Err(_) => return Err(HandleError::Timeout),
     }
     Ok(NextLinkState {
-        stream,
+        read,
+        write,
         peer_pk,
         addr: extend.next_hop,
     })
@@ -622,7 +737,7 @@ fn publish_connect_for_test(p: &ConnectPayload) {
 #[cfg(not(test))]
 fn publish_connect_for_test(_p: &ConnectPayload) {}
 
-async fn pool_sweep_loop(pool: Arc<ConnectionPool>, shutdown: Arc<Notify>) {
+async fn pool_sweep_loop(pool: Arc<ConnectionPool<OutboundStream>>, shutdown: Arc<Notify>) {
     let mut ticker = tokio::time::interval(POOL_SWEEP_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {

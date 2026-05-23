@@ -24,20 +24,18 @@ use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use tokio::net::TcpStream;
-
-pub struct PooledConn {
-    pub stream: TcpStream,
+pub struct PooledConn<S> {
+    pub stream: S,
     last_used: Instant,
 }
 
-impl PooledConn {
-    /// Wrap a freshly handshaked TCP stream for storage in the pool.
+impl<S> PooledConn<S> {
+    /// Wrap a freshly handshaked stream for storage in the pool.
     /// Production callers create these when releasing an outbound
     /// stream at the end of a circuit; the stream is in the
     /// "between-circuits" protocol state (the listener side is blocked
     /// reading the next CIRCUIT_START signal byte).
-    pub fn new(stream: TcpStream) -> Self {
+    pub fn new(stream: S) -> Self {
         Self {
             stream,
             last_used: Instant::now(),
@@ -49,11 +47,11 @@ impl PooledConn {
     }
 }
 
-pub struct ConnectionPool {
-    inner: Mutex<HashMap<SocketAddr, Vec<PooledConn>>>,
+pub struct ConnectionPool<S> {
+    inner: Mutex<HashMap<SocketAddr, Vec<PooledConn<S>>>>,
 }
 
-impl ConnectionPool {
+impl<S> ConnectionPool<S> {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
@@ -63,7 +61,7 @@ impl ConnectionPool {
     /// Remove and return one idle connection to `addr`, if any. The
     /// mutex is held only for the duration of the map lookup; no I/O
     /// happens while locked.
-    pub fn acquire(&self, addr: &SocketAddr) -> Option<PooledConn> {
+    pub fn acquire(&self, addr: &SocketAddr) -> Option<PooledConn<S>> {
         let mut guard = self.inner.lock().expect("connection pool mutex poisoned");
         let bucket = guard.get_mut(addr)?;
         let conn = bucket.pop();
@@ -78,7 +76,7 @@ impl ConnectionPool {
     /// the "listener waiting for next pk" state at circuit end and is
     /// safe to hand back. The next `acquire` will write a fresh
     /// CIRCUIT_START + client pubkey to reuse this stream.
-    pub fn release(&self, addr: SocketAddr, mut conn: PooledConn) {
+    pub fn release(&self, addr: SocketAddr, mut conn: PooledConn<S>) {
         conn.last_used = Instant::now();
         let mut guard = self.inner.lock().expect("connection pool mutex poisoned");
         guard.entry(addr).or_default().push(conn);
@@ -119,7 +117,7 @@ impl ConnectionPool {
     }
 }
 
-impl Default for ConnectionPool {
+impl<S> Default for ConnectionPool<S> {
     fn default() -> Self {
         Self::new()
     }
@@ -128,7 +126,7 @@ impl Default for ConnectionPool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::TcpListener;
+    use tokio::net::{TcpListener, TcpStream};
 
     /// Bind a local listener so we can produce a real TcpStream pair
     /// for testing pool operations; the streams are owned by the pool
@@ -144,7 +142,7 @@ mod tests {
 
     #[tokio::test]
     async fn acquire_empty_returns_none() {
-        let pool = ConnectionPool::new();
+        let pool: ConnectionPool<TcpStream> = ConnectionPool::new();
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
         assert!(pool.acquire(&addr).is_none());
         assert!(pool.is_empty());
@@ -152,7 +150,7 @@ mod tests {
 
     #[tokio::test]
     async fn release_then_acquire_round_trip() {
-        let pool = ConnectionPool::new();
+        let pool: ConnectionPool<TcpStream> = ConnectionPool::new();
         let (a, _b) = local_stream().await;
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
         pool.release(addr, PooledConn::new(a));
@@ -164,7 +162,7 @@ mod tests {
 
     #[tokio::test]
     async fn evict_drops_stale_entries() {
-        let pool = ConnectionPool::new();
+        let pool: ConnectionPool<TcpStream> = ConnectionPool::new();
         let (a, _b) = local_stream().await;
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
         pool.release(addr, PooledConn::new(a));
@@ -177,7 +175,7 @@ mod tests {
 
     #[tokio::test]
     async fn evict_keeps_fresh_entries() {
-        let pool = ConnectionPool::new();
+        let pool: ConnectionPool<TcpStream> = ConnectionPool::new();
         let (a, _b) = local_stream().await;
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
         pool.release(addr, PooledConn::new(a));
@@ -188,7 +186,7 @@ mod tests {
 
     #[tokio::test]
     async fn acquire_returns_lifo() {
-        let pool = ConnectionPool::new();
+        let pool: ConnectionPool<TcpStream> = ConnectionPool::new();
         let (a, _b) = local_stream().await;
         let (c, _d) = local_stream().await;
         let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
