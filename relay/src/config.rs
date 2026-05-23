@@ -1,6 +1,6 @@
 use std::env;
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 use thiserror::Error;
 
@@ -51,7 +51,12 @@ pub struct RelayConfig {
     pub authority_heartbeat_url: String,
     pub relay_api_key: String,
     pub relay_port: u16,
-    pub metrics_port: u16,
+    /// `host:port` the metrics HTTP server binds to. Defaults to
+    /// `127.0.0.1:9091` so Prometheus scraping must happen over an SSH
+    /// tunnel or local sidecar — the metrics surface must not be
+    /// reachable from the public internet (SESSION_LOG 2026-05-22
+    /// deployment-surface hardening, §8.1).
+    pub metrics_bind: SocketAddr,
     pub replay_window_ttl: u64,
     pub max_circuits: u32,
     pub node_id: String,
@@ -82,7 +87,7 @@ impl RelayConfig {
         let authority_heartbeat_url = required(&get, "AUTHORITY_HEARTBEAT_URL")?;
         let relay_api_key = required(&get, "RELAY_API_KEY")?;
         let relay_port = parse_port(&get, "RELAY_PORT", 9001)?;
-        let metrics_port = parse_port(&get, "METRICS_PORT", 9091)?;
+        let metrics_bind = parse_socket_addr(&get, "METRICS_BIND", "127.0.0.1:9091")?;
         let replay_window_ttl = parse_u64(&get, "REPLAY_WINDOW_TTL", 86_400)?;
         let max_circuits = parse_u32_required(&get, "MAX_CIRCUITS")?;
         let node_id = required(&get, "NODE_ID")?;
@@ -135,7 +140,7 @@ impl RelayConfig {
             authority_heartbeat_url,
             relay_api_key,
             relay_port,
-            metrics_port,
+            metrics_bind,
             replay_window_ttl,
             max_circuits,
             node_id,
@@ -212,6 +217,21 @@ fn parse_u32_required<F: Fn(&str) -> Option<String>>(
     })
 }
 
+fn parse_socket_addr<F: Fn(&str) -> Option<String>>(
+    get: &F,
+    key: &'static str,
+    default: &'static str,
+) -> Result<SocketAddr, ConfigError> {
+    let raw = match get(key) {
+        Some(s) if !s.is_empty() => s,
+        _ => default.to_string(),
+    };
+    raw.parse::<SocketAddr>().map_err(|e| ConfigError::Invalid {
+        var: key,
+        reason: format!("not a valid host:port: {e}"),
+    })
+}
+
 fn parse_port_list(raw: &str) -> Result<Vec<u16>, ConfigError> {
     let mut out = Vec::new();
     for piece in raw.split(',') {
@@ -264,7 +284,10 @@ mod tests {
         let cfg = RelayConfig::from_source(lookup(&env)).expect("valid config");
         assert_eq!(cfg.role, Role::Guard);
         assert_eq!(cfg.relay_port, 9001);
-        assert_eq!(cfg.metrics_port, 9091);
+        assert_eq!(
+            cfg.metrics_bind,
+            "127.0.0.1:9091".parse::<SocketAddr>().unwrap()
+        );
         assert_eq!(cfg.replay_window_ttl, 86_400);
         assert_eq!(cfg.allowed_exit_ports, vec![80, 443]);
         assert!(cfg.decodo_proxy_url.is_none());
@@ -385,13 +408,41 @@ mod tests {
     }
 
     #[test]
-    fn parses_custom_ports() {
+    fn parses_custom_relay_port_and_metrics_bind() {
         let mut env = base_env();
         env.insert("RELAY_PORT", "12345");
-        env.insert("METRICS_PORT", "23456");
+        env.insert("METRICS_BIND", "10.0.0.5:23456");
         let cfg = RelayConfig::from_source(lookup(&env)).expect("valid");
         assert_eq!(cfg.relay_port, 12345);
-        assert_eq!(cfg.metrics_port, 23456);
+        assert_eq!(
+            cfg.metrics_bind,
+            "10.0.0.5:23456".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
+    fn rejects_garbage_metrics_bind() {
+        let mut env = base_env();
+        env.insert("METRICS_BIND", "not-a-socket-addr");
+        let err = RelayConfig::from_source(lookup(&env)).unwrap_err();
+        assert!(matches!(
+            err,
+            ConfigError::Invalid {
+                var: "METRICS_BIND",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn metrics_bind_empty_falls_back_to_default() {
+        let mut env = base_env();
+        env.insert("METRICS_BIND", "");
+        let cfg = RelayConfig::from_source(lookup(&env)).expect("valid");
+        assert_eq!(
+            cfg.metrics_bind,
+            "127.0.0.1:9091".parse::<SocketAddr>().unwrap()
+        );
     }
 
     #[test]

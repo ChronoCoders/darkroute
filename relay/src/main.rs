@@ -78,7 +78,7 @@ async fn main() -> ExitCode {
         role = %cfg.role,
         node_id = %cfg.node_id,
         relay_port = cfg.relay_port,
-        metrics_port = cfg.metrics_port,
+        metrics_bind = %cfg.metrics_bind,
         max_circuits = cfg.max_circuits,
         replay_window_ttl_seconds = cfg.replay_window_ttl,
         allowed_exit_ports = ?cfg.allowed_exit_ports,
@@ -121,15 +121,14 @@ async fn main() -> ExitCode {
     };
     info!(addr = %relay_addr, "relay listener bound");
 
-    let metrics_addr = format!("0.0.0.0:{}", cfg.metrics_port);
-    let metrics_listener = match TcpListener::bind(&metrics_addr).await {
+    let metrics_listener = match TcpListener::bind(cfg.metrics_bind).await {
         Ok(l) => l,
         Err(e) => {
-            error!(error = %e, addr = %metrics_addr, "failed to bind metrics port");
+            error!(error = %e, addr = %cfg.metrics_bind, "failed to bind metrics listener");
             return ExitCode::from(1);
         }
     };
-    info!(addr = %metrics_addr, "metrics listener bound");
+    info!(addr = %cfg.metrics_bind, "metrics listener bound");
 
     let heartbeat_client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
