@@ -56,20 +56,20 @@ function Hero() {
       >
         <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-border/80 bg-card/60 px-3 py-1 text-xs text-muted-foreground backdrop-blur">
           <span className="h-1.5 w-1.5 rounded-full bg-emerald-400" />
-          Operator-grade onion routing
+          Operator-grade secure connectivity
         </div>
         <h1 className="text-balance text-4xl font-semibold tracking-tight sm:text-6xl">
-          A managed mesh for{" "}
+          A managed network for{" "}
           <span className="bg-gradient-to-r from-zinc-100 via-zinc-400 to-zinc-100 bg-clip-text text-transparent">
             unlinkable
           </span>{" "}
-          traffic.
+          connections.
         </h1>
         <p className="mt-6 max-w-2xl text-lg text-muted-foreground">
-          Blind-token-gated circuits across guard, middle, and exit relays.
-          The authority issues tokens it cannot link to traffic; relays
-          verify tokens they cannot link to subscribers. End users see only
-          the residential exit IP.
+          Access keys are issued anonymously and verified without exposing the
+          account behind them. Each connection routes through multiple
+          distinct network points so no single point sees both your account
+          and your destination.
         </p>
         <div className="mt-10 flex flex-col gap-3 sm:flex-row">
           <Button asChild size="lg">
@@ -93,23 +93,23 @@ const FEATURES: Array<{
 }> = [
   {
     icon: KeyRound,
-    title: "Blind tokens",
-    body: "Chaum RSA-2048 blind signatures. The authority counts issuances; it never sees the token value that a relay later verifies.",
+    title: "Anonymous access keys",
+    body: "Keys are generated using a cryptographic blind signature scheme. We count generations but never see the key itself, so your traffic stays unlinkable.",
   },
   {
     icon: Network,
-    title: "Three-hop circuits",
-    body: "Guard, middle, exit. Each hop is a distinct physical node — same host cannot serve two roles in one circuit.",
+    title: "Multi-layer connections",
+    body: "Every connection routes through multiple distinct network points. The same point never serves two layers in one connection.",
   },
   {
     icon: Lock,
-    title: "Layered AES-256-GCM",
-    body: "X25519 ECDH per hop, HKDF-SHA256 keys, fresh nonce per frame. Session keys zeroize on circuit teardown.",
+    title: "End-to-end encryption",
+    body: "Ephemeral keys at every layer with fresh randomness per message. Session keys are wiped the moment a connection closes.",
   },
   {
     icon: ShieldCheck,
-    title: "Residential exit",
-    body: "Outbound dialing through Decodo's sticky dedicated IPs. Destination ports are gated by the relay before any SOCKS5 dial.",
+    title: "Residential outbound",
+    body: "Outbound traffic flows through dedicated residential IPs. Destination ports are checked before any connection is opened.",
   },
 ];
 
@@ -143,22 +143,22 @@ const STEPS: Array<{ k: string; title: string; body: string }> = [
   {
     k: "01",
     title: "Sign up",
-    body: "Create an account. Your subscription is pending review until an operator approves it.",
+    body: "Create an account. We review every new account before connections are enabled.",
   },
   {
     k: "02",
-    title: "Get approved",
-    body: "Human review for fraud screening. Once approved, your account unlocks circuit assignment and token issuance.",
+    title: "Get activated",
+    body: "Human review for fraud screening. Once activated, your account unlocks connection requests and key generation.",
   },
   {
     k: "03",
-    title: "Issue tokens",
-    body: "Blind-sign tokens via the authority API. Use them to open circuits without revealing identity to relays.",
+    title: "Generate access keys",
+    body: "Generate anonymous access keys via the API. Use them to open connections without revealing your identity.",
   },
   {
     k: "04",
-    title: "Route traffic",
-    body: "Build a guard → middle → exit circuit, layer-encrypt your payload, send it. The exit dials your destination via Decodo.",
+    title: "Connect",
+    body: "Open a multi-layer connection, encrypt your payload, send it. We route the traffic and an outbound network point opens the destination.",
   },
 ];
 
@@ -207,11 +207,11 @@ function CTA() {
       >
         <Workflow className="mx-auto h-8 w-8 text-zinc-300" aria-hidden />
         <h2 className="mt-4 text-2xl font-semibold tracking-tight sm:text-3xl">
-          Ready to route?
+          Ready to connect?
         </h2>
         <p className="mx-auto mt-3 max-w-xl text-muted-foreground">
-          Self-serve signup. Manual approval. Operator-tier rate limits.
-          Built for teams that need to move bytes without leaving a trail.
+          Self-serve signup. Manual review. Operator-tier limits. Built for
+          teams that need to move data without leaving a trail.
         </p>
         <div className="mt-8 flex flex-col items-center justify-center gap-3 sm:flex-row">
           <Button asChild size="lg">

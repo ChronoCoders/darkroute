@@ -18,7 +18,7 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "darkroute",
   description:
-    "B2B onion routing infrastructure. Blind-token-gated circuits, residential exit proxying, managed relay mesh.",
+    "Secure connectivity infrastructure for B2B operators. Anonymous access keys, multi-layer connections, residential outbound.",
 };
 
 export default function RootLayout({

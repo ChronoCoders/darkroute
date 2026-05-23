@@ -6,3 +6,4 @@ target/
 dist/
 .next/
 node_modules/
+authority/keys/

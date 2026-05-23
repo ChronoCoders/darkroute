@@ -5,7 +5,6 @@ import { usePathname, useRouter } from "next/navigation";
 import { useEffect, type ReactNode } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
-  Activity,
   KeyRound,
   LayoutDashboard,
   LogOut,
@@ -25,6 +24,7 @@ import {
 import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Marketing } from "@/components/marketing";
+import { LivePulse } from "@/components/visuals/live-pulse";
 import { isUnauthorized } from "@/lib/api";
 import { useAccount, useLogout } from "@/lib/queries";
 import type { SubscriptionStatus } from "@/lib/types";
@@ -38,27 +38,16 @@ type NavItem = {
 
 const NAV: NavItem[] = [
   { href: "/dashboard", label: "Overview", icon: LayoutDashboard },
-  { href: "/tokens", label: "Tokens", icon: KeyRound },
-  { href: "/circuits", label: "Circuits", icon: Network },
+  { href: "/keys", label: "Access keys", icon: KeyRound },
+  { href: "/connections", label: "Connections", icon: Network },
   { href: "/account", label: "Account", icon: UserRound },
   { href: "/admin", label: "Admin", icon: Shield, adminOnly: true },
 ];
 
-function statusBadgeVariant(status: SubscriptionStatus) {
-  switch (status) {
-    case "active":
-      return "default" as const;
-    case "pending_review":
-      return "secondary" as const;
-    default:
-      return "outline" as const;
-  }
-}
-
 function statusLabel(status: SubscriptionStatus): string {
   switch (status) {
     case "pending_review":
-      return "Pending review";
+      return "Under review";
     case "active":
       return "Active";
     case "lapsed":
@@ -76,21 +65,14 @@ export function AppShell({ children }: { children: ReactNode }) {
   const { data: account, isLoading, error } = useAccount();
   const logout = useLogout();
 
-  // Redirect to /login on auth failure. Done in an effect so we don't
-  // call router.push during render.
   useEffect(() => {
     if (error && isUnauthorized(error)) {
       router.replace("/login");
     }
   }, [error, router]);
 
-  // If we're admin-paging without admin role, bounce to the overview.
   useEffect(() => {
-    if (
-      account &&
-      account.role !== "admin" &&
-      pathname.startsWith("/admin")
-    ) {
+    if (account && account.role !== "admin" && pathname.startsWith("/admin")) {
       router.replace("/dashboard");
     }
   }, [account, pathname, router]);
@@ -102,9 +84,9 @@ export function AppShell({ children }: { children: ReactNode }) {
           initial={{ opacity: 0 }}
           animate={{ opacity: 1 }}
           transition={{ duration: 0.4 }}
-          className="flex items-center gap-3 text-sm text-muted-foreground"
+          className="flex items-center gap-3 text-sm text-zinc-500"
         >
-          <span className="h-2 w-2 animate-pulse rounded-full bg-zinc-400" />
+          <LivePulse tone="zinc" />
           Loading…
         </motion.div>
       </div>
@@ -118,11 +100,20 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   return (
     <div className="relative min-h-screen bg-background text-foreground">
-      <Marketing.BackgroundGrid />
+      <div aria-hidden className="pointer-events-none absolute inset-0 -z-10 bg-grid" />
       <div className="relative z-10 mx-auto grid min-h-screen max-w-7xl grid-cols-[240px_1fr] gap-0">
-        <aside className="sticky top-0 flex h-screen flex-col border-r border-border/60 bg-background/60 px-4 py-6 backdrop-blur">
-          <Marketing.Logo />
-          <nav className="mt-10 flex flex-1 flex-col gap-1">
+        <aside className="sticky top-0 flex h-screen flex-col border-r border-white/[0.04] bg-zinc-950/40 px-4 py-6 backdrop-blur-xl">
+          <div className="px-2">
+            <Marketing.Logo />
+          </div>
+          <div className="mx-2 mt-3 flex items-center gap-2 text-[10px] uppercase tracking-[0.18em] text-zinc-600">
+            <LivePulse tone="emerald" size={6} />
+            <span>Service connected</span>
+          </div>
+          <nav className="mt-8 flex flex-1 flex-col gap-0.5">
+            <p className="px-3 pb-2 text-[10px] font-medium uppercase tracking-[0.18em] text-zinc-600">
+              Workspace
+            </p>
             {items.map((item) => {
               const active =
                 pathname === item.href || pathname.startsWith(`${item.href}/`);
@@ -130,16 +121,26 @@ export function AppShell({ children }: { children: ReactNode }) {
                 <Link
                   key={item.href}
                   href={item.href}
-                  className={`group flex items-center gap-3 rounded-md px-3 py-2 text-sm transition ${
+                  className={`group relative flex items-center gap-3 rounded-md px-3 py-2 text-sm transition ${
                     active
-                      ? "bg-card text-foreground"
-                      : "text-muted-foreground hover:bg-card/60 hover:text-foreground"
+                      ? "bg-white/[0.05] text-zinc-100"
+                      : "text-zinc-500 hover:bg-white/[0.03] hover:text-zinc-200"
                   }`}
                 >
+                  {active && (
+                    <motion.span
+                      layoutId="nav-active"
+                      className="absolute inset-y-1 left-0 w-0.5 rounded-r bg-zinc-200"
+                      transition={{ type: "spring", stiffness: 400, damping: 30 }}
+                    />
+                  )}
                   <item.icon className="h-4 w-4" />
-                  {item.label}
-                  {item.label === "Admin" && (
-                    <Badge variant="outline" className="ml-auto text-[10px]">
+                  <span className="flex-1">{item.label}</span>
+                  {item.adminOnly && (
+                    <Badge
+                      variant="outline"
+                      className="border-white/10 px-1.5 py-0 text-[9px] uppercase tracking-[0.14em] text-zinc-500"
+                    >
                       Admin
                     </Badge>
                   )}
@@ -149,17 +150,17 @@ export function AppShell({ children }: { children: ReactNode }) {
           </nav>
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
-              <button className="flex items-center gap-3 rounded-md border border-border/60 bg-card/40 p-2 text-left transition hover:bg-card/70">
+              <button className="flex items-center gap-3 rounded-lg border border-white/[0.04] bg-zinc-900/40 p-2.5 text-left transition hover:bg-zinc-900/70">
                 <Avatar className="h-8 w-8">
-                  <AvatarFallback className="bg-zinc-700 text-xs text-zinc-100">
+                  <AvatarFallback className="bg-gradient-to-br from-zinc-700 to-zinc-900 text-xs text-zinc-100">
                     {initials}
                   </AvatarFallback>
                 </Avatar>
                 <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-medium">
+                  <p className="truncate text-xs font-medium text-zinc-200">
                     {account.email}
                   </p>
-                  <p className="text-[11px] text-muted-foreground">
+                  <p className="text-[10px] uppercase tracking-[0.14em] text-zinc-500">
                     {account.role === "admin" ? "Admin" : "Operator"}
                   </p>
                 </div>
@@ -191,7 +192,7 @@ export function AppShell({ children }: { children: ReactNode }) {
           </DropdownMenu>
         </aside>
 
-        <main className="min-w-0 px-8 py-8">
+        <main className="min-w-0 px-10 py-10">
           <AnimatePresence mode="popLayout">
             {status !== "active" && (
               <motion.div
@@ -200,21 +201,21 @@ export function AppShell({ children }: { children: ReactNode }) {
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: -8 }}
                 transition={{ duration: 0.3 }}
-                className="mb-6 flex items-center gap-3 rounded-lg border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200"
+                className="mb-8 flex items-center gap-3 rounded-xl border border-amber-500/20 bg-amber-500/[0.06] px-5 py-4 text-sm"
               >
-                <Activity className="h-4 w-4" />
-                <div>
-                  <p className="font-medium">
-                    Your account is {statusLabel(status).toLowerCase()}.
+                <LivePulse tone="amber" />
+                <div className="flex-1">
+                  <p className="font-medium text-amber-100">
+                    Your account is {statusLabel(status).toLowerCase()}
                   </p>
-                  <p className="text-amber-200/80">
-                    Circuit assignment and token issuance unlock once an
-                    operator approves your subscription.
+                  <p className="mt-0.5 text-xs text-amber-200/70">
+                    Connections and access keys unlock once your account is
+                    activated.
                   </p>
                 </div>
                 <Badge
-                  variant={statusBadgeVariant(status)}
-                  className="ml-auto"
+                  variant="outline"
+                  className="border-amber-500/30 text-amber-200"
                 >
                   {statusLabel(status)}
                 </Badge>
@@ -238,11 +239,13 @@ export function PageHeader({
   actions?: ReactNode;
 }) {
   return (
-    <header className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
+    <header className="mb-10 flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
       <div>
-        <h1 className="text-2xl font-semibold tracking-tight">{title}</h1>
+        <h1 className="text-3xl font-semibold tracking-tight text-zinc-100">
+          {title}
+        </h1>
         {description && (
-          <p className="mt-1 text-sm text-muted-foreground">{description}</p>
+          <p className="mt-2 max-w-xl text-sm text-zinc-500">{description}</p>
         )}
       </div>
       {actions && <div className="flex items-center gap-2">{actions}</div>}
@@ -250,33 +253,26 @@ export function PageHeader({
   );
 }
 
-export function StatCard({
-  label,
-  value,
-  hint,
-  icon: Icon,
-}: {
-  label: string;
-  value: string | number;
-  hint?: string;
-  icon?: typeof LayoutDashboard;
-}) {
-  return (
-    <div className="rounded-xl border border-border/60 bg-card/60 p-5">
-      <div className="flex items-center justify-between text-xs text-muted-foreground">
-        <span>{label}</span>
-        {Icon && <Icon className="h-4 w-4" />}
-      </div>
-      <p className="mt-3 text-2xl font-semibold tracking-tight">{value}</p>
-      {hint && <p className="mt-1 text-xs text-muted-foreground">{hint}</p>}
-    </div>
-  );
-}
-
 export function StatusPill({ status }: { status: SubscriptionStatus }) {
+  const colors = {
+    active: "border-emerald-500/30 bg-emerald-500/10 text-emerald-300",
+    pending_review: "border-amber-500/30 bg-amber-500/10 text-amber-300",
+    lapsed: "border-zinc-500/30 bg-zinc-500/10 text-zinc-400",
+    cancelled: "border-zinc-500/30 bg-zinc-500/10 text-zinc-400",
+  } as const;
+  const cls = colors[status] ?? colors.lapsed;
   return (
-    <Badge variant={statusBadgeVariant(status)} className="capitalize">
+    <span
+      className={`inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] font-medium uppercase tracking-[0.14em] ${cls}`}
+    >
+      <span className={`h-1 w-1 rounded-full ${
+        status === "active"
+          ? "bg-emerald-400"
+          : status === "pending_review"
+            ? "bg-amber-400"
+            : "bg-zinc-400"
+      }`} />
       {statusLabel(status)}
-    </Badge>
+    </span>
   );
 }
