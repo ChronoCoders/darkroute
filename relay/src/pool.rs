@@ -64,10 +64,7 @@ impl ConnectionPool {
     /// mutex is held only for the duration of the map lookup; no I/O
     /// happens while locked.
     pub fn acquire(&self, addr: &SocketAddr) -> Option<PooledConn> {
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("connection pool mutex poisoned");
+        let mut guard = self.inner.lock().expect("connection pool mutex poisoned");
         let bucket = guard.get_mut(addr)?;
         let conn = bucket.pop();
         if bucket.is_empty() {
@@ -83,10 +80,7 @@ impl ConnectionPool {
     /// CIRCUIT_START + client pubkey to reuse this stream.
     pub fn release(&self, addr: SocketAddr, mut conn: PooledConn) {
         conn.last_used = Instant::now();
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("connection pool mutex poisoned");
+        let mut guard = self.inner.lock().expect("connection pool mutex poisoned");
         guard.entry(addr).or_default().push(conn);
     }
 
@@ -94,10 +88,7 @@ impl ConnectionPool {
     /// `ttl`. Returns the number of evicted entries so a metric or log
     /// can record the sweep.
     pub fn evict_older_than(&self, ttl: Duration) -> usize {
-        let mut guard = self
-            .inner
-            .lock()
-            .expect("connection pool mutex poisoned");
+        let mut guard = self.inner.lock().expect("connection pool mutex poisoned");
         let mut evicted = 0usize;
         let mut empty_addrs: Vec<SocketAddr> = Vec::new();
         for (addr, bucket) in guard.iter_mut() {
@@ -116,10 +107,7 @@ impl ConnectionPool {
 
     /// Total number of pooled connections across all addresses.
     pub fn len(&self) -> usize {
-        let guard = self
-            .inner
-            .lock()
-            .expect("connection pool mutex poisoned");
+        let guard = self.inner.lock().expect("connection pool mutex poisoned");
         guard.values().map(|v| v.len()).sum()
     }
 
@@ -208,7 +196,6 @@ mod tests {
         let c_peer = c.peer_addr().unwrap();
         pool.release(addr, PooledConn::new(a));
         pool.release(addr, PooledConn::new(c));
-        // Pop order: last pushed = c first.
         let first = pool.acquire(&addr).unwrap();
         assert_eq!(first.stream.peer_addr().unwrap(), c_peer);
         let second = pool.acquire(&addr).unwrap();

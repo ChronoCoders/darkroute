@@ -15,10 +15,10 @@ import (
 	"github.com/dslabs/darkroute/authority/internal/auth"
 )
 
-// dummyPasswordHash is a precomputed Argon2id hash used to equalize timing
-// when the login flow looks up an email that does not exist. Without it,
-// the absence of the Argon2id step on the unknown-user path is observable
-// via response timing, defeating the constant-time hash comparison.
+// Precomputed Argon2id hash used to equalize timing when the login flow
+// looks up an email that does not exist. Without it, the absence of the
+// Argon2id step on the unknown-user path is observable via response timing,
+// defeating the constant-time hash comparison.
 var dummyPasswordHash = func() string {
 	h, err := auth.HashPassword("dummy-password-only-for-timing-equalization")
 	if err != nil {
@@ -100,9 +100,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
-	// peerIP is the TCP peer (net.SplitHostPort-safe). X-Forwarded-For is
-	// not honored because the authority listens directly on a public port
-	// and any client could supply that header to bypass the rate limiter.
+	// X-Forwarded-For is not honored because the authority listens directly
+	// on a public port and any client could supply that header to bypass
+	// the rate limiter.
 	ip := peerIP(r)
 	if !h.rl.check(ip) {
 		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate_limited"})

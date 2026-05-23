@@ -52,7 +52,10 @@ impl AuthorityClient {
         }
 
         let pubkey = parse_pubkey(body.trim())?;
-        info!(modulus_bits = pubkey_bits(&pubkey), "authority pubkey parsed");
+        info!(
+            modulus_bits = pubkey_bits(&pubkey),
+            "authority pubkey parsed"
+        );
         Ok(Self { pubkey })
     }
 

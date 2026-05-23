@@ -121,8 +121,7 @@ impl Cell {
         }
         let cell_type = CellType::try_from(bytes[0])?;
         let circuit_id = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
-        let payload_len =
-            u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]) as usize;
+        let payload_len = u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]) as usize;
         if payload_len > MAX_CELL_PAYLOAD {
             return Err(CellError::TooLarge(payload_len));
         }
@@ -168,20 +167,25 @@ impl ExtendForward {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, CellError> {
         if bytes.len() < 2 {
-            return Err(CellError::BadExtend("payload shorter than address length prefix"));
+            return Err(CellError::BadExtend(
+                "payload shorter than address length prefix",
+            ));
         }
         let addr_len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
         if bytes.len() < 2 + addr_len + 32 {
             return Err(CellError::BadExtend("payload shorter than addr+pubkey"));
         }
-        let addr_str = std::str::from_utf8(&bytes[2..2 + addr_len])
-            .map_err(|_| CellError::BadAddress)?;
+        let addr_str =
+            std::str::from_utf8(&bytes[2..2 + addr_len]).map_err(|_| CellError::BadAddress)?;
         let next_hop: SocketAddr = addr_str
             .parse()
             .map_err(|_| CellError::UnparseableAddress)?;
         let mut client_pk = [0u8; 32];
         client_pk.copy_from_slice(&bytes[2 + addr_len..2 + addr_len + 32]);
-        Ok(Self { next_hop, client_pk })
+        Ok(Self {
+            next_hop,
+            client_pk,
+        })
     }
 }
 
@@ -195,7 +199,9 @@ pub fn extend_backward_payload(relay_pk: &[u8; 32]) -> Vec<u8> {
 #[cfg(test)]
 pub fn parse_extend_backward(bytes: &[u8]) -> Result<[u8; 32], CellError> {
     if bytes.len() != 32 {
-        return Err(CellError::BadExtend("backward payload must be exactly 32 bytes"));
+        return Err(CellError::BadExtend(
+            "backward payload must be exactly 32 bytes",
+        ));
     }
     let mut out = [0u8; 32];
     out.copy_from_slice(bytes);
@@ -224,11 +230,15 @@ impl ConnectPayload {
 
     pub fn decode(bytes: &[u8]) -> Result<Self, CellError> {
         if bytes.len() < 4 {
-            return Err(CellError::BadConnect("payload shorter than length prefix + port"));
+            return Err(CellError::BadConnect(
+                "payload shorter than length prefix + port",
+            ));
         }
         let host_len = u16::from_be_bytes([bytes[0], bytes[1]]) as usize;
         if bytes.len() != 2 + host_len + 2 {
-            return Err(CellError::BadConnect("payload length does not match host_len + port"));
+            return Err(CellError::BadConnect(
+                "payload length does not match host_len + port",
+            ));
         }
         let host = std::str::from_utf8(&bytes[2..2 + host_len])
             .map_err(|_| CellError::BadAddress)?
@@ -270,10 +280,16 @@ mod tests {
     fn cell_decode_rejects_length_mismatch() {
         let mut bytes = vec![CellType::Data as u8];
         bytes.extend_from_slice(&0u32.to_be_bytes());
-        bytes.extend_from_slice(&(8u32).to_be_bytes()); // claims 8 payload bytes
-        bytes.extend_from_slice(&[1, 2, 3]); // only 3 supplied
+        bytes.extend_from_slice(&(8u32).to_be_bytes());
+        bytes.extend_from_slice(&[1, 2, 3]);
         let err = Cell::decode(&bytes).unwrap_err();
-        assert!(matches!(err, CellError::LengthMismatch { declared: 8, actual: 3 }));
+        assert!(matches!(
+            err,
+            CellError::LengthMismatch {
+                declared: 8,
+                actual: 3
+            }
+        ));
     }
 
     #[test]
@@ -338,7 +354,6 @@ mod tests {
 
     #[test]
     fn connect_rejects_length_mismatch() {
-        // Claim host_len = 5, supply 3 host bytes + 2 port bytes
         let mut bytes = vec![];
         bytes.extend_from_slice(&(5u16).to_be_bytes());
         bytes.extend_from_slice(b"abc");

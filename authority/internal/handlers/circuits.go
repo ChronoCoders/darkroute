@@ -11,9 +11,6 @@ import (
 	"github.com/dslabs/darkroute/authority/internal/relay"
 )
 
-// CircuitHandler serves circuit-assignment requests from authenticated
-// operators. The authority assigns one active relay per role uniformly at
-// random; if any role has no active relay, the request fails with 503.
 // SECURITY_MODEL §9 lets the authority know circuit routes — this is the
 // one place that information is intentionally produced.
 type CircuitHandler struct {
@@ -108,10 +105,7 @@ type circuitListResponse struct {
 	Recent []circuitListItem `json:"recent"`
 }
 
-// HandleListCircuits returns the subscriber's recent circuit
-// assignments. The dashboard's Circuits page uses this to show recent
-// circuit activity; only IDs are returned, never relay endpoints or
-// destinations.
+// Only IDs are returned, never relay endpoints or destinations.
 func (h *CircuitHandler) HandleListCircuits(w http.ResponseWriter, r *http.Request) {
 	subID, ok := r.Context().Value(subscriberKey).(string)
 	if !ok || subID == "" {

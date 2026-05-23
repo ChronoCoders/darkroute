@@ -58,7 +58,10 @@ impl ReplayWindow {
 
     #[cfg(test)]
     pub fn len(&self) -> usize {
-        self.inner.lock().expect("replay window mutex poisoned").len()
+        self.inner
+            .lock()
+            .expect("replay window mutex poisoned")
+            .len()
     }
 }
 
@@ -105,12 +108,8 @@ pub fn verify(
 
     // ----- Step 2: replay check (mandatory SECOND). -----
     let token_hash: [u8; 32] = Sha256::digest(token).into();
-    let mut map = window
-        .inner
-        .lock()
-        .expect("replay window mutex poisoned");
+    let mut map = window.inner.lock().expect("replay window mutex poisoned");
 
-    // Evict expired entries before checking.
     let now = Instant::now();
     let ttl = window.ttl;
     map.retain(|_, t| now.duration_since(*t) < ttl);
@@ -152,8 +151,7 @@ mod tests {
         // 1024-bit for test speed. The verify() code path is identical for
         // any modulus size; only test setup time differs.
         let mut rng = rand_core::OsRng;
-        let priv_key =
-            RsaPrivateKey::new(&mut rng, 1024).expect("test rsa keygen");
+        let priv_key = RsaPrivateKey::new(&mut rng, 1024).expect("test rsa keygen");
         let pub_key = RsaPublicKey::from(&priv_key);
         (priv_key, pub_key)
     }
@@ -165,7 +163,11 @@ mod tests {
         let m_raw = b"this is exactly thirty-two bytes";
         let token = raw_sign(m_raw, &priv_key);
         verify(m_raw, &token, &pub_key, &window).expect("valid token must pass");
-        assert_eq!(window.len(), 1, "valid token should be inserted into window");
+        assert_eq!(
+            window.len(),
+            1,
+            "valid token should be inserted into window"
+        );
     }
 
     #[test]
@@ -184,7 +186,11 @@ mod tests {
             "bad signature must be rejected before any replay logic runs"
         );
         // The window must not have been polluted by the failed attempt:
-        assert_eq!(window.len(), 0, "invalid tokens must not enter the replay window");
+        assert_eq!(
+            window.len(),
+            0,
+            "invalid tokens must not enter the replay window"
+        );
 
         // Submit the same garbage again. If the implementation accidentally
         // checked replay before RSA, this second call would return Replayed

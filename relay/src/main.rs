@@ -100,8 +100,13 @@ async fn main() -> ExitCode {
     };
     info!("authority public key pinned");
 
-    let replay = Arc::new(ReplayWindow::new(Duration::from_secs(cfg.replay_window_ttl)));
-    info!(ttl_seconds = cfg.replay_window_ttl, "replay window initialized");
+    let replay = Arc::new(ReplayWindow::new(Duration::from_secs(
+        cfg.replay_window_ttl,
+    )));
+    info!(
+        ttl_seconds = cfg.replay_window_ttl,
+        "replay window initialized"
+    );
     metrics::init();
 
     let outbound_pool = Arc::new(ConnectionPool::new());

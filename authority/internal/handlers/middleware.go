@@ -124,11 +124,9 @@ func Authenticate(jm *auth.JWTManager, pool *pgxpool.Pool) func(http.Handler) ht
 	}
 }
 
-// RequireRole rejects any request whose authenticated subscriber does not
-// have the named role. Must be applied AFTER Authenticate; it reads the
-// role placed in context by that middleware. Per SECURITY_MODEL §7.3,
-// admin-tier endpoints (relay provisioning, relay listing) are gated this
-// way.
+// Must be applied AFTER Authenticate; it reads the role placed in context
+// by that middleware. Per SECURITY_MODEL §7.3, admin-tier endpoints (relay
+// provisioning, relay listing) are gated this way.
 func RequireRole(required string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

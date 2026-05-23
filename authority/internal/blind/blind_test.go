@@ -12,8 +12,6 @@ import (
 	"testing"
 )
 
-// testSigner builds a Signer around a freshly generated RSA-2048 key WITHOUT
-// touching disk. Faster than LoadOrGenerate for repeated unit tests.
 func testSigner(t *testing.T) *Signer {
 	t.Helper()
 	priv, err := rsa.GenerateKey(rand.Reader, RSAKeySize)
@@ -27,10 +25,6 @@ func testSigner(t *testing.T) *Signer {
 	return s
 }
 
-// TestBlindSignRoundTrip walks the full Chaum protocol end-to-end:
-// client builds m, blinds with r, sends b to Sign(), unblinds with r^-1,
-// and verifies that token^e mod n == m. If the order of operations or the
-// raw primitive is wrong, this test fails.
 func TestBlindSignRoundTrip(t *testing.T) {
 	s := testSigner(t)
 	pub := s.PublicKey()
@@ -42,7 +36,6 @@ func TestBlindSignRoundTrip(t *testing.T) {
 		t.Fatalf("test invariant: m must be < n")
 	}
 
-	// Pick a random blinding factor r with gcd(r, n) = 1.
 	r, err := rand.Int(rand.Reader, pub.N)
 	if err != nil {
 		t.Fatal(err)
@@ -55,7 +48,6 @@ func TestBlindSignRoundTrip(t *testing.T) {
 	}
 
 	e := big.NewInt(int64(pub.E))
-	// b = m * r^e mod n
 	rE := new(big.Int).Exp(r, e, pub.N)
 	b := new(big.Int).Mul(m, rE)
 	b.Mod(b, pub.N)
@@ -66,7 +58,6 @@ func TestBlindSignRoundTrip(t *testing.T) {
 	}
 	sBlind := new(big.Int).SetBytes(signed)
 
-	// Unblind: token = sBlind * r^-1 mod n
 	rInv := new(big.Int).ModInverse(r, pub.N)
 	if rInv == nil {
 		t.Fatalf("r has no inverse mod n")
@@ -74,7 +65,6 @@ func TestBlindSignRoundTrip(t *testing.T) {
 	token := new(big.Int).Mul(sBlind, rInv)
 	token.Mod(token, pub.N)
 
-	// Verify: token^e mod n must equal m
 	check := new(big.Int).Exp(token, e, pub.N)
 	if check.Cmp(m) != 0 {
 		t.Fatalf("blind signature verification failed: check != m")
@@ -93,7 +83,6 @@ func TestSignRejectsOutOfRangeBlinded(t *testing.T) {
 	if _, err := s.Sign(zero); err != ErrInvalidBlindedValue {
 		t.Errorf("zero: got %v, want ErrInvalidBlindedValue", err)
 	}
-	// n itself is out of range (must be < n)
 	if _, err := s.Sign(s.key.N.Bytes()); err != ErrInvalidBlindedValue {
 		t.Errorf("n: got %v, want ErrInvalidBlindedValue", err)
 	}

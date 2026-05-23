@@ -7,9 +7,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// AccountHandler serves the operator dashboard's account and usage
-// surfaces. Both endpoints are read-only and scoped to the authenticated
-// subscriber; no admin-only data is reachable here.
+// Both endpoints are read-only and scoped to the authenticated subscriber;
+// no admin-only data is reachable here.
 type AccountHandler struct {
 	pool *pgxpool.Pool
 }
@@ -83,12 +82,12 @@ type relayRoleCounts struct {
 }
 
 type usageResponse struct {
-	TokensIssued        int64           `json:"tokens_issued"`
-	BandwidthUsed       int64           `json:"bandwidth_used"`
-	CircuitsAssigned    int64           `json:"circuits_assigned"`
-	ActiveRelays        relayRoleCounts `json:"active_relays"`
-	CurrentPeriodStart  string          `json:"current_period_start"`
-	CurrentPeriodEnd    string          `json:"current_period_end"`
+	TokensIssued       int64           `json:"tokens_issued"`
+	BandwidthUsed      int64           `json:"bandwidth_used"`
+	CircuitsAssigned   int64           `json:"circuits_assigned"`
+	ActiveRelays       relayRoleCounts `json:"active_relays"`
+	CurrentPeriodStart string          `json:"current_period_start"`
+	CurrentPeriodEnd   string          `json:"current_period_end"`
 }
 
 func (h *AccountHandler) HandleGetUsage(w http.ResponseWriter, r *http.Request) {

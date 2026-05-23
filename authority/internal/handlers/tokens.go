@@ -13,9 +13,8 @@ import (
 	"github.com/dslabs/darkroute/authority/internal/blind"
 )
 
-// TokenHandler serves the authority pubkey and the blind token issuance
-// endpoint. Per SECURITY_MODEL §5.2 step 8, the authority records only that
-// a token was issued — the blinded value b and the resulting signature s are
+// Per SECURITY_MODEL §5.2 step 8, the authority records only that a token
+// was issued — the blinded value b and the resulting signature s are
 // neither logged nor persisted.
 type TokenHandler struct {
 	pool   *pgxpool.Pool
@@ -26,9 +25,8 @@ func NewTokenHandler(pool *pgxpool.Pool, signer *blind.Signer) *TokenHandler {
 	return &TokenHandler{pool: pool, signer: signer}
 }
 
-// HandlePubkey serves the authority's RSA public key in PEM form. Per
-// ARCHITECTURE §4.2 this endpoint is public and unauthenticated; relays
-// fetch and pin it at startup.
+// Per ARCHITECTURE §4.2 this endpoint is public and unauthenticated;
+// relays fetch and pin it at startup.
 func (h *TokenHandler) HandlePubkey(w http.ResponseWriter, _ *http.Request) {
 	pem := h.signer.PublicKeyPEM()
 	w.Header().Set("Content-Type", "application/x-pem-file")
@@ -45,15 +43,6 @@ type issueRequest struct {
 	Blinded string `json:"blinded"`
 }
 
-// HandleIssue performs the authority side of the blind token protocol:
-//
-//   - Confirms the request is from an authenticated subscriber (the
-//     Authenticate middleware has already done JWT + session lookup).
-//   - Verifies that the subscriber has an active subscription.
-//   - Computes s = b^d mod n via blind.Signer.Sign.
-//   - Atomically increments tokens_issued on the subscription row.
-//   - Returns s as hex.
-//
 // Failure modes return generic errors so an attacker cannot distinguish
 // "no subscription" from "expired subscription" or "internal failure".
 func (h *TokenHandler) HandleIssue(w http.ResponseWriter, r *http.Request) {
@@ -108,10 +97,8 @@ func (h *TokenHandler) HandleIssue(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// SECURITY_MODEL §5.2 step 8: counter only, no token value. We also
-	// insert a row into token_issuance_events with the timestamp only
-	// (no token bytes) so the dashboard can show a list of recent
-	// issuances per the user-facing Phase 5 Tokens page.
+	// SECURITY_MODEL §5.2 step 8: counter only, no token value. The
+	// token_issuance_events row stores only a timestamp — no token bytes.
 	if _, err := h.pool.Exec(r.Context(),
 		`UPDATE subscriptions
 		 SET tokens_issued = tokens_issued + 1
@@ -140,13 +127,12 @@ type tokenIssuanceListItem struct {
 }
 
 type tokenListResponse struct {
-	TokensIssued int64                  `json:"tokens_issued"`
+	TokensIssued int64                   `json:"tokens_issued"`
 	Recent       []tokenIssuanceListItem `json:"recent"`
 }
 
-// HandleListTokens returns the subscriber's lifetime issuance counter
-// and the most recent N issuance timestamps. No token bytes are stored
-// or returned — this is purely an audit/visualisation surface.
+// No token bytes are stored or returned — this is purely an
+// audit/visualisation surface.
 func (h *TokenHandler) HandleListTokens(w http.ResponseWriter, r *http.Request) {
 	subID, ok := r.Context().Value(subscriberKey).(string)
 	if !ok || subID == "" {
