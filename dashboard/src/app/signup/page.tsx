@@ -71,7 +71,7 @@ export default function SignupPage() {
   return (
     <AuthShell
       title="Create your account"
-      subtitle="Self-serve signup. Approval is manual — we'll review and unlock circuit access within one business day."
+      subtitle="Self-serve signup. Review is manual — we'll activate your account, typically within one business day."
       footer={
         <>
           Already have an account?{" "}
@@ -138,9 +138,9 @@ export default function SignupPage() {
           )}
         </Button>
         <p className="text-xs text-muted-foreground">
-          By signing up you agree that circuit access is gated on manual
-          approval. Your subscription stays in <strong>pending review</strong>{" "}
-          until an operator approves it.
+          By signing up you agree that connections are gated on manual
+          review. Your account stays{" "}
+          <strong>under review</strong> until we activate it.
         </p>
       </form>
     </AuthShell>

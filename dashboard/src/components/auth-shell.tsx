@@ -1,6 +1,5 @@
 "use client";
 
-import Link from "next/link";
 import { motion } from "framer-motion";
 import type { ReactNode } from "react";
 
@@ -23,17 +22,15 @@ export function AuthShell({
       <div className="relative hidden overflow-hidden border-r border-border/60 bg-background lg:block">
         <Marketing.BackgroundGrid />
         <div className="relative z-10 flex h-full flex-col p-10">
-          <Link href="/">
-            <Marketing.Logo />
-          </Link>
+          <Marketing.Logo />
           <div className="mt-auto max-w-md">
             <blockquote className="text-2xl font-medium tracking-tight text-zinc-200">
-              &ldquo;The authority cannot link a token to the subscriber who
-              requested it. The relay cannot link a circuit to a token&rsquo;s
-              owner. Each principal sees only its column.&rdquo;
+              &ldquo;No single party can link an access key to the account
+              that requested it. Each network point sees only the layer in
+              front of it.&rdquo;
             </blockquote>
             <p className="mt-4 text-sm text-muted-foreground">
-              — SECURITY_MODEL §9
+              — Security principle
             </p>
           </div>
         </div>

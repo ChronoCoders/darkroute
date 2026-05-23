@@ -84,9 +84,9 @@
 }
 
 .dark {
-  --background: oklch(0.145 0 0);
+  --background: oklch(0.115 0 0);
   --foreground: oklch(0.985 0 0);
-  --card: oklch(0.205 0 0);
+  --card: oklch(0.165 0 0);
   --card-foreground: oklch(0.985 0 0);
   --popover: oklch(0.205 0 0);
   --popover-foreground: oklch(0.985 0 0);
@@ -123,8 +123,37 @@
   }
   body {
     @apply bg-background text-foreground;
+    background-image:
+      radial-gradient(ellipse 1200px 600px at 50% -200px,
+        oklch(0.32 0.02 264 / 0.35),
+        transparent 60%),
+      radial-gradient(ellipse 800px 400px at 100% 100%,
+        oklch(0.32 0.02 220 / 0.18),
+        transparent 60%);
+    background-attachment: fixed;
   }
   html {
     @apply font-sans;
+  }
+  ::selection {
+    background-color: oklch(0.7 0 0 / 0.25);
+    color: var(--foreground);
+  }
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+  /* Subtle dotted/grid mesh background utility used by marketing
+     and the dashboard. Scoped so pages can layer it without
+     re-declaring the same big linear-gradient. */
+  .bg-grid {
+    background-image:
+      linear-gradient(to right, oklch(1 0 0 / 0.04) 1px, transparent 1px),
+      linear-gradient(to bottom, oklch(1 0 0 / 0.04) 1px, transparent 1px);
+    background-size: 56px 56px;
+    mask-image: radial-gradient(ellipse at 50% 0%,
+      black 0%, transparent 70%);
   }
 }

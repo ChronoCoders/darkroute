@@ -39,7 +39,7 @@ export default function LoginPage() {
   return (
     <AuthShell
       title="Welcome back"
-      subtitle="Log in to manage your circuits, tokens, and subscription."
+      subtitle="Log in to manage your connections, access keys, and account."
       footer={
         <>
           Don&apos;t have an account?{" "}
