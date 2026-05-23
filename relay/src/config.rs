@@ -150,10 +150,12 @@ impl RelayConfig {
                 var: "DECODO_PROXY_URL",
                 reason: format!("not a valid URL: {e}"),
             })?;
-            if !parsed.scheme().eq_ignore_ascii_case("socks5") {
+            // socks5h = proxy-side DNS; required for exits so destination lookups don't leak locally.
+            let scheme = parsed.scheme();
+            if !scheme.eq_ignore_ascii_case("socks5") && !scheme.eq_ignore_ascii_case("socks5h") {
                 return Err(ConfigError::Invalid {
                     var: "DECODO_PROXY_URL",
-                    reason: format!("scheme must be socks5, got {}", parsed.scheme()),
+                    reason: format!("scheme must be socks5 or socks5h, got {scheme}"),
                 });
             }
             if parsed.host_str().is_none_or(str::is_empty) {
@@ -434,6 +436,15 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn exit_role_accepts_socks5h_scheme() {
+        let mut env = base_env();
+        env.insert("RELAY_ROLE", "exit");
+        env.insert("DECODO_PROXY_URL", "socks5h://user:pass@proxy:1080");
+        let cfg = RelayConfig::from_source(lookup(&env)).expect("socks5h must validate");
+        assert_eq!(cfg.role, Role::Exit);
     }
 
     #[test]
