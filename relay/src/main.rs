@@ -28,7 +28,7 @@ use tokio::signal;
 use tokio::sync::Notify;
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_rustls::TlsConnector;
 use tracing::{error, info, warn};
 
 use crate::authority::AuthorityClient;
@@ -198,7 +198,8 @@ async fn main() -> ExitCode {
 
     let accept_handle = tokio::spawn(accept_loop(
         relay_listener,
-        acme.acceptor,
+        acme.default_config,
+        acme.challenge_config,
         shutdown.clone(),
         cfg.clone(),
         authority.clone(),
@@ -247,7 +248,8 @@ fn redact_proxy_url(raw: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn accept_loop(
     listener: TcpListener,
-    acceptor: TlsAcceptor,
+    default_config: std::sync::Arc<rustls::ServerConfig>,
+    challenge_config: std::sync::Arc<rustls::ServerConfig>,
     shutdown: Arc<Notify>,
     cfg: Arc<RelayConfig>,
     authority: Arc<AuthorityClient>,
@@ -268,11 +270,22 @@ async fn accept_loop(
                     let rep = replay.clone();
                     let pl = pool.clone();
                     let conn = connector.clone();
-                    let acc = acceptor.clone();
+                    let dc = default_config.clone();
+                    let cc = challenge_config.clone();
                     tokio::spawn(async move {
                         let _ = tcp.set_nodelay(true);
-                        let tls = match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acc.accept(tcp)).await {
-                            Ok(Ok(s)) => s,
+                        let routed = tokio::time::timeout(
+                            TLS_HANDSHAKE_TIMEOUT,
+                            tls::accept_routed(tcp, dc, cc),
+                        )
+                        .await;
+                        let tls = match routed {
+                            // Ok(None) means ACME-TLS-ALPN-01 challenge
+                            // probe — handshake completed with the
+                            // challenge cert, must not enter relay path
+                            // (RFC 8737 §3).
+                            Ok(Ok(Some(s))) => s,
+                            Ok(Ok(None)) => return,
                             Ok(Err(e)) => {
                                 warn!(peer = %peer, error = %e, "tls handshake failed");
                                 return;
@@ -282,13 +295,6 @@ async fn accept_loop(
                                 return;
                             }
                         };
-                        // RFC 8737 §3: drop ACME-TLS-ALPN-01 probes
-                        // before the relay protocol path. They are not
-                        // real clients and would otherwise generate a
-                        // spurious "connection terminated" warning.
-                        if tls.get_ref().1.alpn_protocol() == Some(tls::ACME_TLS_ALPN) {
-                            return;
-                        }
                         if let Err(e) = handle_connection(tls, peer, cfg, auth, rep, pl, conn).await {
                             warn!(peer = %peer, reason = %e, "connection terminated");
                         }
