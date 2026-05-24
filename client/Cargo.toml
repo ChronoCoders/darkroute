@@ -1,0 +1,30 @@
+[package]
+name = "darkroute-client-sdk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "darkroute_client"
+path = "src/lib.rs"
+
+[dependencies]
+darkroute-crypto = { path = "../darkroute-crypto" }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+sha2 = { workspace = true }
+rsa = { workspace = true }
+num-bigint-dig = { version = "0.8", features = ["rand"] }
+num-traits = { workspace = true }
+rand_core = { workspace = true }
+rand = { workspace = true }
+x25519-dalek = { workspace = true }
+url = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
+rustls-pemfile = { workspace = true }

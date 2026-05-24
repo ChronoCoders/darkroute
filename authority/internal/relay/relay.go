@@ -137,6 +137,13 @@ func PickRandomActiveByRole(ctx context.Context, pool *pgxpool.Pool, role string
 	if !validRole(role) {
 		return nil, ErrInvalidRole
 	}
+	// pgx serializes nil slices as SQL NULL; `ANY(NULL)` evaluates to NULL
+	// and the WHERE clause drops the row, so a no-exclusions call would
+	// never match. Force the empty-array case so the picker can pick on
+	// the first hop of a circuit.
+	if excludeIDs == nil {
+		excludeIDs = []string{}
+	}
 	r := &Relay{}
 	err := pool.QueryRow(ctx,
 		`SELECT id, endpoint, region, role, status, last_heartbeat

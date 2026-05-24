@@ -2,10 +2,8 @@
 #![forbid(unsafe_code)]
 
 mod authority;
-mod cell;
 mod circuit;
 mod config;
-mod crypto;
 mod exit;
 mod heartbeat;
 mod metrics;
@@ -31,34 +29,24 @@ use tokio_rustls::server::TlsStream as ServerTlsStream;
 use tokio_rustls::TlsConnector;
 use tracing::{error, info, warn};
 
+use darkroute_crypto::cell::{self, Cell, CellType, ConnectPayload, ExtendForward};
+use darkroute_crypto::crypto::{self, SessionKey};
+use darkroute_crypto::wire::{
+    CIRCUIT_ID, CIRCUIT_START, M_RAW_LEN, PRESENTATION_LEN, PROTO_CLIENT, PROTO_RELAY,
+    X25519_PK_LEN,
+};
+
 use crate::authority::AuthorityClient;
-use crate::cell::{Cell, CellType, ConnectPayload, ExtendForward};
 use crate::config::{RelayConfig, Role};
-use crate::crypto::SessionKey;
 use crate::pool::{ConnectionPool, PooledConn};
 use crate::token::ReplayWindow;
 
-/// First byte after TLS termination. Selects between Phase-3 token
-/// presentation (guard) and the relay-to-relay circuit-start protocol
-/// (middle/exit, peer-allowlisted).
-const PROTO_CLIENT: u8 = 0x01;
-const PROTO_RELAY: u8 = 0x02;
-
-/// On a relay-to-relay link, any byte other than CIRCUIT_START
-/// (including EOF) terminates the link instead of starting a circuit.
-const CIRCUIT_START: u8 = 0xC1;
-
-const M_RAW_LEN: usize = 32;
-const TOKEN_LEN: usize = 256;
-const PRESENTATION_LEN: usize = M_RAW_LEN + TOKEN_LEN;
 const PRESENTATION_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CELL_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const POOL_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 const POOL_IDLE_TTL: Duration = Duration::from_secs(300);
-const X25519_PK_LEN: usize = 32;
-const CIRCUIT_ID: u32 = 1;
 const DEST_READ_BUF: usize = 16 * 1024;
 
 pub type InboundStream = ServerTlsStream<TcpStream>;
@@ -708,7 +696,7 @@ pub(crate) mod test_hooks {
     use std::sync::OnceLock;
     use tokio::sync::mpsc;
 
-    use crate::cell::ConnectPayload;
+    use darkroute_crypto::cell::ConnectPayload;
 
     static CONNECT_SINK: OnceLock<Mutex<Option<mpsc::UnboundedSender<ConnectPayload>>>> =
         OnceLock::new();

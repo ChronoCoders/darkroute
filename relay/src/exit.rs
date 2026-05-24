@@ -52,7 +52,8 @@ pub async fn dial_via_socks5(
     }
 
     let proxy = ::url::Url::parse(proxy_url).map_err(|_| ExitError::BadProxyUrl)?;
-    if !proxy.scheme().eq_ignore_ascii_case("socks5") {
+    let scheme = proxy.scheme();
+    if !scheme.eq_ignore_ascii_case("socks5") && !scheme.eq_ignore_ascii_case("socks5h") {
         return Err(ExitError::BadProxyUrl);
     }
     let proxy_host = proxy.host_str().ok_or(ExitError::BadProxyUrl)?;
