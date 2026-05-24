@@ -128,4 +128,3 @@ async fn write_reply(sock: &mut TcpStream, rep: u8) -> Result<(), std::io::Error
         .await?;
     Ok(())
 }
-

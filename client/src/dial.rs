@@ -65,7 +65,13 @@ pub async fn dial(
     );
 
     let k_middle = extend_hop(&mut tls, &k_guard, &[], middle_addr).await?;
-    let k_exit = extend_hop(&mut tls, &k_guard, std::slice::from_ref(&k_middle), exit_addr).await?;
+    let k_exit = extend_hop(
+        &mut tls,
+        &k_guard,
+        std::slice::from_ref(&k_middle),
+        exit_addr,
+    )
+    .await?;
 
     let inner_layers = [k_middle.clone(), k_exit.clone()];
     send_layered(
