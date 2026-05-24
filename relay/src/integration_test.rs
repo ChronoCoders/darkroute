@@ -38,10 +38,15 @@ use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::TlsConnector;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
+use darkroute_crypto::cell::{
+    parse_extend_backward, Cell, CellType, ConnectPayload, ExtendForward,
+};
+use darkroute_crypto::crypto::{
+    decrypt_frame, derive_session_key, encrypt_frame, X25519_PUBKEY_LEN,
+};
+
 use crate::authority::AuthorityClient;
-use crate::cell::{parse_extend_backward, Cell, CellType, ConnectPayload, ExtendForward};
 use crate::config::{RelayConfig, Role};
-use crate::crypto::{decrypt_frame, derive_session_key, encrypt_frame, X25519_PUBKEY_LEN};
 use crate::pool::ConnectionPool;
 use crate::test_hooks;
 use crate::token::{raw_sign, ReplayWindow};

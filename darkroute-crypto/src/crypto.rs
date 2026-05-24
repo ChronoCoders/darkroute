@@ -67,8 +67,7 @@ impl SessionKey {
         Aes256Gcm::new_from_slice(&self.0).expect("session key is exactly 32 bytes")
     }
 
-    #[cfg(test)]
-    pub(crate) fn from_raw(k: [u8; AES_KEY_LEN]) -> Self {
+    pub fn from_raw(k: [u8; AES_KEY_LEN]) -> Self {
         Self(k)
     }
 }
@@ -192,10 +191,8 @@ where
         .map_err(|_| CryptoError::Aead)
 }
 
-/// Encrypt `plaintext` to a complete wire-frame `Vec<u8>` rather than
-/// streaming it. Used by the integration test's mock client to construct
-/// layered onion-encrypted payloads before sending the outermost frame.
-#[cfg(test)]
+/// Encrypt `plaintext` to a complete wire-frame `Vec<u8>`. Used by the client
+/// to build layered onion payloads before sending the outermost frame.
 pub fn encrypt_frame(key: &SessionKey, plaintext: &[u8]) -> Result<Vec<u8>, CryptoError> {
     if plaintext.len() > MAX_FRAME_PLAINTEXT {
         return Err(CryptoError::FrameTooLarge(u32::MAX));
@@ -215,9 +212,7 @@ pub fn encrypt_frame(key: &SessionKey, plaintext: &[u8]) -> Result<Vec<u8>, Cryp
     Ok(out)
 }
 
-/// Decrypt a complete wire-frame from a byte slice rather than a reader.
-/// Mirror of `encrypt_frame` for the test client's onion-decryption path.
-#[cfg(test)]
+/// Decrypt a complete wire-frame from a byte slice (client onion-peel path).
 pub fn decrypt_frame(key: &SessionKey, frame: &[u8]) -> Result<Vec<u8>, CryptoError> {
     if frame.len() < NONCE_LEN + 4 {
         return Err(CryptoError::FrameTooShort);

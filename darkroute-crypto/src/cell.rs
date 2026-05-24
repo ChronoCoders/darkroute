@@ -2,10 +2,8 @@
 //!
 //! Every AES-GCM frame on a client-relay link carries exactly one cell
 //! in its decrypted plaintext. The cell has a fixed 9-byte header:
-//!
-//!     [type: 1][circuit_id: 4 BE][payload_length: 4 BE]
-//!
-//! followed by `payload_length` payload bytes. No partial reads — the
+//! `[type: 1][circuit_id: 4 BE][payload_length: 4 BE]` followed by
+//! `payload_length` payload bytes. No partial reads — the
 //! caller decrypts the full frame plaintext first and only then parses
 //! it as a cell, so an attacker cannot cause work by sending half a
 //! header.
@@ -149,12 +147,7 @@ pub struct ExtendForward {
 }
 
 impl ExtendForward {
-    /// Client-side mirror of `decode`. Production relays only decode
-    /// EXTEND-forward payloads (they receive them from clients); the
-    /// encode path lives behind `#[cfg(test)]` because the binary itself
-    /// is never a client. A future client library will expose this as
-    /// part of its public surface.
-    #[cfg(test)]
+    /// Encode for the client side of the protocol.
     pub fn encode(&self) -> Vec<u8> {
         let addr = self.next_hop.to_string();
         let addr_bytes = addr.as_bytes();
@@ -194,9 +187,7 @@ pub fn extend_backward_payload(relay_pk: &[u8; 32]) -> Vec<u8> {
     relay_pk.to_vec()
 }
 
-/// Client-side mirror of `extend_backward_payload`. Gated to test builds
-/// for the same reason as `ExtendForward::encode`.
-#[cfg(test)]
+/// Client-side: parse the relay's ephemeral pubkey out of an EXTEND-backward payload.
 pub fn parse_extend_backward(bytes: &[u8]) -> Result<[u8; 32], CellError> {
     if bytes.len() != 32 {
         return Err(CellError::BadExtend(
@@ -216,9 +207,7 @@ pub struct ConnectPayload {
 }
 
 impl ConnectPayload {
-    /// Client-side mirror of `decode`. Gated to test builds for the same
-    /// reason as `ExtendForward::encode`.
-    #[cfg(test)]
+    /// Encode for the client side of the protocol.
     pub fn encode(&self) -> Vec<u8> {
         let host_bytes = self.host.as_bytes();
         let mut out = Vec::with_capacity(2 + host_bytes.len() + 2);

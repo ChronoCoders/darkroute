@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = ["darkroute-crypto", "relay", "client", "darkroute-client"]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "signal", "sync"] }
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rsa = "0.9"
+sha2 = "0.10"
+num-bigint = "0.4"
+num-traits = "0.2"
+x25519-dalek = { version = "2", features = ["getrandom"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+rand_core = { version = "0.6", features = ["getrandom"] }
+rand = "0.8"
+url = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "cookies"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
+tokio-rustls = "0.26"
+rustls-native-certs = "0.8"
+rustls-pemfile = "2"
+futures-util = "0.3"
