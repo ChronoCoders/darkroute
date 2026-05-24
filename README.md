@@ -18,7 +18,7 @@ Three principals see different slices of any request:
 - **Relay nodes** know the cryptographic validity of a token, the previous hop, and the next hop. They do not know which subscriber the token belongs to and they do not see beyond their own layer of the encrypted envelope.
 - **Exit node** sees the destination host and one layer of ciphertext. It does not know the client's identity or IP.
 
-The unlinkability between subscriber and traffic flow is built on a Chaum blind RSA signature: the authority signs a blinded message it never sees in unblinded form, the client unblinds the signature locally, and relays verify the signature against the authority's public key without contacting the authority. A complete protocol description lives in [SECURITY_MODEL.md](SECURITY_MODEL.md).
+The unlinkability between subscriber and traffic flow is built on a Chaum blind RSA signature: the authority signs a blinded message it never sees in unblinded form, the client unblinds the signature locally, and relays verify the signature against the authority's public key without contacting the authority. The full threat model and trust boundaries are available on request.
 
 ## Architecture
 
@@ -59,7 +59,7 @@ If you need a private deployment for compliance reasons, contact us.
 
 ## Security model
 
-The authoritative specification is in [SECURITY_MODEL.md](SECURITY_MODEL.md). It defines the cryptographic primitives, the principals and their trust boundaries, the blind-token protocol step by step, and an explicit list of what the system does not protect against.
+The authoritative specification defines the cryptographic primitives, the principals and their trust boundaries, the blind-token protocol step by step, and an explicit list of what the system does not protect against. The full threat model and trust boundaries are available on request.
 
 For vulnerability disclosure, see [SECURITY.md](SECURITY.md).
 
