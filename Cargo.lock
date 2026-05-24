@@ -455,6 +455,7 @@ name = "darkroute-client"
 version = "0.1.0"
 dependencies = [
  "darkroute-client-sdk",
+ "reqwest",
  "rustls",
  "thiserror 1.0.69",
  "tokio",
