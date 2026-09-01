@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -136,8 +137,17 @@ func TestLoadOrGenerateCreatesFileOnFirstRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
-	if mode := info.Mode().Perm(); mode != 0o600 {
-		t.Errorf("file mode = %o, want 0600", mode)
+	// Go on Windows does not implement Unix permission bits: a file created with
+	// 0600 reports Mode().Perm() == 0666 because only the read-only attribute is
+	// mapped. The 0600 requirement is a property of the Linux host the authority
+	// runs on, so the assertion stays unconditional there and only the platform
+	// that cannot express it is exempted. Narrowing the guard to this one check
+	// keeps the rest of the test, including that the file was created at all,
+	// running everywhere.
+	if runtime.GOOS != "windows" {
+		if mode := info.Mode().Perm(); mode != 0o600 {
+			t.Errorf("file mode = %o, want 0600", mode)
+		}
 	}
 
 	s2, err := LoadOrGenerate(path)
