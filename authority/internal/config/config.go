@@ -87,6 +87,18 @@ func (c *Config) Validate() error {
 		if strings.Contains(c.DatabaseURL, "localhost") || strings.Contains(c.DatabaseURL, "127.0.0.1") {
 			return errors.New("DATABASE_URL must not point to localhost or 127.0.0.1 in production")
 		}
+		// ARCHITECTURE §4.4 rejects an absent or unreadable RSA key in production.
+		// blind.LoadOrGenerate mints a fresh modulus whenever the file is missing,
+		// and relays pin the authority public key at their own startup and never
+		// refetch it (SECURITY_MODEL §5.1), so a silently regenerated key would
+		// invalidate every token already issued without any startup failure.
+		keyFile, err := os.Open(c.RSAKeyPath)
+		if err != nil {
+			return fmt.Errorf("RSA key file not found or unreadable at %q: production requires a pre-existing key", c.RSAKeyPath)
+		}
+		if cerr := keyFile.Close(); cerr != nil {
+			return fmt.Errorf("RSA key file at %q could not be closed: %w", c.RSAKeyPath, cerr)
+		}
 	}
 	return nil
 }

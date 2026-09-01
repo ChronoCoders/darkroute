@@ -1,6 +1,9 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -110,5 +113,52 @@ func TestValidateAllowsLocalhostInDevelopment(t *testing.T) {
 	c.DatabaseURL = "postgres://u:p@localhost:5432/dr"
 	if err := c.Validate(); err != nil {
 		t.Fatalf("expected localhost OK in development: %v", err)
+	}
+}
+
+func TestValidateRejectsAbsentRSAKeyFileInProduction(t *testing.T) {
+	c := validBase()
+	c.Environment = "production"
+	c.RSAKeyPath = filepath.Join(t.TempDir(), "absent", "authority.pem")
+
+	err := c.Validate()
+	if err == nil {
+		t.Fatal("expected error for absent RSA key file in production")
+	}
+	// Validate formats the path with %q, which is strconv.Quote, so on Windows
+	// every separator in the message is backslash-escaped and a raw comparison
+	// against c.RSAKeyPath cannot match. Quoting the expected path the same way
+	// pins the exact rendered form on both platforms.
+	if !strings.Contains(err.Error(), strconv.Quote(c.RSAKeyPath)) {
+		t.Errorf("error must name the failing path %s; got %v", strconv.Quote(c.RSAKeyPath), err)
+	}
+	if !strings.Contains(err.Error(), "not found or unreadable") {
+		t.Errorf("error must say the key was not found; got %v", err)
+	}
+}
+
+func TestValidateAcceptsExistingRSAKeyFileInProduction(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "authority.pem")
+	if err := os.WriteFile(path, []byte("placeholder"), 0o600); err != nil {
+		t.Fatalf("write key file: %v", err)
+	}
+	c := validBase()
+	c.Environment = "production"
+	c.RSAKeyPath = path
+
+	if err := c.Validate(); err != nil {
+		t.Fatalf("expected production config with an existing key file to pass: %v", err)
+	}
+}
+
+// The development branch must stay permissive so blind.LoadOrGenerate can mint
+// the first key on a fresh machine; TestLoadOrGenerateCreatesFileOnFirstRun in
+// the blind package covers the generation itself.
+func TestValidateAllowsAbsentRSAKeyFileOutsideProduction(t *testing.T) {
+	c := validBase()
+	c.RSAKeyPath = filepath.Join(t.TempDir(), "absent", "authority.pem")
+
+	if err := c.Validate(); err != nil {
+		t.Fatalf("expected absent key file to be allowed outside production: %v", err)
 	}
 }
