@@ -1,8 +1,8 @@
-// Display helpers shared across pages. Pure functions — easy to unit
+// Display helpers shared across pages. Pure functions, easy to unit
 // test if we ever wire up a TS test runner.
 
 export function formatBytes(bytes: number): string {
-  if (bytes < 0 || !Number.isFinite(bytes)) return "—";
+  if (bytes < 0 || !Number.isFinite(bytes)) return "n/a";
   if (bytes === 0) return "0 B";
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   const exp = Math.min(
@@ -19,7 +19,7 @@ export function formatNumber(n: number): string {
 
 export function formatDateTime(iso: string): string {
   const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—";
+  if (Number.isNaN(d.getTime())) return "n/a";
   return d.toLocaleString("en-US", {
     month: "short",
     day: "numeric",
@@ -31,7 +31,7 @@ export function formatDateTime(iso: string): string {
 
 export function formatDate(iso: string): string {
   const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—";
+  if (Number.isNaN(d.getTime())) return "n/a";
   return d.toLocaleDateString("en-US", {
     month: "short",
     day: "numeric",
@@ -41,7 +41,7 @@ export function formatDate(iso: string): string {
 
 export function timeSince(iso: string): string {
   const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return "—";
+  if (Number.isNaN(d.getTime())) return "n/a";
   const seconds = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000));
   if (seconds < 60) return `${seconds}s ago`;
   const minutes = Math.floor(seconds / 60);

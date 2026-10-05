@@ -224,10 +224,10 @@ export default function AdminPage() {
                     <p className="font-mono text-[10px] text-zinc-600">{s.id}</p>
                   </TableCell>
                   <TableCell>
-                    {s.status ? <StatusPill status={s.status} /> : "—"}
+                    {s.status ? <StatusPill status={s.status} /> : "n/a"}
                   </TableCell>
                   <TableCell className="text-xs text-zinc-400">
-                    {s.tier || "—"}
+                    {s.tier || "n/a"}
                   </TableCell>
                   <TableCell className="text-xs tabular-nums text-zinc-400">
                     {formatNumber(s.tokens_issued)}
