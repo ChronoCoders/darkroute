@@ -16,7 +16,7 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: "darkroute",
+  title: "darkrouter",
   description:
     "Secure connectivity infrastructure for B2B operators. Anonymous access keys, multi-layer connections, residential outbound.",
 };

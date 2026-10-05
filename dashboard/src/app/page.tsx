@@ -30,7 +30,7 @@ export default function LandingPage() {
 
       <footer className="relative z-10 mx-auto max-w-6xl border-t border-border/60 px-6 py-8 text-sm text-muted-foreground">
         <div className="flex flex-col items-start gap-2 sm:flex-row sm:items-center sm:justify-between">
-          <p>© darkroute. Secure connectivity infrastructure.</p>
+          <p>© darkrouter. Secure connectivity infrastructure.</p>
           <p className="font-mono text-xs uppercase tracking-[0.18em]">
             anonymous · encrypted · residential
           </p>
