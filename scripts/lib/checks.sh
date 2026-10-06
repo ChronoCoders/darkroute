@@ -21,6 +21,13 @@ CK_DASH_CLASS="[$(printf '\u2010\u2011\u2012\u2013\u2014\u2015')]"
 CK_MSG_PREFIX='^(feat|fix|docs|test|refactor|chore)(\([a-z0-9._-]+\))?: .+'
 CK_CLEANUP_WORDS='formatting|whitespace|punctuation|typo|trailing space|indentation|em dash|en dash|reformat'
 
+# The project author. Every commit that leaves this machine carries this identity
+# as both author and committer. It is already in every commit in the published
+# history, so naming it here exposes nothing new, and a rule that lives only in a
+# instruction file is a rule the next session can forget.
+CK_AUTHOR_NAME='ChronoCoders'
+CK_AUTHOR_EMAIL='altug@bytus.io'
+
 CK_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 CK_ACCEPTED="$CK_ROOT/scripts/accepted-advisories.txt"
 
@@ -135,6 +142,97 @@ ck_naming_staged() {
 		fi
 	done
 	return $rc
+}
+
+# Author and committer on every commit in a range. The naming scan over the same
+# fields only rejects an identity carrying the tooling name, which leaves every
+# other wrong identity through, so this is a separate rule rather than a widening
+# of that one.
+ck_identity_commits() { # revs
+	local revs="$1" rc=0 line sha rest an ae cn ce checked=0 total
+	total=$(git rev-list --count "$revs" 2>/dev/null || echo 0)
+	# Only commits that have not reached a remote yet. 8a68505 in this history was
+	# made through the GitHub web interface, so it carries that interface's
+	# committer, and a rule applied to the whole reachable history would refuse
+	# every push forever over a commit that was published long before the rule
+	# existed. What has already left the machine cannot be stopped from leaving.
+	while IFS= read -r line; do
+		[ -z "$line" ] && continue
+		checked=$((checked + 1))
+		sha=${line%% *}
+		rest=${line#* }
+		IFS='|' read -r an ae cn ce <<< "$rest"
+		if [ "$an" != "$CK_AUTHOR_NAME" ] || [ "$ae" != "$CK_AUTHOR_EMAIL" ]; then
+			printf 'REJECT identity: %s author is "%s <%s>", expected "%s <%s>"\n' \
+				"${sha:0:8}" "$an" "$ae" "$CK_AUTHOR_NAME" "$CK_AUTHOR_EMAIL" >&2
+			rc=1
+		fi
+		if [ "$cn" != "$CK_AUTHOR_NAME" ] || [ "$ce" != "$CK_AUTHOR_EMAIL" ]; then
+			printf 'REJECT identity: %s committer is "%s <%s>", expected "%s <%s>"\n' \
+				"${sha:0:8}" "$cn" "$ce" "$CK_AUTHOR_NAME" "$CK_AUTHOR_EMAIL" >&2
+			rc=1
+		fi
+	done < <(git log --format="%H %an|%ae|%cn|%ce" "$revs" --not --remotes 2>/dev/null)
+	if [ "${total:-0}" -eq 0 ]; then
+		echo "the range held no commit at all, so the identity check proved nothing" >&2
+		return 1
+	fi
+	if [ $rc -eq 0 ]; then
+		if [ "$checked" -eq 0 ]; then
+			echo "all $total commit in this range are already on a remote, none left to check"
+		else
+			echo "$checked of $total commit are unpublished and carry the project identity"
+		fi
+	fi
+	return $rc
+}
+
+ck_identity_config() {
+	local n e rc=0
+	n=$(git -C "$CK_ROOT" config user.name || true)
+	e=$(git -C "$CK_ROOT" config user.email || true)
+	[ "$n" = "$CK_AUTHOR_NAME" ] || { echo "user.name is '$n', expected '$CK_AUTHOR_NAME'" >&2; rc=1; }
+	[ "$e" = "$CK_AUTHOR_EMAIL" ] || { echo "user.email is '$e', expected '$CK_AUTHOR_EMAIL'" >&2; rc=1; }
+	[ $rc -eq 0 ] && echo "the configured identity is $n <$e>"
+	return $rc
+}
+
+# The control builds a scratch repository, never the working tree, and proves the
+# rule rejects a wrong author and a wrong committer separately as well as
+# accepting a correct commit. Checking a predicate in isolation says nothing about
+# whether anything calls it, so the hook case lives in the hook controls and this
+# covers the rule itself.
+ck_identity_self_test() {
+	local tmp rc=0
+	tmp=$(mktemp -d) || return 1
+	(
+		cd "$tmp" || exit 1
+		git init -q .
+		git config user.name "$CK_AUTHOR_NAME"
+		git config user.email "$CK_AUTHOR_EMAIL"
+		git config commit.gpgsign false
+		printf 'x\n' > f
+		git add f
+		git commit -q -m 'chore: a commit'
+	) >/dev/null 2>&1
+	( cd "$tmp" && ck_identity_commits HEAD ) >/dev/null 2>&1 || {
+		echo "control failed: a correct commit was rejected" >&2; rc=1; }
+
+	( cd "$tmp" && git -c user.name='Someone Else' -c user.email='someone@example.invalid' \
+		commit -q --allow-empty -m 'chore: a commit with the wrong author' ) >/dev/null 2>&1
+	if ( cd "$tmp" && ck_identity_commits HEAD~1..HEAD ) >/dev/null 2>&1; then
+		echo "control failed: a commit with the wrong author and committer was accepted" >&2; rc=1
+	fi
+
+	( cd "$tmp" && GIT_COMMITTER_NAME='Someone Else' GIT_COMMITTER_EMAIL='someone@example.invalid' \
+		git commit -q --allow-empty -m 'chore: a commit with the wrong committer' ) >/dev/null 2>&1
+	if ( cd "$tmp" && ck_identity_commits HEAD~1..HEAD ) >/dev/null 2>&1; then
+		echo "control failed: a commit with only the committer wrong was accepted" >&2; rc=1
+	fi
+
+	rm -rf "$tmp"
+	[ $rc -eq 0 ] || return 1
+	echo "the identity rule accepts the project identity and rejects a wrong author or committer"
 }
 
 ck_naming_tracked() {

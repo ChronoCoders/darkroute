@@ -43,6 +43,7 @@ while read -r lref lsha rref rsha; do
 
 	meta=$(git log --format='%H%n%B%n%an%n%ae%n%cn%n%ce' "$revs" 2>/dev/null || true)
 	ck_naming_scan "pushed commits" "$meta" || rc=1
+	ck_identity_commits "$revs" >/dev/null || rc=1
 	ck_dash_text "pushed commit messages" "$(git log --format='%B' "$revs" 2>/dev/null || true)" || rc=1
 	ck_naming_scan_paths "$(git log --format='' --name-only "$revs" 2>/dev/null | sort -u || true)" || rc=1
 

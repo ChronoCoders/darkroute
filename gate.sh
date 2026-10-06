@@ -38,6 +38,8 @@ ck_step "every crate root carries deny(warnings) and forbid(unsafe_code)" ck_att
 ck_step "control: the accepted advisory file parses"              ck_accepted_file_self_test
 ck_step "the rust and go toolchains are pinned"                   ck_toolchain_pins
 ck_step "the git hooks are installed and executable"              ck_hooks_installed
+ck_step "control: the identity rule rejects a wrong author"        ck_identity_self_test
+ck_step "the configured git identity is the project author"        ck_identity_config
 
 ck_step "cargo fmt"      ck_run cargo fmt --all --check
 ck_step "cargo clippy"   ck_run cargo clippy --workspace --all-targets --all-features -- -D warnings
