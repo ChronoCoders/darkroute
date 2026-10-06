@@ -186,3 +186,44 @@ func TestIssueIncrementsTokensIssued(t *testing.T) {
 		t.Error("returned signature does not verify against b")
 	}
 }
+
+// SECURITY_MODEL 5.4: issuance requires an active subscription. The onboarding gate
+// leaves a new subscriber at pending_review until an admin approves, and nothing
+// covered that path, so removing the status check went unnoticed by the whole suite.
+// The blinded value is well formed on purpose, so a 403 cannot come from the body.
+func TestIssueRejectsPendingReviewSubscription(t *testing.T) {
+	pool := testPool(t, "TEST_DATABASE_URL not set; skipping DB-backed pending review test")
+	subID := seedSubscriberWithSubscription(t, pool, "pending", "pending_review")
+
+	signer := testSignerForHandler(t)
+	th := NewTokenHandler(pool, signer)
+
+	pub := signer.PublicKey()
+	m := big.NewInt(2)
+	r := big.NewInt(3)
+	e := big.NewInt(int64(pub.E))
+	rE := new(big.Int).Exp(r, e, pub.N)
+	b := new(big.Int).Mul(m, rE)
+	b.Mod(b, pub.N)
+	body, err := json.Marshal(map[string]string{"blinded": hex.EncodeToString(b.Bytes())})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/tokens/issue", bytes.NewReader(body))
+	req = req.WithContext(context.WithValue(req.Context(), subscriberKey, subID))
+	rec := httptest.NewRecorder()
+	th.HandleIssue(rec, req)
+
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("a pending_review subscriber got %d, want 403 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var issued int64
+	if err := pool.QueryRow(context.Background(),
+		`SELECT tokens_issued FROM subscriptions WHERE subscriber_id = $1`, subID).Scan(&issued); err != nil {
+		t.Fatal(err)
+	}
+	if issued != 0 {
+		t.Errorf("tokens_issued = %d after a refused issuance, want 0", issued)
+	}
+}

@@ -63,6 +63,14 @@ const (
 // enough to undo all of it.
 func seedSubscriberWithActiveSubscription(t *testing.T, pool *pgxpool.Pool, tag string) string {
 	t.Helper()
+	return seedSubscriberWithSubscription(t, pool, tag, "active")
+}
+
+// The status is a parameter because the onboarding gate turns on it: a new subscriber
+// sits at pending_review until an admin approves, and that path needs covering as much
+// as the active one does.
+func seedSubscriberWithSubscription(t *testing.T, pool *pgxpool.Pool, tag, status string) string {
+	t.Helper()
 	ctx := context.Background()
 	var subID string
 	if err := pool.QueryRow(ctx,
@@ -74,9 +82,9 @@ func seedSubscriberWithActiveSubscription(t *testing.T, pool *pgxpool.Pool, tag 
 	cleanupRow(t, pool, deleteSubscriberByID, subID)
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO subscriptions (subscriber_id, tier, status, current_period_start, current_period_end)
-		 VALUES ($1, 'free', 'active', NOW(), NOW() + INTERVAL '30 days')`, subID,
+		 VALUES ($1, 'free', $2, NOW(), NOW() + INTERVAL '30 days')`, subID, status,
 	); err != nil {
-		t.Fatalf("seed subscription: %v", err)
+		t.Fatalf("seed %s subscription: %v", status, err)
 	}
 	return subID
 }
