@@ -510,6 +510,78 @@ ck_npm_audit() {
 		python3 "$CK_ROOT/scripts/lib/audit_filter.py" npm
 }
 
+# The tables the database backed tests read and write, enumerated from those tests
+# rather than from whatever the database happens to contain, so a migration that
+# stops creating one of them fails here instead of inside a test.
+CK_TEST_DB_TABLES='subscribers sessions subscriptions relay_nodes circuit_assignments token_issuance_events'
+
+ck_test_db() {
+	ck_require psql python3 || return 1
+	local url origin dbname missing t have version
+	url="$(ck_test_db_url)"
+	origin="$(ck_test_db_origin)"
+	dbname=$(python3 "$CK_ROOT/scripts/lib/dburl.py" "$url" dbname) || return 1
+
+	if ! psql "$url" -tAc 'select 1' >/dev/null 2>&1; then
+		echo "cannot reach the test database '$dbname' (url from $origin)" >&2
+		echo "  pg_isready: $(pg_isready 2>&1)" >&2
+		echo "  the cluster may be down, or the database may not exist yet" >&2
+		echo "  fix: scripts/testdb-setup.sh" >&2
+		return 1
+	fi
+
+	missing=''
+	for t in $CK_TEST_DB_TABLES; do
+		have=$(psql "$url" -tAc \
+			"select 1 from information_schema.tables where table_schema = 'public' and table_name = '$t'" \
+			2>/dev/null)
+		[ "$have" = 1 ] || missing="$missing $t"
+	done
+	if [ -n "$missing" ]; then
+		echo "the test database '$dbname' is missing tables:$missing" >&2
+		echo "  fix: scripts/testdb-setup.sh applies the embedded migrations" >&2
+		return 1
+	fi
+
+	version=$(psql "$url" -tAc 'select version from schema_migrations' 2>/dev/null)
+	echo "test database '$dbname' reachable (url from $origin), schema complete at migration ${version:-unknown}"
+}
+
+# The control for the step above. It runs the same check against a socket directory
+# that holds no server. If that passes, the check cannot tell a missing database
+# from a present one, and a green gate would mean nothing.
+ck_test_db_control() {
+	if ( TEST_DATABASE_URL='postgres:///darkrouter_test?host=/var/empty&sslmode=disable'
+		ck_test_db ) >/dev/null 2>&1; then
+		echo "the database check passed against a dead socket, so it detects nothing" >&2
+		return 1
+	fi
+	echo "the database check fails when no server is listening"
+}
+
+# go test with the database url supplied, and a skip is treated as a failure. The
+# whole point of the database step is that six tests used to skip silently and the
+# suite still reported success.
+ck_go_test() {
+	ck_require go || return 1
+	local out rc skips passes
+	out=$(cd "$CK_ROOT/authority" && TEST_DATABASE_URL="$(ck_test_db_url)" \
+		go test -count=1 -v ./... 2>&1)
+	rc=$?
+	if [ $rc -ne 0 ]; then
+		printf '%s\n' "$out" | grep -E '^--- FAIL|^[[:space:]]+[a-z_]+\.go:[0-9]+:' | head -20 >&2
+		return 1
+	fi
+	skips=$(printf '%s\n' "$out" | grep -c '^--- SKIP' || true)
+	if [ "${skips:-0}" -ne 0 ]; then
+		echo "the suite reported success but skipped $skips test(s). A skip is not a pass." >&2
+		printf '%s\n' "$out" | grep '^--- SKIP' | sed 's/^/    /' >&2
+		return 1
+	fi
+	passes=$(printf '%s\n' "$out" | grep -c '^--- PASS' || true)
+	echo "$passes tests passed, 0 skipped"
+}
+
 # Commit message shape. Used by the commit-msg hook, and kept here so the gate
 # and the hook share one definition of it.
 ck_msg_shape() {
