@@ -28,6 +28,23 @@ CK_CLEANUP_WORDS='formatting|whitespace|punctuation|typo|trailing space|indentat
 CK_AUTHOR_NAME='ChronoCoders'
 CK_AUTHOR_EMAIL='altug@bytus.io'
 
+# The test database url carries nothing secret: peer authentication over the unix
+# socket, so no password, no host and no port appear in it. That is why the default
+# lives here as a constant instead of in a shell profile that every fresh shell has
+# to have sourced. TEST_DATABASE_URL overrides it when a different database is
+# wanted. The database check still fails loudly when the cluster is down or the
+# schema is missing. It just no longer fails merely because nobody exported a
+# variable.
+CK_TEST_DB_DEFAULT='postgres:///darkrouter_test?host=/var/run/postgresql&sslmode=disable'
+
+ck_test_db_url() {
+	printf '%s' "${TEST_DATABASE_URL:-$CK_TEST_DB_DEFAULT}"
+}
+
+ck_test_db_origin() {
+	if [ -n "${TEST_DATABASE_URL:-}" ]; then printf 'TEST_DATABASE_URL'; else printf 'the built in default'; fi
+}
+
 CK_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 CK_ACCEPTED="$CK_ROOT/scripts/accepted-advisories.txt"
 
