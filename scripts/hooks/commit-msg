@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Enabled with: git config core.hooksPath scripts/hooks
+#
+# Message shape lives in ck_msg_shape in scripts/lib/checks.sh: one line, a
+# conventional prefix, no trailer of any kind, no subject that describes only a
+# formatting or whitespace cleanup, no em dash or en dash, no tooling name.
+
+set -uo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+lib="$root/scripts/lib/checks.sh"
+[ -r "$lib" ] || { echo "commit-msg: shared check library unreachable at $lib" >&2; exit 1; }
+# shellcheck source=../lib/checks.sh
+. "$lib"
+
+ck_naming_self_test >/dev/null && ck_dash_self_test >/dev/null || {
+	echo "commit-msg: a pattern self test failed, refusing" >&2; exit 1; }
+
+ck_msg_shape "$1" || { echo "commit-msg: refused" >&2; exit 1; }

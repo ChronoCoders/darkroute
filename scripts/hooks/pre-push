@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# Enabled with: git config core.hooksPath scripts/hooks
+#
+# The last gate before anything leaves the machine. It covers the whole tracked
+# tree, not only what this push changes, because a leak committed earlier is
+# still a leak once it is published. It also covers what a commit carries beyond
+# its content: the messages, the author and committer identity, the paths, and
+# any tag annotation being pushed.
+#
+# Standard input holds one line per ref: <local ref> <local sha> <remote ref>
+# <remote sha>.
+
+set -uo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+lib="$root/scripts/lib/checks.sh"
+[ -r "$lib" ] || { echo "pre-push: shared check library unreachable at $lib" >&2; exit 1; }
+# shellcheck source=../lib/checks.sh
+. "$lib"
+
+rc=0
+ck_naming_self_test >/dev/null || rc=1
+ck_dash_self_test >/dev/null || rc=1
+[ $rc -eq 0 ] || { echo "pre-push: a pattern self test failed, refusing" >&2; exit 1; }
+
+ck_naming_tracked || rc=1
+ck_dash_tracked || rc=1
+
+zero_sha() { [ -z "$1" ] || [ "$(printf '%s' "$1" | tr -d 0)" = "" ]; }
+
+while read -r lref lsha rref rsha; do
+	[ -z "${lref:-}" ] && continue
+	ck_naming_scan_paths "$(printf '%s\n%s' "$lref" "${rref:-}")" || rc=1
+	zero_sha "${lsha:-}" && continue
+
+	if zero_sha "${rsha:-}"; then
+		revs="$lsha"
+		diffsrc=$(git show -U0 --format='' "$lsha" 2>/dev/null || true)
+	else
+		revs="$rsha..$lsha"
+		diffsrc=$(git diff -U0 "$revs" 2>/dev/null || true)
+	fi
+
+	meta=$(git log --format='%H%n%B%n%an%n%ae%n%cn%n%ce' "$revs" 2>/dev/null || true)
+	ck_naming_scan "pushed commits" "$meta" || rc=1
+	ck_dash_text "pushed commit messages" "$(git log --format='%B' "$revs" 2>/dev/null || true)" || rc=1
+	ck_naming_scan_paths "$(git log --format='' --name-only "$revs" 2>/dev/null | sort -u || true)" || rc=1
+
+	added=$(printf '%s\n' "$diffsrc" | grep '^+' | grep -v '^+++' || true)
+	ck_naming_scan "pushed content" "$added" || rc=1
+	ck_dash_text "pushed content" "$added" || rc=1
+
+	case "$lref" in
+	refs/tags/*)
+		if [ "$(git cat-file -t "$lsha" 2>/dev/null)" = tag ]; then
+			annotation=$(git cat-file tag "$lsha" | sed '1,/^$/d' || true)
+			ck_naming_scan "tag annotation" "$annotation" || rc=1
+			ck_dash_text "tag annotation" "$annotation" || rc=1
+		fi
+		;;
+	esac
+done
+
+[ $rc -eq 0 ] && exit 0
+echo "pre-push: refused" >&2
+exit 1

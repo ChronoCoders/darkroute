@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Enabled with: git config core.hooksPath scripts/hooks
+#
+# Shares scripts/lib/checks.sh with gate.sh, so what blocks a commit and what
+# blocks the gate are the same code rather than two descriptions of it.
+
+set -uo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+lib="$root/scripts/lib/checks.sh"
+[ -r "$lib" ] || { echo "pre-commit: shared check library unreachable at $lib" >&2; exit 1; }
+# shellcheck source=../lib/checks.sh
+. "$lib"
+
+rc=0
+# The controls run first. A pattern that stopped matching would let every check
+# below report a clean commit.
+ck_naming_self_test >/dev/null || rc=1
+ck_dash_self_test >/dev/null || rc=1
+[ $rc -eq 0 ] || { echo "pre-commit: a pattern self test failed, refusing" >&2; exit 1; }
+
+ck_naming_staged || rc=1
+ck_dash_staged || rc=1
+ck_private_staged || rc=1
+ck_fmt_staged || rc=1
+
+[ $rc -eq 0 ] && exit 0
+echo "pre-commit: refused" >&2
+exit 1
