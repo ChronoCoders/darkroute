@@ -29,7 +29,7 @@ func serveRoute(pool *pgxpool.Pool, subID string) *httptest.ResponseRecorder {
 }
 
 func TestCircuitRouteRequiresAllThreeRoles(t *testing.T) {
-	pool := testPool(t, "TEST_DATABASE_URL not set; skipping DB-backed circuit route test")
+	pool := testPool(t)
 	subID := seedSubscriberWithActiveSubscription(t, pool, "roles")
 
 	requireNoActiveRelays(t, pool, "exit")
@@ -70,7 +70,7 @@ func TestCircuitRouteRequiresAllThreeRoles(t *testing.T) {
 // HandleRoute find the subscriber and answer 200. Asserting 401 alone cannot
 // distinguish them, because HandleRoute also answers 401 when the context is empty.
 func TestCircuitRouteRejectsUnauthenticatedThroughRouter(t *testing.T) {
-	pool := testPool(t, "TEST_DATABASE_URL not set; skipping DB-backed router wiring test")
+	pool := testPool(t)
 	subID := seedSubscriberWithActiveSubscription(t, pool, "wiring")
 	seedActiveRelay(t, pool, "guard", "wiring")
 	seedActiveRelay(t, pool, "middle", "wiring")

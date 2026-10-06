@@ -121,7 +121,7 @@ func mintExpiredJWT(t *testing.T) string {
 }
 
 func TestIssueIncrementsTokensIssued(t *testing.T) {
-	pool := testPool(t, "TEST_DATABASE_URL not set; skipping DB-backed issue test")
+	pool := testPool(t)
 	ctx := context.Background()
 
 	var subID string
@@ -192,7 +192,7 @@ func TestIssueIncrementsTokensIssued(t *testing.T) {
 // covered that path, so removing the status check went unnoticed by the whole suite.
 // The blinded value is well formed on purpose, so a 403 cannot come from the body.
 func TestIssueRejectsPendingReviewSubscription(t *testing.T) {
-	pool := testPool(t, "TEST_DATABASE_URL not set; skipping DB-backed pending review test")
+	pool := testPool(t)
 	subID := seedSubscriberWithSubscription(t, pool, "pending", "pending_review")
 
 	signer := testSignerForHandler(t)

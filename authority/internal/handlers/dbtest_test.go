@@ -2,20 +2,23 @@ package handlers
 
 import (
 	"context"
-	"os"
 	"testing"
 	"time"
 
+	"github.com/ChronoCoders/darkrouter/authority/internal/dbtest"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Shared database plumbing for this package's tests. It exists so the pool is
 // closed in the right order in one place rather than in each test.
-func testPool(t *testing.T, skipMsg string) *pgxpool.Pool {
+func testPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip(skipMsg)
+	// Lazy: this is where the package's database gets created, on the first test that
+	// asks for one. A failure is fatal rather than a skip, because a skipped database
+	// test and a passing one read the same in a test log.
+	url, err := dbtest.URL()
+	if err != nil {
+		t.Fatalf("test database: %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

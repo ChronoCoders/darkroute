@@ -5,13 +5,18 @@
 // PickRandomActiveByRole selects from every active relay of a role by design, so the
 // handlers tests can pick a guard row seeded by the relay package; when that package's
 // cleanup deletes the row, the circuit_assignments insert fails
-// circuit_assignments_guard_id_fkey. Measured at two failures in twenty full runs
-// before this helper existed. Scoping assertions to rows a test created cannot fix it,
-// because the production code under test chooses rows the test does not own.
+// circuit_assignments_guard_id_fkey. Measured at four failures in fifty full runs
+// before this helper existed, and zero in fifty afterwards. Scoping assertions to rows
+// a test created cannot fix it, because the production code under test chooses rows the
+// test does not own.
 //
 // One database per package binary, not per test. Tests inside a package still share
 // that database and still run sequentially, so their own checked cleanups stay
 // meaningful.
+//
+// Creation is lazy. A package whose database is never asked for never creates one, so
+// an unreachable server fails only the tests that need a database and leaves the rest
+// of the package running and reporting.
 //
 // Imported only from _test files.
 package dbtest
@@ -27,6 +32,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -46,10 +52,21 @@ const DefaultTemplateURL = "postgres:///darkrouter_test?host=/var/run/postgresql
 // WITH (FORCE), which terminates other sessions rather than failing.
 const forceDropMinVersion = 130000
 
+const createTimeout = 30 * time.Second
+
 var safeName = regexp.MustCompile(`^[a-z0-9_]+$`)
 
 // ErrUnsafeName is returned before any statement is sent.
 var ErrUnsafeName = errors.New("refusing to touch a database outside the test namespace")
+
+// One database per test binary, created at most once however many tests ask for it.
+var pkgDB struct {
+	once  sync.Once
+	label string
+	name  string
+	url   string
+	err   error
+}
 
 // TemplateURL is the migrated template, from the environment or the built in default.
 // Nothing connects to the template during a test run.
@@ -73,8 +90,8 @@ func databaseOf(raw string) (string, error) {
 }
 
 // WithDatabase returns raw pointed at a different database, keeping every other
-// connection parameter. The socket form carries its host in the query string, so only
-// the path changes.
+// connection parameter. The socket form carries its host in the query string and has an
+// empty authority, so only the path changes.
 func WithDatabase(raw, name string) (string, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -203,36 +220,48 @@ func supportsForceDrop(ctx context.Context, conn *pgx.Conn) (bool, error) {
 	return n >= forceDropMinVersion, nil
 }
 
-// Run wraps TestMain. It creates this package's database, points TEST_DATABASE_URL at
-// it so the existing pool helpers pick it up, runs the tests, and drops it.
+// URL returns this package's database, creating it on the first call. Every later call
+// returns the same url, or the same error, so one unreachable server produces one
+// diagnosis rather than one per test.
 //
-// When the template is unreachable the tests are left to skip or fail on their own
-// terms rather than being masked here, so a missing database still surfaces.
+// The error is returned rather than skipped on, because a skipped database test and a
+// passing one are indistinguishable in a test log.
+func URL() (string, error) {
+	pkgDB.once.Do(func() {
+		if pkgDB.label == "" {
+			pkgDB.err = errors.New("dbtest.URL called without dbtest.Run in TestMain")
+			return
+		}
+		templateURL := TemplateURL()
+		name, err := Name(pkgDB.label)
+		if err != nil {
+			pkgDB.err = err
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), createTimeout)
+		defer cancel()
+		dbURL, err := Create(ctx, templateURL, name)
+		if err != nil {
+			pkgDB.err = err
+			return
+		}
+		pkgDB.name = name
+		pkgDB.url = dbURL
+	})
+	return pkgDB.url, pkgDB.err
+}
+
+// Run wraps TestMain. It records the package label, runs the tests, and drops the
+// database only if one was actually created.
 func Run(pkg string, run func() int) int {
-	templateURL := TemplateURL()
-	name, err := Name(pkg)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "dbtest: %v\n", err)
-		return 1
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	dbURL, err := Create(ctx, templateURL, name)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "dbtest: %v\n", err)
-		return 1
-	}
-	if err := os.Setenv("TEST_DATABASE_URL", dbURL); err != nil {
-		fmt.Fprintf(os.Stderr, "dbtest: set TEST_DATABASE_URL: %v\n", err)
-		return 1
-	}
-
+	pkgDB.label = pkg
 	code := run()
-
-	dropCtx, dropCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer dropCancel()
-	if err := Drop(dropCtx, templateURL, name); err != nil {
+	if pkgDB.name == "" {
+		return code
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), createTimeout)
+	defer cancel()
+	if err := Drop(ctx, TemplateURL(), pkgDB.name); err != nil {
 		fmt.Fprintf(os.Stderr, "dbtest: %v\n", err)
 		if code == 0 {
 			code = 1
