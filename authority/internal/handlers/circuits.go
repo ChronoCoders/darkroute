@@ -58,16 +58,26 @@ func (h *CircuitHandler) HandleRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// SECURITY_MODEL §9 requires three distinct physical relays across
-	// guard/middle/exit. Each pick excludes IDs already chosen so the
-	// same node can never serve two roles in the same circuit; if any
-	// pick has no eligible relay (because the eligible pool is empty
-	// after exclusion), the whole request fails with 503.
+	// The three picks are separated by role, and that is all they guarantee: three
+	// distinct relay ids. relay_nodes carries one role per row, so a row picked for
+	// one role is never eligible for another.
+	//
+	// Distinct ids are not distinct hosts. endpoint carries no unique constraint, so
+	// one machine can be registered as a guard, a middle and an exit, and a circuit
+	// can pass through that machine three times. Nothing here prevents it. Host
+	// distinctness belongs to client path selection against the signed registry, per
+	// SECURITY_MODEL 5.3.
+	//
+	// If any pick finds no eligible relay, the whole request fails with 503.
 	guard, err := relay.PickRandomActiveByRole(r.Context(), h.pool, "guard")
 	if err != nil {
 		writeRouteError(w, err)
 		return
 	}
+	// The excluded ids on this pick and the next cannot change either outcome while
+	// role is a single column per row: a row with role middle or exit can never
+	// carry a guard's id. They stay because path selection is moving to the client
+	// and this handler is to be removed rather than reworked.
 	middle, err := relay.PickRandomActiveByRole(r.Context(), h.pool, "middle", guard.ID)
 	if err != nil {
 		writeRouteError(w, err)
