@@ -29,3 +29,8 @@ tokio-rustls = "0.26"
 rustls-native-certs = "0.8"
 rustls-pemfile = "2"
 futures-util = "0.3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
