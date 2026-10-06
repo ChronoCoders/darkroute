@@ -5,110 +5,95 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"testing"
-	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/ChronoCoders/darkrouter/authority/internal/auth"
 )
 
-// Per SECURITY_MODEL §9: same host as guard and exit collapses the
-// unlinkability between client IP and destination. Because we cannot make
-// two rows share a primary key, this test seeds two distinct nodes total
-// and exercises the path where the third pick has no eligible row after
-// the first two IDs are excluded.
-func TestCircuitRouteRequiresThreeDistinctNodes(t *testing.T) {
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("TEST_DATABASE_URL not set; skipping DB-backed distinct-host test")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	pool, err := pgxpool.New(ctx, url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
+// routeRequest builds the request HandleRoute expects. The subscriber id goes into
+// the context the way Authenticate puts it there. Without it the handler answers
+// 401 at its first line and never reaches relay selection, which is how both tests
+// in this file used to pass nothing while claiming to test hop distinctness.
+func routeRequest(subID string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/circuits/route", nil)
+	return req.WithContext(context.WithValue(req.Context(), subscriberKey, subID))
+}
 
-	seedAs := func(role string) string {
-		var id string
-		if err := pool.QueryRow(ctx,
-			`INSERT INTO relay_nodes (id, api_key_hash, endpoint, region, role, status, last_heartbeat)
-			 VALUES (gen_random_uuid(), $1, $2, 'us-east', $3, 'active', NOW())
-			 RETURNING id`,
-			"test-hash-distinct-"+role+"-"+time.Now().Format("150405.000000"),
-			"10.0.0.50:9001", role,
-		).Scan(&id); err != nil {
-			t.Fatalf("seed %s: %v", role, err)
-		}
-		t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM relay_nodes WHERE id = $1`, id) })
-		return id
-	}
-	seedAs("guard")
-	seedAs("middle")
-
-	h := NewCircuitHandler(pool)
+func serveRoute(pool *pgxpool.Pool, subID string) *httptest.ResponseRecorder {
 	rec := httptest.NewRecorder()
-	h.HandleRoute(rec, httptest.NewRequest(http.MethodGet, "/api/v1/circuits/route", nil))
+	NewCircuitHandler(pool).HandleRoute(rec, routeRequest(subID))
+	return rec
+}
+
+// Per SECURITY_MODEL §9: the same host serving two hops collapses the
+// unlinkability between client IP and destination. Two distinct nodes are seeded
+// and the third pick has no eligible row once the first two ids are excluded, so
+// the whole request must fail rather than reuse a node.
+func TestCircuitRouteRequiresThreeDistinctNodes(t *testing.T) {
+	pool := testPool(t, "TEST_DATABASE_URL not set; skipping DB-backed distinct-host test")
+	subID := seedSubscriberWithActiveSubscription(t, pool, "distinct")
+
+	requireNoActiveRelays(t, pool, "exit")
+	seedActiveRelay(t, pool, "guard", "distinct")
+	seedActiveRelay(t, pool, "middle", "distinct")
+
+	rec := serveRoute(pool, subID)
 	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503 when exit role has no row, got %d", rec.Code)
+		t.Fatalf("expected 503 when exit role has no row, got %d (body=%s)", rec.Code, rec.Body.String())
 	}
 }
 
 func TestCircuitRouteRequiresAllThreeRoles(t *testing.T) {
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("TEST_DATABASE_URL not set; skipping DB-backed circuit route test")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	pool, err := pgxpool.New(ctx, url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
+	pool := testPool(t, "TEST_DATABASE_URL not set; skipping DB-backed circuit route test")
+	subID := seedSubscriberWithActiveSubscription(t, pool, "roles")
 
-	seed := func(role string) string {
-		var id string
-		if err := pool.QueryRow(ctx,
-			`INSERT INTO relay_nodes (id, api_key_hash, endpoint, region, role, status, last_heartbeat)
-			 VALUES (gen_random_uuid(), $1, $2, 'us-east', $3, 'active', NOW())
-			 RETURNING id`,
-			"test-hash-"+role+"-"+time.Now().Format("150405.000000"),
-			"10.0.0.1:9001", role,
-		).Scan(&id); err != nil {
-			t.Fatalf("seed %s: %v", role, err)
-		}
-		t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM relay_nodes WHERE id = $1`, id) })
-		return id
-	}
-	seed("guard")
-	seed("middle")
+	requireNoActiveRelays(t, pool, "exit")
+	seedActiveRelay(t, pool, "guard", "roles")
+	seedActiveRelay(t, pool, "middle", "roles")
 
-	h := NewCircuitHandler(pool)
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/circuits/route", nil)
-	rec := httptest.NewRecorder()
-	h.HandleRoute(rec, req)
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503 with missing exit role, got %d", rec.Code)
+	if rec := serveRoute(pool, subID); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 with missing exit role, got %d (body=%s)", rec.Code, rec.Body.String())
 	}
 
-	exitID := seed("exit")
-	_ = exitID
+	seedActiveRelay(t, pool, "exit", "roles")
 
-	rec2 := httptest.NewRecorder()
-	h.HandleRoute(rec2, httptest.NewRequest(http.MethodGet, "/api/v1/circuits/route", nil))
-	if rec2.Code != http.StatusOK {
-		t.Fatalf("expected 200 after all three roles available, got %d (body=%s)", rec2.Code, rec2.Body.String())
+	rec := serveRoute(pool, subID)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 once all three roles are available, got %d (body=%s)", rec.Code, rec.Body.String())
 	}
 	var got circuitRouteResponse
-	if err := json.Unmarshal(rec2.Body.Bytes(), &got); err != nil {
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatal(err)
 	}
 	if got.Guard.ID == "" || got.Middle.ID == "" || got.Exit.ID == "" {
 		t.Fatalf("missing hop ids: %+v", got)
 	}
-	if got.Guard.ID == got.Middle.ID || got.Middle.ID == got.Exit.ID {
+	if got.Guard.ID == got.Middle.ID || got.Middle.ID == got.Exit.ID || got.Guard.ID == got.Exit.ID {
 		t.Fatalf("relays must come from distinct rows: %+v", got)
+	}
+}
+
+// The two tests above inject the subscriber id directly, which is the right unit
+// boundary for HandleRoute but says nothing about the route being wired behind
+// Authenticate. This covers that wiring: the same route, mounted the way
+// cmd/authority mounts it, must reject a request carrying no credentials.
+func TestCircuitRouteRejectsUnauthenticatedThroughRouter(t *testing.T) {
+	pool := testPool(t, "TEST_DATABASE_URL not set; skipping DB-backed router wiring test")
+
+	ch := NewCircuitHandler(pool)
+	r := chi.NewRouter()
+	r.Group(func(r chi.Router) {
+		r.Use(Authenticate(auth.NewJWTManager(testJWTSecret), pool))
+		r.Get("/api/v1/circuits/route", ch.HandleRoute)
+	})
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/circuits/route", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("an unauthenticated request reached past Authenticate: got %d (body=%s)",
+			rec.Code, rec.Body.String())
 	}
 }

@@ -24,12 +24,15 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	if err := pool.Ping(ctx); err != nil {
 		t.Fatalf("ping: %v", err)
 	}
+	// Registered before the caller registers any row cleanup, so LIFO closes the
+	// pool last. A deferred Close runs before every t.Cleanup, which silently broke
+	// the row delete below and let subscribers build up across runs.
+	t.Cleanup(pool.Close)
 	return pool
 }
 
 func TestSessionCreateGetDelete(t *testing.T) {
 	pool := testPool(t)
-	defer pool.Close()
 
 	ctx := context.Background()
 	var subID string
@@ -39,7 +42,14 @@ func TestSessionCreateGetDelete(t *testing.T) {
 		t.Fatalf("insert subscriber: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = pool.Exec(ctx, `DELETE FROM subscribers WHERE id = $1`, subID)
+		tag, err := pool.Exec(ctx, `DELETE FROM subscribers WHERE id = $1`, subID)
+		if err != nil {
+			t.Errorf("cleanup subscriber %s: %v", subID, err)
+			return
+		}
+		if tag.RowsAffected() != 1 {
+			t.Errorf("cleanup subscriber %s removed %d rows, want 1", subID, tag.RowsAffected())
+		}
 	})
 
 	sid, err := CreateSession(ctx, pool, subID)

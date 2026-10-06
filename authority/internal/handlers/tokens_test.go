@@ -11,13 +11,11 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"testing"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/golang-jwt/jwt/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/ChronoCoders/darkrouter/authority/internal/auth"
 	"github.com/ChronoCoders/darkrouter/authority/internal/blind"
@@ -123,17 +121,8 @@ func mintExpiredJWT(t *testing.T) string {
 }
 
 func TestIssueIncrementsTokensIssued(t *testing.T) {
-	url := os.Getenv("TEST_DATABASE_URL")
-	if url == "" {
-		t.Skip("TEST_DATABASE_URL not set; skipping DB-backed issue test")
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	pool, err := pgxpool.New(ctx, url)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer pool.Close()
+	pool := testPool(t, "TEST_DATABASE_URL not set; skipping DB-backed issue test")
+	ctx := context.Background()
 
 	var subID string
 	if err := pool.QueryRow(ctx,
@@ -141,7 +130,7 @@ func TestIssueIncrementsTokensIssued(t *testing.T) {
 		"issue-test-"+time.Now().Format("150405.000000")+"@example.test", "x").Scan(&subID); err != nil {
 		t.Fatalf("seed subscriber: %v", err)
 	}
-	t.Cleanup(func() { _, _ = pool.Exec(ctx, `DELETE FROM subscribers WHERE id = $1`, subID) })
+	cleanupRow(t, pool, deleteSubscriberByID, subID)
 	if _, err := pool.Exec(ctx,
 		`INSERT INTO subscriptions (subscriber_id, tier, status, current_period_start, current_period_end)
 		 VALUES ($1, 'free', 'active', NOW(), NOW() + INTERVAL '30 days')`, subID); err != nil {
