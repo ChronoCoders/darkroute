@@ -29,7 +29,7 @@ One thing you can do about the IP join. Tokens are issued in a single batch once
 | Component | Role |
 |---|---|
 | Authority | Issues blind tokens, manages subscriptions, and publishes a signed relay registry and epoch key set. It does not choose or record your path. Reached only via Cloudflare Tunnel; no public ingress on the origin host. |
-| Guard relay | First hop. Verifies the client's blind token, terminates the client-side TLS, runs the per-hop authenticated handshake, forwards encrypted traffic to a middle relay. |
+| Guard relay | First hop. Verifies the client's blind token, terminates the client-side TLS, runs the per-hop X25519 key exchange, which is not authenticated against a relay identity, and forwards encrypted traffic to a middle relay. |
 | Middle relay | Second hop. Relays opaque bytes between guard and exit. Holds neither the client identity nor the destination. |
 | Exit relay | Third hop. Decrypts the innermost layer, validates the destination port against an allowlist, and dials through a Decodo residential dedicated IP. |
 | Residential exit | Decodo sticky dedicated IP. The destination sees this IP as the request source. |
@@ -51,8 +51,9 @@ The Rust SDK is also exposed directly for applications that prefer in-process in
 ## Stack
 
 - **Authority**: Go, PostgreSQL, JWT sessions, Argon2id password hashing
-- **Relay**: Rust, tokio, rustls, rustls-acme, tokio-socks, snow for Noise NK, blind-rsa-signatures, ed25519-dalek
-- **Client SDK and daemon**: Rust, tokio, rustls, snow for Noise NK, blind-rsa-signatures, ed25519-dalek
+- **Relay**: Rust, tokio, rustls, rustls-acme, tokio-socks, rsa and num-bigint for blind token verification
+- **Shared wire protocol**: Rust, x25519-dalek, hkdf, aes-gcm
+- **Client SDK and daemon**: Rust, tokio, rustls, rsa and num-bigint-dig for the blind signature
 - **Dashboard**: Next.js 15 (App Router), shadcn/ui
 
 ## Self-hosting
@@ -64,6 +65,8 @@ If you need a private deployment for compliance reasons, contact us.
 ## Security model
 
 The authoritative specification defines the cryptographic primitives, the principals and their trust boundaries, the blind-token protocol step by step, and an explicit list of what the system does not protect against. It is not published.
+
+The protocol is being rebuilt against a revised security model that is not published, and this README describes the current implementation rather than that target.
 
 For vulnerability disclosure, see [SECURITY.md](SECURITY.md).
 
