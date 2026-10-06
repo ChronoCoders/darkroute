@@ -56,26 +56,61 @@ echo "server ready: $(pg_isready 2>&1)"
 # are swept before every run. The pattern requires the trailing underscore that the
 # template name does not have, so the template can never match it. The underscores are
 # escaped because LIKE treats a bare underscore as a single character wildcard.
+#
+# The listing keeps its errors. Discarding them turned a failed query into an empty
+# list and an untroubled "no leftover per package databases", which is a clean report
+# of a check that never ran.
 leftovers=$(psql "$MAINT" -tAc \
-	"select datname from pg_database where datname like 'darkrouter\\_test\\_%'" 2>/dev/null)
-if [ -n "$leftovers" ]; then
-	n=0
+	"select datname from pg_database where datname like 'darkrouter\\_test\\_%'" 2>&1)
+if [ $? -ne 0 ]; then
+	echo "listing leftover databases failed, so the sweep cannot run:" >&2
+	printf '%s\n' "$leftovers" | sed 's/^/    /' >&2
+	exit 1
+fi
+
+if [ -z "$leftovers" ]; then
+	echo "no leftover per package databases"
+else
+	removed=0
+	survivors=''
 	while IFS= read -r db; do
 		[ -z "$db" ] && continue
 		case "$db" in
-		darkrouter_test_*)
-			psql "$MAINT" -q -c "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE)" >/dev/null 2>&1 ||
-				psql "$MAINT" -q -c "DROP DATABASE IF EXISTS \"$db\"" >/dev/null 2>&1
-			n=$((n + 1))
-			;;
+		darkrouter_test_*) ;;
 		*)
 			echo "refusing to drop '$db': outside the darkrouter_test_ namespace" >&2
+			survivors="$survivors $db"
+			continue
 			;;
 		esac
+
+		out=$(psql "$MAINT" -q -c "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE)" 2>&1)
+		if [ $? -ne 0 ]; then
+			out=$(psql "$MAINT" -q -c "DROP DATABASE IF EXISTS \"$db\"" 2>&1)
+		fi
+
+		# The effect, not the exit status. A drop that reported success while the
+		# database is still listed would otherwise be counted as removed.
+		still=$(psql "$MAINT" -tAc \
+			"select count(*) from pg_database where datname = '$db'" 2>&1)
+		if [ $? -ne 0 ]; then
+			echo "could not confirm whether '$db' was removed:" >&2
+			printf '%s\n' "$still" | sed 's/^/    /' >&2
+			survivors="$survivors $db"
+		elif [ "$still" = 0 ]; then
+			removed=$((removed + 1))
+		else
+			echo "leftover database '$db' is still present after the drop:" >&2
+			[ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/    /' >&2
+			survivors="$survivors $db"
+		fi
 	done <<< "$leftovers"
-	echo "removed $n leftover per package database(s)"
-else
-	echo "no leftover per package databases"
+
+	echo "removed $removed leftover per package database(s)"
+	if [ -n "$survivors" ]; then
+		echo "these leftover databases survived the sweep:$survivors" >&2
+		exit 1
+	fi
 fi
 
 exists=$(psql "$MAINT" -tAc "select 1 from pg_database where datname = '$DBNAME'" 2>/dev/null)
