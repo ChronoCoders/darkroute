@@ -78,10 +78,21 @@ func TestCircuitRouteRequiresAllThreeRoles(t *testing.T) {
 
 // The two tests above inject the subscriber id directly, which is the right unit
 // boundary for HandleRoute but says nothing about the route being wired behind
-// Authenticate. This covers that wiring: the same route, mounted the way
-// cmd/authority mounts it, must reject a request carrying no credentials.
+// Authenticate. This covers that wiring.
+//
+// The request carries no credentials but does carry a subscriber id in its context,
+// together with a seeded active subscription and three usable relays. That
+// combination is what makes the test able to tell the two layers apart: a working
+// Authenticate rejects on the missing cookie and never looks at the context, so the
+// answer is 401, while an Authenticate that passes everything through lets
+// HandleRoute find the subscriber and answer 200. Asserting 401 alone cannot
+// distinguish them, because HandleRoute also answers 401 when the context is empty.
 func TestCircuitRouteRejectsUnauthenticatedThroughRouter(t *testing.T) {
 	pool := testPool(t, "TEST_DATABASE_URL not set; skipping DB-backed router wiring test")
+	subID := seedSubscriberWithActiveSubscription(t, pool, "wiring")
+	seedActiveRelay(t, pool, "guard", "wiring")
+	seedActiveRelay(t, pool, "middle", "wiring")
+	seedActiveRelay(t, pool, "exit", "wiring")
 
 	ch := NewCircuitHandler(pool)
 	r := chi.NewRouter()
@@ -91,9 +102,9 @@ func TestCircuitRouteRejectsUnauthenticatedThroughRouter(t *testing.T) {
 	})
 
 	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/circuits/route", nil))
+	r.ServeHTTP(rec, routeRequest(subID))
 	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("an unauthenticated request reached past Authenticate: got %d (body=%s)",
+		t.Fatalf("a request with no credentials reached past Authenticate: got %d (body=%s)",
 			rec.Code, rec.Body.String())
 	}
 }
