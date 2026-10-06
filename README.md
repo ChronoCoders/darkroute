@@ -14,18 +14,18 @@ Typical workloads: ad verification, brand-safety crawling, competitive pricing i
 
 Three principals see different slices of any request:
 
-- **Authority** knows who you are (your subscription) and that you were issued some token. It does not see the unblinded token value, and it does not see request bytes or destinations.
-- **Relay nodes** know the cryptographic validity of a token, the previous hop, and the next hop. They do not know which subscriber the token belongs to and they do not see beyond their own layer of the encrypted envelope.
+- **Authority** knows who you are (your subscription), and how many tokens you were issued in the current epoch. It does not see the unblinded token value, it does not see request bytes or destinations, and it does not know or record which path you chose.
+- **Relay nodes** know that a token is cryptographically valid and has not been replayed, plus the previous hop and the next hop. They cannot learn which subscriber a token belongs to.
 - **Exit node** sees the destination host and one layer of ciphertext. It does not know the client's identity or IP.
 
-The unlinkability between subscriber and traffic flow is built on a Chaum blind RSA signature: the authority signs a blinded message it never sees in unblinded form, the client unblinds the signature locally, and relays verify the signature against the authority's public key without contacting the authority. The full threat model and trust boundaries are available on request.
+What this does and does not give you. Relays cannot learn the subscriber: that holds unconditionally, because a relay verifies a token offline and never contacts the authority. The authority cannot link a request to a subscription beyond what the shared epoch key allows: tokens are blind-signed under a key that every subscriber in the same epoch shares, so a token narrows you only to that set. The anonymity set is therefore the set of subscribers active in the same epoch, and with few active subscribers that set is small. This is a property of how many people are using the service, not of the cryptography, and we do not claim more than it.
 
 ## Architecture
 
 | Component | Role |
 |---|---|
-| Authority | Issues blind tokens, assigns circuits, manages subscriptions, publishes the relay registry. Reached only via Cloudflare Tunnel; no public ingress on the origin host. |
-| Guard relay | First hop. Verifies the client's blind token, terminates the client-side TLS, runs the per-hop ECDH handshake, forwards encrypted traffic to a middle relay. |
+| Authority | Issues blind tokens, manages subscriptions, and publishes a signed relay registry and epoch key set. It does not choose or record your path. Reached only via Cloudflare Tunnel; no public ingress on the origin host. |
+| Guard relay | First hop. Verifies the client's blind token, terminates the client-side TLS, runs the per-hop authenticated handshake, forwards encrypted traffic to a middle relay. |
 | Middle relay | Second hop. Relays opaque bytes between guard and exit. Holds neither the client identity nor the destination. |
 | Exit relay | Third hop. Decrypts the innermost layer, validates the destination port against an allowlist, and dials through a Decodo residential dedicated IP. |
 | Residential exit | Decodo sticky dedicated IP. The destination sees this IP as the request source. |
@@ -38,8 +38,8 @@ All relay hops run on port 443 with real Let's Encrypt certificates obtained via
 The product surface is a SOCKS5 daemon plus a Rust SDK. A typical integration looks like:
 
 1. Sign up through the dashboard, complete payment, and wait for approval. Approval is manual.
-2. Issue a long-lived access key from the dashboard.
-3. Drop the key into the daemon's environment (`AUTHORITY_URL`, `CLIENT_EMAIL`, `CLIENT_PASSWORD`, `SOCKS5_BIND`) and run the daemon on the host that needs to make outbound requests.
+2. There is no access key to copy from the dashboard. The daemon obtains tokens itself: give it your subscriber credentials and it signs in, requests blind-signed tokens, and selects its own path.
+3. Put those credentials in the daemon's environment (`AUTHORITY_URL`, `CLIENT_EMAIL`, `CLIENT_PASSWORD`, `SOCKS5_BIND`) and run the daemon on the host that needs to make outbound requests.
 4. Point your existing HTTP client at the local SOCKS5 endpoint. Every outbound request transparently builds a fresh three-hop circuit and exits through a residential IP.
 
 The Rust SDK is also exposed directly for applications that prefer in-process integration without the SOCKS5 hop. Both surfaces produce circuits that are functionally identical.
@@ -47,8 +47,8 @@ The Rust SDK is also exposed directly for applications that prefer in-process in
 ## Stack
 
 - **Authority**: Go, PostgreSQL, JWT sessions, Argon2id password hashing
-- **Relay**: Rust, tokio, rustls, rustls-acme, tokio-socks
-- **Client SDK and daemon**: Rust, tokio, rustls
+- **Relay**: Rust, tokio, rustls, rustls-acme, tokio-socks, snow for Noise NK, blind-rsa-signatures, ed25519-dalek
+- **Client SDK and daemon**: Rust, tokio, rustls, snow for Noise NK, blind-rsa-signatures, ed25519-dalek
 - **Dashboard**: Next.js 15 (App Router), shadcn/ui
 
 ## Self-hosting
@@ -59,7 +59,7 @@ If you need a private deployment for compliance reasons, contact us.
 
 ## Security model
 
-The authoritative specification defines the cryptographic primitives, the principals and their trust boundaries, the blind-token protocol step by step, and an explicit list of what the system does not protect against. The full threat model and trust boundaries are available on request.
+The authoritative specification defines the cryptographic primitives, the principals and their trust boundaries, the blind-token protocol step by step, and an explicit list of what the system does not protect against. It is not published.
 
 For vulnerability disclosure, see [SECURITY.md](SECURITY.md).
 
