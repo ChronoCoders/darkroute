@@ -12,9 +12,7 @@ path = "src/lib.rs"
 darkrouter-crypto = { path = "../darkrouter-crypto" }
 tokio = { workspace = true }
 thiserror = { workspace = true }
-tracing = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
 rsa = { workspace = true }
@@ -27,4 +25,3 @@ url = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
-rustls-pemfile = { workspace = true }

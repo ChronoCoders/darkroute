@@ -17,10 +17,6 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }
-x25519-dalek = { workspace = true }
-aes-gcm = { workspace = true }
-hkdf = { workspace = true }
-rand_core = { workspace = true }
 tokio-socks = "0.5"
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
@@ -30,3 +26,5 @@ futures-util = { workspace = true }
 
 [dev-dependencies]
 rcgen = "0.13"
+rand_core = { workspace = true }
+x25519-dalek = { workspace = true }
