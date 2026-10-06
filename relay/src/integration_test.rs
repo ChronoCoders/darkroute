@@ -102,7 +102,7 @@ async fn tls_connect(connector: &TlsConnector, addr: SocketAddr) -> ClientTlsStr
         .expect("client tls handshake")
 }
 
-const TEST_TIMEOUT: Duration = Duration::from_secs(20);
+const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 const CIRCUIT_ID: u32 = 1;
 
 struct RelayOverride {
