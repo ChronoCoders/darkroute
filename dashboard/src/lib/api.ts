@@ -1,7 +1,7 @@
 // Single fetch wrapper for every dashboard request to the authority.
 // Always sends `credentials: "include"` so the HttpOnly session_id and
 // jwt cookies set by the authority flow back with each call. The
-// dashboard never reads or stores the token value itself — that
+// dashboard never reads or stores the token value itself. That
 // remains in the cookie jar, inaccessible to JavaScript.
 
 import type { ApiError } from "./types";

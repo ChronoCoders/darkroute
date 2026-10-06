@@ -451,10 +451,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "darkroute-client"
+name = "darkrouter-client"
 version = "0.1.0"
 dependencies = [
- "darkroute-client-sdk",
+ "darkrouter-client-sdk",
  "reqwest",
  "rustls",
  "thiserror 1.0.69",
@@ -465,10 +465,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "darkroute-client-sdk"
+name = "darkrouter-client-sdk"
 version = "0.1.0"
 dependencies = [
- "darkroute-crypto",
+ "darkrouter-crypto",
  "num-bigint-dig",
  "num-traits",
  "rand 0.8.6",
@@ -490,7 +490,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "darkroute-crypto"
+name = "darkrouter-crypto"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
@@ -503,11 +503,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "darkroute-relay"
+name = "darkrouter-relay"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",
- "darkroute-crypto",
+ "darkrouter-crypto",
  "futures-util",
  "hkdf",
  "num-bigint",

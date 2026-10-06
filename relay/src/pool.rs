@@ -109,7 +109,7 @@ impl<S> ConnectionPool<S> {
         guard.values().map(|v| v.len()).sum()
     }
 
-    /// Convenience around `len()` — used by tests and by the pool-
+    /// Convenience around `len()`, used by tests and by the pool-
     /// sweep log to skip noisy "0 evicted" messages when nothing was
     /// pooled to begin with.
     pub fn is_empty(&self) -> bool {

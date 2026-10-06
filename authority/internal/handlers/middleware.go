@@ -11,7 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/dslabs/darkroute/authority/internal/auth"
+	"github.com/ChronoCoders/darkrouter/authority/internal/auth"
 )
 
 type ctxKey string

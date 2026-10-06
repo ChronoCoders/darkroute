@@ -19,7 +19,7 @@ export function AuthShell({
 }) {
   return (
     <div className="relative isolate grid min-h-screen lg:grid-cols-[1fr_minmax(420px,520px)]">
-      {/* Left side — branding */}
+      {/* Left side: branding */}
       <div className="relative hidden overflow-hidden border-r border-border/60 bg-background lg:block">
         <Marketing.BackgroundGrid />
         <NetworkMesh />
@@ -38,7 +38,7 @@ export function AuthShell({
         </div>
       </div>
 
-      {/* Right side — form */}
+      {/* Right side: form */}
       <div className="relative flex items-center justify-center bg-card/40 p-6 sm:p-12">
         <Marketing.BackgroundGrid />
         <motion.div

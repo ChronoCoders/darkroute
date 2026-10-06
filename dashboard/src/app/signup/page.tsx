@@ -71,7 +71,7 @@ export default function SignupPage() {
   return (
     <AuthShell
       title="Create your account"
-      subtitle="Self-serve signup. Review is manual — we'll activate your account, typically within one business day."
+      subtitle="Self-serve signup. Review is manual. We'll activate your account, typically within one business day."
       footer={
         <>
           Already have an account?{" "}

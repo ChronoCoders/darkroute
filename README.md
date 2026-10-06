@@ -46,10 +46,10 @@ The Rust SDK is also exposed directly for applications that prefer in-process in
 
 ## Stack
 
-- **Authority** — Go, PostgreSQL, JWT sessions, Argon2id password hashing
-- **Relay** — Rust, tokio, rustls, rustls-acme, tokio-socks
-- **Client SDK and daemon** — Rust, tokio, rustls
-- **Dashboard** — Next.js 15 (App Router), shadcn/ui
+- **Authority**: Go, PostgreSQL, JWT sessions, Argon2id password hashing
+- **Relay**: Rust, tokio, rustls, rustls-acme, tokio-socks
+- **Client SDK and daemon**: Rust, tokio, rustls
+- **Dashboard**: Next.js 15 (App Router), shadcn/ui
 
 ## Self-hosting
 

@@ -1,4 +1,4 @@
-module github.com/dslabs/darkroute/authority
+module github.com/ChronoCoders/darkrouter/authority
 
 go 1.25.0
 

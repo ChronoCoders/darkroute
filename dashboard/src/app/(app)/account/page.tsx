@@ -177,7 +177,7 @@ export default function AccountPage() {
         </div>
         <p className="mt-2 text-sm text-zinc-400">
           Every signup currently lands on the free plan. Plan upgrades happen
-          out-of-band — contact us to move to a paid plan.
+          out-of-band. Contact us to move to a paid plan.
         </p>
       </motion.section>
     </>

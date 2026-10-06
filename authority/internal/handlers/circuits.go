@@ -8,10 +8,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/dslabs/darkroute/authority/internal/relay"
+	"github.com/ChronoCoders/darkrouter/authority/internal/relay"
 )
 
-// SECURITY_MODEL §9 lets the authority know circuit routes — this is the
+// SECURITY_MODEL §9 lets the authority know circuit routes. This is the
 // one place that information is intentionally produced.
 type CircuitHandler struct {
 	pool *pgxpool.Pool

@@ -1,5 +1,5 @@
-use darkroute_crypto::cell::CellError;
-use darkroute_crypto::crypto::CryptoError;
+use darkrouter_crypto::cell::CellError;
+use darkrouter_crypto::crypto::CryptoError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -32,7 +32,7 @@ pub enum ClientError {
     #[error("cell: {0}")]
     Cell(#[from] CellError),
     #[error("circuit handshake: unexpected cell type {0:?}")]
-    UnexpectedCell(darkroute_crypto::cell::CellType),
+    UnexpectedCell(darkrouter_crypto::cell::CellType),
     #[error("native root certificate store could not be loaded: {0}")]
     NativeRoots(std::io::Error),
 }

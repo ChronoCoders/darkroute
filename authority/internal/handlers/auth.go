@@ -12,7 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/dslabs/darkroute/authority/internal/auth"
+	"github.com/ChronoCoders/darkrouter/authority/internal/auth"
 )
 
 // Precomputed Argon2id hash used to equalize timing when the login flow
@@ -118,7 +118,7 @@ func (h *AuthHandler) Login(w http.ResponseWriter, r *http.Request) {
 		`SELECT id, password, role FROM subscribers WHERE email = $1`, req.Email,
 	).Scan(&id, &hash, &role)
 	if err != nil {
-		// Equalize timing on unknown email — without this Argon2id run, the
+		// Equalize timing on unknown email. Without this Argon2id run, the
 		// absence of the verify step on the missing-user path is observable
 		// via response timing and enumerates registered emails.
 		_, _ = auth.VerifyPassword(req.Password, dummyPasswordHash)

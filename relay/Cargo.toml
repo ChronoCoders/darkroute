@@ -1,11 +1,11 @@
 [package]
-name = "darkroute-relay"
+name = "darkrouter-relay"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-darkroute-crypto = { path = "../darkroute-crypto" }
+darkrouter-crypto = { path = "../darkrouter-crypto" }
 tokio = { workspace = true }
 rsa = { workspace = true }
 sha2 = { workspace = true }

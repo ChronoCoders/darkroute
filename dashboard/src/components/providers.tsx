@@ -19,7 +19,7 @@ export function Providers({ children }: { children: ReactNode }) {
             // The dashboard is read-mostly; 30 s of staleness is a
             // reasonable default for an authenticated control plane.
             staleTime: 30_000,
-            // Auth errors shouldn't be silently retried — they mean the
+            // Auth errors shouldn't be silently retried, because they mean the
             // user has to log in again.
             retry: (failureCount, error) => {
               if (

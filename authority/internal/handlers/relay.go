@@ -9,7 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/dslabs/darkroute/authority/internal/relay"
+	"github.com/ChronoCoders/darkrouter/authority/internal/relay"
 )
 
 type RelayHandler struct {
@@ -30,8 +30,8 @@ func NewRelayHandler(pool *pgxpool.Pool, salt string, allowedIPs []string) *Rela
 }
 
 // peerIP returns the real caller IP. Cloudflare Tunnel terminates on
-// loopback, so when the TCP peer is loopback we trust CF-Connecting-IP
-// — and only then. Any other peer is the legacy direct-listen path and
+// loopback, so when the TCP peer is loopback we trust CF-Connecting-IP,
+// and only then. Any other peer is the legacy direct-listen path and
 // the header is ignored as client-controllable.
 func peerIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
@@ -60,8 +60,8 @@ func (h *RelayHandler) HandleRelayHeartbeat(w http.ResponseWriter, r *http.Reque
 	}
 	key := strings.TrimPrefix(authHeader, "Bearer ")
 	if _, err := relay.RecordHeartbeat(r.Context(), h.pool, h.salt, key); err != nil {
-		// Same response for unknown relay and infrastructure failures —
-		// do not leak which check failed.
+		// Same response for unknown relay and infrastructure failures.
+		// Do not leak which check failed.
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 		return
 	}
@@ -107,7 +107,7 @@ func (h *RelayHandler) HandleListRelays(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
-	// relay.Relay carries no api_key_hash — the field is unexported from the
+	// relay.Relay carries no api_key_hash: the field is unexported from the
 	// query, so the JSON response cannot leak it.
 	writeJSON(w, http.StatusOK, map[string]any{"relays": relays})
 }

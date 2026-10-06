@@ -55,7 +55,7 @@ pub struct RelayConfig {
     pub relay_port: u16,
     /// `host:port` the metrics HTTP server binds to. Defaults to
     /// `127.0.0.1:9091` so Prometheus scraping must happen over an SSH
-    /// tunnel or local sidecar — the metrics surface must not be
+    /// tunnel or local sidecar, because the metrics surface must not be
     /// reachable from the public internet (SESSION_LOG 2026-05-22
     /// deployment-surface hardening, §8.1).
     pub metrics_bind: SocketAddr,
@@ -130,7 +130,7 @@ impl RelayConfig {
         let acme_contact_email = required(&get, "ACME_CONTACT_EMAIL")?;
         let acme_dir = match get("ACME_DIR") {
             Some(s) if !s.is_empty() => PathBuf::from(s),
-            _ => PathBuf::from("/opt/darkroute/secrets/acme-cache"),
+            _ => PathBuf::from("/opt/darkrouter/secrets/acme-cache"),
         };
         let acme_staging = parse_bool(&get, "ACME_STAGING", false)?;
         let peer_hostnames = match get("PEER_HOSTNAMES") {
@@ -144,7 +144,7 @@ impl RelayConfig {
                 return Err(ConfigError::ExitRequiresDecodoProxy);
             }
             // Validate the URL is parseable and uses socks5 scheme with a
-            // host:port — anything else means the exit cannot dial and
+            // host:port, and anything else means the exit cannot dial and
             // must refuse to start. Phase 4c security requirement.
             let parsed = ::url::Url::parse(raw).map_err(|e| ConfigError::Invalid {
                 var: "DECODO_PROXY_URL",
@@ -558,7 +558,7 @@ mod tests {
         let cfg = RelayConfig::from_source(lookup(&env)).expect("valid");
         assert_eq!(
             cfg.acme_dir,
-            std::path::PathBuf::from("/opt/darkroute/secrets/acme-cache")
+            std::path::PathBuf::from("/opt/darkrouter/secrets/acme-cache")
         );
     }
 

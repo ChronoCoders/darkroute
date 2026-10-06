@@ -1,6 +1,6 @@
 //! Chaum blind RSA per SECURITY_MODEL §5.2.
 //!
-//! Raw textbook RSA — no padding. The authority publishes (e, n) and
+//! Raw textbook RSA with no padding. The authority publishes (e, n) and
 //! signs `b = m * r^e mod n` returning `s = b^d mod n`. The client
 //! unblinds `token = s * r^-1 mod n` and verifies `token^e mod n == m`.
 

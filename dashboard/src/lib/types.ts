@@ -86,7 +86,7 @@ export interface AdminSubscribersResponse {
 }
 
 export interface LoginResponse {
-  // The dashboard does not read this value — auth flows through the
+  // The dashboard does not read this value. Auth flows through the
   // HttpOnly session_id and jwt cookies set by the authority. The
   // field is present in the response body for API clients that need
   // to attach the JWT as an Authorization header.

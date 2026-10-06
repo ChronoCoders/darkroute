@@ -11,7 +11,7 @@ import (
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/dslabs/darkroute/authority/migrations"
+	"github.com/ChronoCoders/darkrouter/authority/migrations"
 )
 
 type DB struct {

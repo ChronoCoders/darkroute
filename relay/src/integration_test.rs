@@ -38,10 +38,10 @@ use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::TlsConnector;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
-use darkroute_crypto::cell::{
+use darkrouter_crypto::cell::{
     parse_extend_backward, Cell, CellType, ConnectPayload, ExtendForward,
 };
-use darkroute_crypto::crypto::{
+use darkrouter_crypto::crypto::{
     decrypt_frame, derive_session_key, encrypt_frame, X25519_PUBKEY_LEN,
 };
 
@@ -136,7 +136,7 @@ fn make_config(
         peer_allowlist: vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))],
         relay_hostname: TEST_HOSTNAME.to_string(),
         acme_contact_email: "test@example.invalid".to_string(),
-        acme_dir: PathBuf::from("/tmp/darkroute-relay-test-acme-unused"),
+        acme_dir: PathBuf::from("/tmp/darkrouter-relay-test-acme-unused"),
         acme_staging: true,
         peer_hostnames: peers,
     })
@@ -376,7 +376,7 @@ async fn run_test() {
 
     // Drop the socket to end the circuit. The relays will see EOF and
     // tear down via run_cell_loop's error path. We do not assert on the
-    // teardown ordering — only that all three relays do not panic, which
+    // teardown ordering, only that all three relays do not panic, which
     // is implicitly verified by the test process not crashing.
     drop(sock);
 }
@@ -420,7 +420,7 @@ async fn handle_socks5_session(sock: &mut TcpStream) -> std::io::Result<()> {
         let plen = plen_buf[0] as usize;
         let mut pass = vec![0u8; plen];
         sock.read_exact(&mut pass).await?;
-        // Always succeed — this is a test stub.
+        // Always succeed, because this is a test stub.
         sock.write_all(&[0x01, 0x00]).await?;
     }
 
@@ -626,7 +626,7 @@ async fn run_data_test() {
     // Wait briefly so the exit completes the SOCKS5 dial before DATA arrives.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let payload_bytes = b"hello-darkroute".to_vec();
+    let payload_bytes = b"hello-darkrouter".to_vec();
     let data_cell = Cell::new(CellType::Data, CIRCUIT_ID, payload_bytes.clone()).unwrap();
     let f_exit = encrypt_frame(&k_exit, &data_cell.encode()).unwrap();
     let r_mid = Cell::new(CellType::Relay, CIRCUIT_ID, f_exit).unwrap();

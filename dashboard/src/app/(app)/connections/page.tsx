@@ -167,14 +167,14 @@ export default function ConnectionsPage() {
               <li className="flex gap-3">
                 <span className="font-mono text-[10px] text-zinc-600">02</span>
                 <span>
-                  Each layer is a distinct point — the same point never serves
+                  Each layer is a distinct point. The same point never serves
                   two layers in one connection.
                 </span>
               </li>
               <li className="flex gap-3">
                 <span className="font-mono text-[10px] text-zinc-600">03</span>
                 <span>
-                  Each network point only sees its adjacent layers — never the
+                  Each network point only sees its adjacent layers, never the
                   whole path.
                 </span>
               </li>

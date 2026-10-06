@@ -11,7 +11,7 @@
 //! `fail`; illegal transitions are programmer errors and return a typed
 //! error rather than panicking.
 //!
-//! The state machine does NOT own the underlying TCP socket — that lives
+//! The state machine does NOT own the underlying TCP socket. That lives
 //! in the connection handler. A `Circuit` is just a small piece of state
 //! the handler advances as the handshake and frame loop progress.
 
@@ -117,7 +117,7 @@ impl Circuit {
                 // Terminal state; emit a debug log and stay in Closed.
                 warn!(
                     state = %self.state,
-                    "circuit.fail() called after Close — ignoring"
+                    "circuit.fail() called after Close, ignoring"
                 );
             }
         }

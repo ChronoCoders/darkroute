@@ -11,13 +11,13 @@ use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
-use darkroute_crypto::cell::{
+use darkrouter_crypto::cell::{
     parse_extend_backward, Cell, CellType, ConnectPayload, ExtendForward,
 };
-use darkroute_crypto::crypto::{
+use darkrouter_crypto::crypto::{
     decrypt_frame, derive_session_key, encrypt_frame, read_frame, SessionKey,
 };
-use darkroute_crypto::wire::{CIRCUIT_ID, PROTO_CLIENT};
+use darkrouter_crypto::wire::{CIRCUIT_ID, PROTO_CLIENT};
 
 use crate::circuits::CircuitRoute;
 use crate::error::ClientError;

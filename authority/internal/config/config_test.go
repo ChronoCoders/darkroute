@@ -100,7 +100,7 @@ func TestValidateRejectsForbiddenJWTSecretsInEveryEnvironment(t *testing.T) {
 			c := validBase()
 			c.Environment = env
 			c.JWTSecret = bad
-			// short secrets fail the length check first; that's acceptable — both reject.
+			// short secrets fail the length check first; that's acceptable, both reject.
 			if err := c.Validate(); err == nil {
 				t.Fatalf("expected error for forbidden JWT_SECRET %q in %s", bad, env)
 			}

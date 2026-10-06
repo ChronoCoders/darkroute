@@ -10,11 +10,11 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/dslabs/darkroute/authority/internal/blind"
+	"github.com/ChronoCoders/darkrouter/authority/internal/blind"
 )
 
 // Per SECURITY_MODEL §5.2 step 8, the authority records only that a token
-// was issued — the blinded value b and the resulting signature s are
+// was issued. The blinded value b and the resulting signature s are
 // neither logged nor persisted.
 type TokenHandler struct {
 	pool   *pgxpool.Pool
@@ -34,7 +34,7 @@ func (h *TokenHandler) HandlePubkey(w http.ResponseWriter, _ *http.Request) {
 	w.WriteHeader(http.StatusOK)
 	if _, err := w.Write(pem); err != nil {
 		// The response is already started; we cannot recover. Log via the
-		// standard slog default — pem is not sensitive.
+		// standard slog default, and pem is not sensitive.
 		return
 	}
 }
@@ -98,7 +98,7 @@ func (h *TokenHandler) HandleIssue(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// SECURITY_MODEL §5.2 step 8: counter only, no token value. The
-	// token_issuance_events row stores only a timestamp — no token bytes.
+	// token_issuance_events row stores only a timestamp, no token bytes.
 	if _, err := h.pool.Exec(r.Context(),
 		`UPDATE subscriptions
 		 SET tokens_issued = tokens_issued + 1
@@ -131,7 +131,7 @@ type tokenListResponse struct {
 	Recent       []tokenIssuanceListItem `json:"recent"`
 }
 
-// No token bytes are stored or returned — this is purely an
+// No token bytes are stored or returned. This is purely an
 // audit/visualisation surface.
 func (h *TokenHandler) HandleListTokens(w http.ResponseWriter, r *http.Request) {
 	subID, ok := r.Context().Value(subscriberKey).(string)

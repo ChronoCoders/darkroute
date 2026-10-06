@@ -29,9 +29,9 @@ use tokio_rustls::server::TlsStream as ServerTlsStream;
 use tokio_rustls::TlsConnector;
 use tracing::{error, info, warn};
 
-use darkroute_crypto::cell::{self, Cell, CellType, ConnectPayload, ExtendForward};
-use darkroute_crypto::crypto::{self, SessionKey};
-use darkroute_crypto::wire::{
+use darkrouter_crypto::cell::{self, Cell, CellType, ConnectPayload, ExtendForward};
+use darkrouter_crypto::crypto::{self, SessionKey};
+use darkrouter_crypto::wire::{
     CIRCUIT_ID, CIRCUIT_START, M_RAW_LEN, PRESENTATION_LEN, PROTO_CLIENT, PROTO_RELAY,
     X25519_PK_LEN,
 };
@@ -269,7 +269,7 @@ async fn accept_loop(
                         .await;
                         let tls = match routed {
                             // Ok(None) means ACME-TLS-ALPN-01 challenge
-                            // probe — handshake completed with the
+                            // probe, handshake completed with the
                             // challenge cert, must not enter relay path
                             // (RFC 8737 §3).
                             Ok(Ok(Some(s))) => s,
@@ -354,7 +354,7 @@ async fn handle_connection(
             handle_relay_connection(r, w, peer, cfg, pool, connector).await
         }
         (b, _) => {
-            // Ignore shutdown errors — we're already rejecting.
+            // Ignore shutdown errors since we're already rejecting.
             let _ = w.shutdown().await;
             Err(HandleError::UnexpectedProtocol(b))
         }
@@ -475,8 +475,8 @@ async fn drive_circuit(
     let key: SessionKey = circuit
         .session_key()
         .expect(
-            "drive_circuit just activated the circuit, so session_key() returns Some \
-             — this invariant is enforced by the state machine",
+            "drive_circuit just activated the circuit, so session_key() returns Some. \
+             This invariant is enforced by the state machine",
         )
         .clone();
 
@@ -696,7 +696,7 @@ pub(crate) mod test_hooks {
     use std::sync::OnceLock;
     use tokio::sync::mpsc;
 
-    use darkroute_crypto::cell::ConnectPayload;
+    use darkrouter_crypto::cell::ConnectPayload;
 
     static CONNECT_SINK: OnceLock<Mutex<Option<mpsc::UnboundedSender<ConnectPayload>>>> =
         OnceLock::new();

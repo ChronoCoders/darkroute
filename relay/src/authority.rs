@@ -20,7 +20,7 @@ pub enum AuthorityError {
 
 /// `AuthorityClient` holds the pinned RSA public key of the authority. The key
 /// is fetched exactly once at startup. SECURITY_MODEL §5.1 forbids re-fetching
-/// during operation — rotation requires a relay restart.
+/// during operation. Rotation requires a relay restart.
 #[derive(Debug)]
 pub struct AuthorityClient {
     pubkey: RsaPublicKey,

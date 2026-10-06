@@ -150,7 +150,7 @@ func TestPickRandomActiveByRoleExcludesIDs(t *testing.T) {
 }
 
 func TestProvisionRejectsInvalidRole(t *testing.T) {
-	// No DB needed — the role check happens before any query.
+	// No DB needed: the role check happens before any query.
 	_, _, err := ProvisionRelay(context.Background(), nil, "salt", "endpoint", "region", "admin")
 	if err != ErrInvalidRole {
 		t.Errorf("expected ErrInvalidRole, got %v", err)

@@ -3,26 +3,26 @@
 //! Every AES-GCM frame on a client-relay link carries exactly one cell
 //! in its decrypted plaintext. The cell has a fixed 9-byte header:
 //! `[type: 1][circuit_id: 4 BE][payload_length: 4 BE]` followed by
-//! `payload_length` payload bytes. No partial reads — the
+//! `payload_length` payload bytes. No partial reads: the
 //! caller decrypts the full frame plaintext first and only then parses
 //! it as a cell, so an attacker cannot cause work by sending half a
 //! header.
 //!
 //! Cell types (Phase 4b):
 //!
-//!   * EXTEND — bidirectional. Forward payload:
+//!   * EXTEND: bidirectional. Forward payload:
 //!     `addr_len(2 BE) || addr || client_pk(32)`. Backward payload:
 //!     `relay_pk(32)`.
-//!   * RELAY — bidirectional. Payload is bytes the receiver must
+//!   * RELAY: bidirectional. Payload is bytes the receiver must
 //!     forward verbatim to its OTHER link (next hop on the forward
 //!     path, previous hop on the backward path).
-//!   * CONNECT — forward, exit-only. Payload:
+//!   * CONNECT: forward, exit-only. Payload:
 //!     `addr_len(2 BE) || addr || port(2 BE)`. Exit decodes and (in
 //!     Phase 4c) dials the destination via the Decodo SOCKS5 proxy.
-//!   * DATA — bidirectional, exit-only. Payload: opaque bytes to and
+//!   * DATA: bidirectional, exit-only. Payload: opaque bytes to and
 //!     from the destination.
-//!   * CLOSE_REQUEST — forward, requests circuit teardown.
-//!   * CLOSE_ACK — backward, confirms teardown.
+//!   * CLOSE_REQUEST: forward, requests circuit teardown.
+//!   * CLOSE_ACK: backward, confirms teardown.
 //!
 //! Cells whose payload exceeds `MAX_CELL_PAYLOAD` are rejected at decode
 //! time; the per-frame cap from `crypto.rs` also applies.

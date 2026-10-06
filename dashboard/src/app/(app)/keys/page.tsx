@@ -22,7 +22,7 @@ export default function KeysPage() {
     <>
       <PageHeader
         title="Access keys"
-        description="Anonymous credentials that authorize your connections. Generated using a blind signature scheme — the value is built locally and never linked back to your account."
+        description="Anonymous credentials that authorize your connections. Generated using a blind signature scheme. The value is built locally and never linked back to your account."
       />
 
       <section className="grid grid-cols-1 gap-4 lg:grid-cols-3">
@@ -78,7 +78,7 @@ export default function KeysPage() {
                 Recent keys
               </p>
               <p className="mt-1 text-xs text-zinc-500">
-                Timestamps only — key values are never stored
+                Timestamps only, key values are never stored
               </p>
             </div>
             {canIssue && (
@@ -125,8 +125,8 @@ export default function KeysPage() {
           </div>
           <p className="mt-2 text-xs text-zinc-500">
             Access keys use a blind signature scheme. Your client builds the
-            blinded value locally and only the signed result comes back —
-            the key itself stays on your side.
+            blinded value locally and only the signed result comes back.
+            The key itself stays on your side.
           </p>
           <pre className="mt-4 overflow-x-auto rounded-lg border border-white/[0.06] bg-black/40 p-4 font-mono text-[11px] leading-relaxed text-zinc-300">
 {`# Build a blinded value locally
@@ -134,7 +134,7 @@ secret=$(openssl rand -hex 32)
 blinded=$(client-blind "$secret")
 
 # Request a signed key
-curl -X POST https://api.darkroute/api/v1/tokens/issue \\
+curl -X POST https://api.darkrouter.com/api/v1/tokens/issue \\
   -H "Authorization: Bearer $JWT" \\
   -H "Content-Type: application/json" \\
   -d "{\\"blinded\\": \\"$blinded\\"}"

@@ -1,7 +1,7 @@
 #![deny(warnings)]
 #![forbid(unsafe_code)]
 
-//! darkroute client SDK: login, blind-token issuance, circuit dialer.
+//! darkrouter client SDK: login, blind-token issuance, circuit dialer.
 
 mod auth;
 mod blind;
@@ -23,22 +23,22 @@ use rsa::RsaPublicKey;
 use tokio_rustls::TlsConnector;
 use url::Url;
 
-pub struct DarkrouteConfig {
+pub struct DarkrouterConfig {
     pub authority_url: Url,
     pub email: String,
     pub password: String,
 }
 
-pub struct DarkrouteClient {
-    cfg: DarkrouteConfig,
+pub struct DarkrouterClient {
+    cfg: DarkrouterConfig,
     http: HttpClient,
     tls: Arc<TlsConnector>,
     session: Option<Session>,
     pubkey: Option<RsaPublicKey>,
 }
 
-impl DarkrouteClient {
-    pub fn new(cfg: DarkrouteConfig) -> Result<Self, ClientError> {
+impl DarkrouterClient {
+    pub fn new(cfg: DarkrouterConfig) -> Result<Self, ClientError> {
         let http = HttpClient::builder()
             .cookie_store(true)
             .timeout(std::time::Duration::from_secs(30))

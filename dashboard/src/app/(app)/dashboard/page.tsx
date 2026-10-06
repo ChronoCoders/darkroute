@@ -191,7 +191,7 @@ export default function DashboardPage() {
               Latest access keys
             </p>
             <p className="mt-1 text-xs text-zinc-500">
-              Timestamps only — key values never persist
+              Timestamps only, key values never persist
             </p>
           </div>
           {tokens.isLoading ? (

@@ -19,8 +19,8 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/dslabs/darkroute/authority/internal/auth"
-	"github.com/dslabs/darkroute/authority/internal/blind"
+	"github.com/ChronoCoders/darkrouter/authority/internal/auth"
+	"github.com/ChronoCoders/darkrouter/authority/internal/blind"
 )
 
 const testJWTSecret = "test-secret-of-sufficient-length-please-32+"

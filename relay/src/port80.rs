@@ -6,7 +6,7 @@
 //! hardening entry; ARCHITECTURE §5.8, §8.1).
 //!
 //! Bounded read (4 KiB) and a 5s read timeout cap the resources a
-//! hostile peer can tie up. No keepalive, no header parsing — this is
+//! hostile peer can tie up. No keepalive, no header parsing, because this is
 //! the smallest correct redirector, not an HTTP server.
 
 use std::sync::Arc;
@@ -89,7 +89,7 @@ async fn serve_redirect(mut sock: TcpStream, hostname: &str) -> std::io::Result<
 }
 
 fn parse_request_path(buf: &[u8]) -> String {
-    // Malformed input falls back to "/" — this is a courtesy redirect,
+    // Malformed input falls back to "/" because this is a courtesy redirect,
     // not an HTTP server, so we trade conformance for safety.
     let line_end = buf
         .iter()
@@ -106,7 +106,7 @@ fn parse_request_path(buf: &[u8]) -> String {
     let _method = parts.next();
     let target = parts.next().unwrap_or(b"/");
     // Non-printable bytes in the path would be reflected into the
-    // Location header — that's header injection (CRLF, NUL). Reject.
+    // Location header, which is header injection (CRLF, NUL). Reject.
     if !target.iter().all(|&b| (0x21..=0x7e).contains(&b)) {
         return "/".to_string();
     }

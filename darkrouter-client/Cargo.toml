@@ -1,15 +1,15 @@
 [package]
-name = "darkroute-client"
+name = "darkrouter-client"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "darkroute-client"
+name = "darkrouter-client"
 path = "src/main.rs"
 
 [dependencies]
-darkroute-client-sdk = { path = "../client" }
+darkrouter-client-sdk = { path = "../client" }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

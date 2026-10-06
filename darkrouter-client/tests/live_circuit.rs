@@ -1,7 +1,7 @@
-//! Live end-to-end integration test against production darkroute.
+//! Live end-to-end integration test against production darkrouter.
 //!
 //! Spawns the SOCKS5 daemon binary against api.darkrouter.com using the
-//! test operator account (`test@darkrouter.dev`), then performs an HTTP
+//! test operator account (`test@darkrouter.com`), then performs an HTTP
 //! GET to https://api.ipify.org through the SOCKS5 proxy and asserts the
 //! returned public IP matches the Decodo NY exit IP wired to node03.
 //!
@@ -11,7 +11,7 @@
 //! updated to match.
 //!
 //! Gated `#[ignore]` so `cargo test` never runs it; only
-//! `cargo test -p darkroute-client -- --ignored` exercises this path.
+//! `cargo test -p darkrouter-client -- --ignored` exercises this path.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -35,7 +35,7 @@ async fn live_circuit_returns_decodo_exit_ip() {
     let authority =
         std::env::var("AUTHORITY_URL").unwrap_or_else(|_| "https://api.darkrouter.com".to_string());
 
-    let bin = env!("CARGO_BIN_EXE_darkroute-client");
+    let bin = env!("CARGO_BIN_EXE_darkrouter-client");
     let mut child = Command::new(bin)
         .env("AUTHORITY_URL", authority)
         .env("CLIENT_EMAIL", email)
@@ -46,7 +46,7 @@ async fn live_circuit_returns_decodo_exit_ip() {
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .expect("spawn darkroute-client");
+        .expect("spawn darkrouter-client");
 
     // tracing_subscriber::fmt writes to stdout by default; the daemon's
     // ready marker comes through there.
@@ -87,7 +87,7 @@ async fn live_circuit_returns_decodo_exit_ip() {
 
     assert_eq!(
         observed, EXPECTED_EXIT_IP,
-        "exit IP mismatch — got {observed:?}, expected {EXPECTED_EXIT_IP:?} \
+        "exit IP mismatch: got {observed:?}, expected {EXPECTED_EXIT_IP:?} \
          (node03.darkrouter.com → Decodo NY)"
     );
 }

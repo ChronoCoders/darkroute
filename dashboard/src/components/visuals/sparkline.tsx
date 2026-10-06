@@ -4,7 +4,7 @@ import { motion } from "framer-motion";
 
 // Reads an array of ISO timestamps, buckets them into N equal-width
 // intervals across the lookback window, and draws the histogram as a
-// line. Used to show real activity over time on metric cards — the
+// line. Used to show real activity over time on metric cards. The
 // data is real (timestamps from the authority), the visual is the
 // trend itself, not decoration.
 
