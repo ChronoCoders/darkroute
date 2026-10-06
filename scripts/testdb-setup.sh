@@ -52,6 +52,32 @@ if [ "$ready" != yes ]; then
 fi
 echo "server ready: $(pg_isready 2>&1)"
 
+# A test binary killed mid run leaves its per package database behind, so leftovers
+# are swept before every run. The pattern requires the trailing underscore that the
+# template name does not have, so the template can never match it. The underscores are
+# escaped because LIKE treats a bare underscore as a single character wildcard.
+leftovers=$(psql "$MAINT" -tAc \
+	"select datname from pg_database where datname like 'darkrouter\\_test\\_%'" 2>/dev/null)
+if [ -n "$leftovers" ]; then
+	n=0
+	while IFS= read -r db; do
+		[ -z "$db" ] && continue
+		case "$db" in
+		darkrouter_test_*)
+			psql "$MAINT" -q -c "DROP DATABASE IF EXISTS \"$db\" WITH (FORCE)" >/dev/null 2>&1 ||
+				psql "$MAINT" -q -c "DROP DATABASE IF EXISTS \"$db\"" >/dev/null 2>&1
+			n=$((n + 1))
+			;;
+		*)
+			echo "refusing to drop '$db': outside the darkrouter_test_ namespace" >&2
+			;;
+		esac
+	done <<< "$leftovers"
+	echo "removed $n leftover per package database(s)"
+else
+	echo "no leftover per package databases"
+fi
+
 exists=$(psql "$MAINT" -tAc "select 1 from pg_database where datname = '$DBNAME'" 2>/dev/null)
 if [ "$exists" = "1" ]; then
 	echo "database already present, leaving it alone"
