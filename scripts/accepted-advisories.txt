@@ -1,0 +1,30 @@
+# Security advisories that are known, reviewed, and deliberately not fixed.
+#
+# The audit steps in gate.sh read this file. Any advisory the auditors report
+# that is not listed here fails the gate. Any advisory listed here is printed as
+# skipped, so an accepted finding stays visible instead of disappearing.
+#
+# One record per line, five fields separated by " | ":
+#   id | package | date reviewed | re-evaluation trigger | reason
+#
+# A record is not a judgement that the advisory is harmless. It is a statement
+# that the vulnerable code path is not reachable in what this repository ships,
+# with the evidence that shows it. When the trigger fires, the record is void
+# and the advisory has to be answered again.
+#
+# Lines starting with # and blank lines are ignored.
+
+RUSTSEC-2023-0071 | rsa | 2026-10-05 | the rsa crate publishes a fixed release, or any Rust outside a cfg(test) block gains an RsaPrivateKey operation | The Marvin attack needs a private key operation to time. Every RsaPrivateKey use in this workspace is behind cfg(test): relay/src/token.rs:129 raw_sign is cfg(test) gated, client/src/blind.rs private key use starts after the cfg(test) at line 76, and relay/src/integration_test.rs is a test only module. Shipped code parses a public key with RsaPublicKey::from_pkcs1_pem at relay/src/authority.rs:80 and verifies token^e mod n, which involves no secret exponent.
+
+GHSA-6g55-p6wh-862q | postcss | 2026-10-05 | postcss appears in .next/server or .next/static after a build, or the dashboard adds a runtime css pipeline | postcss runs only while the dashboard is being built. Measured on the 15.5.27 build tree: 6 files under .next/build mention it, 0 under .next/server, 0 under .next/static. The positive control for that scan is react, which the same scan finds in 7 static files and 115 server files, so the scan can see a package that does reach the output.
+GHSA-fxqj-rqcc-2cmp | postcss | 2026-10-05 | postcss appears in .next/server or .next/static after a build, or the dashboard adds a runtime css pipeline | Same build time only placement as GHSA-6g55-p6wh-862q. The attacker controlled source map path this advisory covers needs a postcss run, and no postcss run happens in the serving process.
+GHSA-qx2v-qp2m-jg93 | postcss | 2026-10-05 | postcss appears in .next/server or .next/static after a build | The XSS is in postcss stringify output. The only stringify runs happen during the build, against css written in this repository, never against anything a request supplies.
+GHSA-r28c-9q8g-f849 | postcss | 2026-10-05 | postcss appears in .next/server or .next/static after a build | Path traversal through previous source map auto loading. Source maps are read at build time from paths in this repository, so no request controlled path reaches the loader.
+
+GHSA-68fv-2mgg-jv7q | source-map-js | 2026-10-05 | source-map-js appears in .next/server or .next/static after a build | Reached only through postcss, which is build time only. Measured on the 15.5.27 build tree: 2 files under .next/build, 0 under .next/server, 0 under .next/static. The denial of service needs a request to drive the parse, and no request reaches it.
+
+GHSA-28wg-ghj8-5hjv | nanoid | 2026-10-05 | nanoid appears in .next/server or .next/static after a build | Reached only through postcss, which is build time only. Measured on the 15.5.27 build tree: 2 files under .next/build, 0 under .next/server, 0 under .next/static. Both nanoid advisories need a caller passing a hostile size, and the only caller is postcss generating build time identifiers.
+GHSA-2v37-7h3g-55p8 | nanoid | 2026-10-05 | nanoid appears in .next/server or .next/static after a build | Same build time only placement as GHSA-28wg-ghj8-5hjv.
+
+GHSA-f88m-g3jw-g9cj | sharp | 2026-10-05 | a next.config.ts images block appears, or any next/image usage appears in dashboard/src, or a raster file is added under dashboard/public | sharp is absent from the built output: 0 files under .next/build, .next/server and .next/static mention it. The only path to libvips is the built in /_next/image route, and the built config reports remotePatterns as empty and dangerouslyAllowSVG as false, so it accepts no remote url. dashboard/public holds five svg files and no raster image, and no component imports next/image. Nothing attacker supplied can reach libvips.
+GHSA-rgj7-g3m4-5g8c | sharp | 2026-10-05 | a next.config.ts images block appears, or any next/image usage appears in dashboard/src, or a raster file is added under dashboard/public | Same unreachable image path as GHSA-f88m-g3jw-g9cj. The libheif advisories need a heif input, and no request can supply one.
