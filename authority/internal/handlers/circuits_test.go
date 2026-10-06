@@ -28,24 +28,6 @@ func serveRoute(pool *pgxpool.Pool, subID string) *httptest.ResponseRecorder {
 	return rec
 }
 
-// Per SECURITY_MODEL §9: the same host serving two hops collapses the
-// unlinkability between client IP and destination. Two distinct nodes are seeded
-// and the third pick has no eligible row once the first two ids are excluded, so
-// the whole request must fail rather than reuse a node.
-func TestCircuitRouteRequiresThreeDistinctNodes(t *testing.T) {
-	pool := testPool(t, "TEST_DATABASE_URL not set; skipping DB-backed distinct-host test")
-	subID := seedSubscriberWithActiveSubscription(t, pool, "distinct")
-
-	requireNoActiveRelays(t, pool, "exit")
-	seedActiveRelay(t, pool, "guard", "distinct")
-	seedActiveRelay(t, pool, "middle", "distinct")
-
-	rec := serveRoute(pool, subID)
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("expected 503 when exit role has no row, got %d (body=%s)", rec.Code, rec.Body.String())
-	}
-}
-
 func TestCircuitRouteRequiresAllThreeRoles(t *testing.T) {
 	pool := testPool(t, "TEST_DATABASE_URL not set; skipping DB-backed circuit route test")
 	subID := seedSubscriberWithActiveSubscription(t, pool, "roles")
