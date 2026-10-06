@@ -1,4 +1,4 @@
-# darkrouter
+# Darkrouter
 
 B2B onion routing infrastructure with cryptographic access control and residential exit IPs.
 
@@ -58,7 +58,7 @@ The Rust SDK is also exposed directly for applications that prefer in-process in
 
 ## Self-hosting
 
-Not supported. darkrouter runs as managed infrastructure on operator-controlled hosts. The relay fleet, authority, residential exit IPs, and certificate lifecycle are operated by Distributed Systems Labs. Source is published for review under the BSL terms below, not for independent deployment.
+Not supported. Darkrouter runs as managed infrastructure on operator-controlled hosts. The relay fleet, authority, residential exit IPs, and certificate lifecycle are operated by Distributed Systems Labs. Source is published for review under the BSL terms below, not for independent deployment.
 
 If you need a private deployment for compliance reasons, contact us.
 
