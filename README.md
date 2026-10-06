@@ -4,7 +4,7 @@ B2B onion routing infrastructure with cryptographic access control and residenti
 
 ## What it is
 
-darkrouter is a managed three-hop circuit routing service for businesses that need to make outbound HTTPS requests from an origin the destination cannot attribute to them. Each request travels through three relay hops before exiting through a sticky residential IP. The destination sees a residential address and nothing that ties the request back to your company.
+Darkrouter is a managed three-hop circuit routing service for businesses that need to make outbound HTTPS requests from an origin the destination cannot attribute to them. Each request travels through three relay hops before exiting through a sticky residential IP. The destination sees a residential address and nothing that ties the request back to your company.
 
 Access is gated by a blind-signed token. What that buys is specific: no single component, if compromised or compelled, yields a link between a subscription and a traffic flow. It does not make you anonymous to us, and the privacy model below says exactly why.
 
