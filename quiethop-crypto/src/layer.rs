@@ -137,8 +137,8 @@ impl<R: tokio::io::AsyncRead + Unpin> FrameReader<R> {
     /// Bytes buffered that do not yet make a frame.
     ///
     /// A caller that intends to hand the underlying stream to someone else must
-    /// check this first: those bytes belong to the current circuit and would
-    /// surface as a corrupt frame for the next one.
+    /// check this first: those bytes belong to the current reader's stream
+    /// position and would surface as a corrupt frame for whoever reads next.
     pub fn pending(&self) -> usize {
         self.acc.pending()
     }

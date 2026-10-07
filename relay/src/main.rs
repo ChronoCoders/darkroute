@@ -7,7 +7,6 @@ mod config;
 mod exit;
 mod heartbeat;
 mod metrics;
-mod pool;
 mod port80;
 mod static_key;
 mod tls;
@@ -39,15 +38,12 @@ use quiethop_crypto::wire::{
 
 use crate::authority::AuthorityClient;
 use crate::config::{RelayConfig, Role};
-use crate::pool::{ConnectionPool, PooledConn};
 use crate::token::ReplayWindow;
 
 const PRESENTATION_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CELL_READ_TIMEOUT: Duration = Duration::from_secs(120);
-const POOL_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
-const POOL_IDLE_TTL: Duration = Duration::from_secs(300);
 // Read in whole cells. 32 payloads per read keeps the syscall count near the
 // old 16 KiB buffer while every cell on the wire stays CELL_PAYLOAD_LEN.
 const DEST_READ_BUF: usize = cell::CELL_PAYLOAD_LEN * 32;
@@ -149,8 +145,6 @@ async fn main() -> ExitCode {
     );
     metrics::init();
 
-    let outbound_pool: Arc<ConnectionPool<OutboundStream>> = Arc::new(ConnectionPool::new());
-
     let acme = match tls::acme_setup(&cfg) {
         Ok(a) => a,
         Err(e) => {
@@ -229,12 +223,10 @@ async fn main() -> ExitCode {
         cfg.clone(),
         authority.clone(),
         replay.clone(),
-        outbound_pool.clone(),
         outbound_connector.clone(),
         static_key.clone(),
     ));
     let metrics_handle = tokio::spawn(metrics_accept_loop(metrics_listener, shutdown.clone()));
-    let pool_sweep_handle = tokio::spawn(pool_sweep_loop(outbound_pool.clone(), shutdown.clone()));
     let port80_handle = tokio::spawn(port80::redirect_loop(
         port80_listener,
         cfg.relay_hostname.clone(),
@@ -250,7 +242,6 @@ async fn main() -> ExitCode {
     let _ = hb_handle.await;
     let _ = accept_handle.await;
     let _ = metrics_handle.await;
-    let _ = pool_sweep_handle.await;
     let _ = port80_handle.await;
     acme.driver.abort();
     let _ = acme.driver.await;
@@ -280,7 +271,6 @@ async fn accept_loop(
     cfg: Arc<RelayConfig>,
     authority: Arc<AuthorityClient>,
     replay: Arc<ReplayWindow>,
-    pool: Arc<ConnectionPool<OutboundStream>>,
     connector: Arc<TlsConnector>,
     static_key: Arc<StaticKeypair>,
 ) {
@@ -296,7 +286,6 @@ async fn accept_loop(
                         cfg: cfg.clone(),
                         authority: authority.clone(),
                         replay: replay.clone(),
-                        pool: pool.clone(),
                         connector: connector.clone(),
                         static_key: static_key.clone(),
                     };
@@ -341,13 +330,12 @@ async fn accept_loop(
 /// Per-connection dependencies, cloned once per accepted connection.
 ///
 /// These travel together through every layer of the connection handler, so
-/// they move as one value rather than as six positional arguments.
+/// they move as one value rather than as five positional arguments.
 #[derive(Clone)]
 struct ConnCtx {
     cfg: Arc<RelayConfig>,
     authority: Arc<AuthorityClient>,
     replay: Arc<ReplayWindow>,
-    pool: Arc<ConnectionPool<OutboundStream>>,
     connector: Arc<TlsConnector>,
     static_key: Arc<StaticKeypair>,
 }
@@ -490,25 +478,27 @@ async fn handle_relay_connection(
         return Err(HandleError::PeerNotAllowed);
     }
 
-    loop {
-        let mut signal = [0u8; 1];
-        match r.read_exact(&mut signal).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(e) => return Err(HandleError::Io(e)),
-        }
-        if signal[0] != CIRCUIT_START {
-            // Any byte other than CIRCUIT_START terminates the link.
-            return Ok(());
-        }
-        drive_circuit(&mut r, &mut w, peer, ctx.cfg.role, ctx.clone()).await?;
+    // One circuit per relay link (DECISIONS 15). CIRCUIT_START still marks the
+    // start of the protocol, but nothing waits for a second one: when the
+    // circuit ends the link ends with it, so no stale cell from this circuit
+    // can surface in another.
+    let mut signal = [0u8; 1];
+    match r.read_exact(&mut signal).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
+        Err(e) => return Err(HandleError::Io(e)),
     }
+    if signal[0] != CIRCUIT_START {
+        // Any byte other than CIRCUIT_START terminates the link.
+        return Ok(());
+    }
+    drive_circuit(&mut r, &mut w, peer, ctx.cfg.role, ctx).await
 }
 
 /// Bring up one circuit: run the Noise NK responder handshake against this
 /// relay's static key, activate the state machine, run the bidirectional cell
-/// loop. On CLOSE_REQUEST: send CLOSE_ACK, release the next link to the pool
-/// (if any), drop the destination link (if any), close the circuit.
+/// loop. On CLOSE_REQUEST: send CLOSE_ACK, drop the next link (if any) and the
+/// destination link (if any), close the circuit.
 ///
 /// Every failure below takes the same path: close the connection, fail the
 /// circuit, send nothing back. The peer cannot tell a bad handshake from a bad
@@ -650,14 +640,8 @@ async fn run_circuit_io(
                             let out = out_len.ok_or(
                                 HandleError::IllegalCellForRole(CellType::Extend, role),
                             )?;
-                            let nl = open_next_link(
-                                &extend,
-                                &ctx.pool,
-                                &ctx.cfg,
-                                &ctx.connector,
-                                out,
-                            )
-                            .await?;
+                            let nl =
+                                open_next_link(&extend, &ctx.cfg, &ctx.connector, out).await?;
                             let reply = Cell::new(
                                 CellType::Extend,
                                 cell::extend_backward_payload(&nl.noise_msg2),
@@ -708,14 +692,11 @@ async fn run_circuit_io(
                             let framed = layer::seal_to_me(transport, &ack, layers)?;
                             sock_write.write_all(&framed).await?;
                             sock_write.flush().await?;
-                            if let Some(nl) = next_link.take() {
-                                // The inner CLOSE_REQUESTs ran before this
-                                // outer one, so the next-hop link is back
-                                // in "waiting for CIRCUIT_START" state and
-                                // safe to reuse, provided its reader holds
-                                // nothing belonging to this circuit.
-                                release_or_discard(&ctx.pool, nl.addr, nl.read, nl.write);
-                            }
+                            // A relay link carries one circuit, so it closes
+                            // with the circuit. Dropping both halves shuts the
+                            // TLS stream, which is what the next hop sees as
+                            // the end of its own circuit.
+                            drop(next_link.take());
                             drop(dest_link.take());
                             return Ok(());
                         }
@@ -773,39 +754,10 @@ async fn run_circuit_io(
     }
 }
 
-/// Hand a finished next link back to the pool, or drop it.
-///
-/// A reader still holding a partial frame holds bytes that belong to the
-/// circuit just closing. Pooling that stream would surface them as a corrupt
-/// frame for whichever circuit acquires it next, so it is discarded instead.
-/// Losing a pooled connection costs one TLS handshake; pooling a dirty one
-/// breaks the next circuit.
-fn release_or_discard<S>(
-    pool: &ConnectionPool<S>,
-    addr: SocketAddr,
-    read: layer::FrameReader<ReadHalf<S>>,
-    write: WriteHalf<S>,
-) where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let pending = read.pending();
-    if pending != 0 {
-        warn!(
-            peer = %addr,
-            pending,
-            "discarding a next-hop link rather than pooling it: its reader holds a partial frame"
-        );
-        return;
-    }
-    let stream = read.into_inner().unsplit(write);
-    pool.release(addr, PooledConn::new(stream));
-}
-
 struct NextLinkState {
     read: layer::FrameReader<ReadHalf<OutboundStream>>,
     write: WriteHalf<OutboundStream>,
     noise_msg2: [u8; NOISE_MSG_LEN],
-    addr: SocketAddr,
 }
 
 /// Acquire (or dial and TLS-handshake) an outbound link to `next_hop` and act
@@ -815,27 +767,20 @@ struct NextLinkState {
 /// This relay is not a party to that handshake. It cannot read either message,
 /// and the next hop authenticates to the client, not to this relay.
 ///
-/// A fresh outbound stream gets the PROTO_RELAY prefix once; pooled streams are
-/// already past PROTO_RELAY and ready for the next CIRCUIT_START.
+/// Each circuit opens its own link, so the stream always starts at PROTO_RELAY
+/// followed by one CIRCUIT_START. Relay links are not reused (DECISIONS 15).
 async fn open_next_link(
     extend: &ExtendForward,
-    pool: &ConnectionPool<OutboundStream>,
     cfg: &RelayConfig,
     connector: &TlsConnector,
     frame_len: usize,
 ) -> Result<NextLinkState, HandleError> {
-    let stream: OutboundStream = match pool.acquire(&extend.next_hop) {
-        Some(PooledConn { stream, .. }) => stream,
-        None => {
-            let sni = cfg
-                .peer_hostnames
-                .get(&extend.next_hop)
-                .ok_or(HandleError::PeerHostnameMissing(extend.next_hop))?;
-            let mut s = tls::dial_tls(connector, extend.next_hop, sni).await?;
-            s.write_all(&[PROTO_RELAY]).await?;
-            s
-        }
-    };
+    let sni = cfg
+        .peer_hostnames
+        .get(&extend.next_hop)
+        .ok_or(HandleError::PeerHostnameMissing(extend.next_hop))?;
+    let mut stream = tls::dial_tls(connector, extend.next_hop, sni).await?;
+    stream.write_all(&[PROTO_RELAY]).await?;
     let (mut read, mut write) = tokio::io::split(stream);
     write.write_all(&[CIRCUIT_START]).await?;
     write.write_all(&extend.noise_msg1).await?;
@@ -850,7 +795,6 @@ async fn open_next_link(
         read: layer::FrameReader::new(read, frame_len),
         write,
         noise_msg2,
-        addr: extend.next_hop,
     })
 }
 
@@ -895,28 +839,6 @@ fn publish_connect_for_test(p: &ConnectPayload) {
 #[cfg(not(test))]
 fn publish_connect_for_test(_p: &ConnectPayload) {}
 
-async fn pool_sweep_loop(pool: Arc<ConnectionPool<OutboundStream>>, shutdown: Arc<Notify>) {
-    let mut ticker = tokio::time::interval(POOL_SWEEP_INTERVAL);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
-        tokio::select! {
-            _ = shutdown.notified() => {
-                info!("pool sweep shutting down");
-                return;
-            }
-            _ = ticker.tick() => {
-                if pool.is_empty() {
-                    continue;
-                }
-                let evicted = pool.evict_older_than(POOL_IDLE_TTL);
-                if evicted > 0 {
-                    info!(evicted, remaining = pool.len(), "pool sweep");
-                }
-            }
-        }
-    }
-}
-
 async fn metrics_accept_loop(listener: TcpListener, shutdown: Arc<Notify>) {
     loop {
         tokio::select! {
@@ -943,74 +865,6 @@ async fn metrics_accept_loop(listener: TcpListener, shutdown: Arc<Notify>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A clean reader gives its stream back to the pool.
-    ///
-    /// This is the positive half of the pooling decision: without it, a test
-    /// that only checks the discard path would pass even if nothing were ever
-    /// pooled.
-    #[tokio::test]
-    async fn clean_next_link_is_returned_to_the_pool() {
-        let pool: ConnectionPool<tokio::io::DuplexStream> = ConnectionPool::new();
-        let addr: SocketAddr = "127.0.0.1:9001".parse().expect("addr");
-        let (near, mut far) = tokio::io::duplex(256);
-
-        const FRAME: usize = 8;
-        far.write_all(&[5u8; FRAME]).await.expect("write a frame");
-        far.flush().await.expect("flush");
-
-        let (read, write) = tokio::io::split(near);
-        let mut reader = layer::FrameReader::new(read, FRAME);
-        let frame = reader.next_frame().await.expect("frame");
-        assert_eq!(frame.len(), FRAME);
-        assert_eq!(reader.pending(), 0, "nothing should be left over");
-
-        release_or_discard(&pool, addr, reader, write);
-        assert_eq!(pool.len(), 1, "a clean link must be pooled");
-        assert!(
-            pool.acquire(&addr).is_some(),
-            "and must be acquirable again"
-        );
-    }
-
-    /// A reader holding a partial frame must not be pooled. Those bytes belong
-    /// to the circuit that is closing and would corrupt the next one's framing.
-    #[tokio::test]
-    async fn next_link_holding_a_partial_frame_is_discarded() {
-        let pool: ConnectionPool<tokio::io::DuplexStream> = ConnectionPool::new();
-        let addr: SocketAddr = "127.0.0.1:9002".parse().expect("addr");
-        let (near, mut far) = tokio::io::duplex(256);
-
-        const FRAME: usize = 8;
-        // Three bytes of a frame, and a competing branch that is ready at once,
-        // so next_frame is cancelled with a partial frame retained.
-        far.write_all(&[1, 2, 3])
-            .await
-            .expect("write a partial frame");
-        far.flush().await.expect("flush");
-
-        let (read, write) = tokio::io::split(near);
-        let mut reader = layer::FrameReader::new(read, FRAME);
-        let (other_tx, mut other_rx) = tokio::io::duplex(8);
-        drop(other_tx);
-        let mut obuf = [0u8; 1];
-        // biased so next_frame is polled first and takes the three bytes
-        // before the other branch wins. Unbiased, the runtime may never poll
-        // it and the retained-partial assertion would pass vacuously.
-        tokio::select! {
-            biased;
-            r = reader.next_frame() => panic!("a frame appeared from three bytes: {r:?}"),
-            _ = other_rx.read(&mut obuf) => {}
-        }
-        assert_eq!(reader.pending(), 3, "the partial frame must be retained");
-
-        release_or_discard(&pool, addr, reader, write);
-        assert!(
-            pool.is_empty(),
-            "a link whose reader holds {} buffered bytes must be discarded, not pooled",
-            3
-        );
-    }
 
     #[test]
     fn redact_proxy_url_strips_userinfo() {

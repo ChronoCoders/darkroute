@@ -45,7 +45,6 @@ use quiethop_crypto::noise::{Initiator, Transport, NOISE_MSG_LEN, STATIC_KEY_LEN
 
 use crate::authority::AuthorityClient;
 use crate::config::{RelayConfig, Role};
-use crate::pool::ConnectionPool;
 use crate::static_key;
 use crate::test_hooks;
 use crate::token::{raw_sign, ReplayWindow};
@@ -176,7 +175,6 @@ async fn spawn_relay(
     )));
     let replay = Arc::new(ReplayWindow::new(Duration::from_secs(86_400)));
     let cfg = make_config(role, over, peers, key_path);
-    let pool = Arc::new(ConnectionPool::new());
     let shutdown = Arc::new(Notify::new());
     tokio::spawn(super::accept_loop(
         listener,
@@ -186,7 +184,6 @@ async fn spawn_relay(
         cfg,
         authority,
         replay,
-        pool,
         connector,
         Arc::new(kp),
     ));
@@ -784,27 +781,20 @@ async fn run_data_test() {
     assert_eq!(back.payload, payload, "echo did not round trip");
 }
 
-/// Two circuits in sequence on one relay-to-relay inbound link, with the second
-/// circuit's preamble arriving in the same read as the last frame of the first.
+/// A relay link carries exactly one circuit, so a second CIRCUIT_START after a
+/// finished circuit is not served and the link is closed (DECISIONS 15).
 ///
-/// A relay link carries circuits one after another: CIRCUIT_START, handshake
-/// message 1, cells, then the next CIRCUIT_START. The inbound FrameReader is
-/// created per circuit and dropped when the circuit closes, so any bytes it
-/// read past the final frame are dropped with it, and the next circuit loses
-/// the front of its handshake.
-///
-/// The final frame is written in two pieces, and the second piece is bundled
-/// with the next CIRCUIT_START and message 1. That gives the reader a partial
-/// frame followed by a read with more available than the frame needs, which is
-/// the condition under which an uncapped read reaches past the boundary.
+/// The control is the first circuit in the same test: it completes its
+/// handshake on the same link, so a failure to serve the second one cannot be
+/// explained by the relay refusing circuits in general.
 #[tokio::test]
-async fn second_circuit_survives_a_preamble_bundled_with_the_last_frame() {
-    tokio::time::timeout(TEST_TIMEOUT, run_sequential_circuit_test())
+async fn a_second_circuit_start_on_a_finished_link_is_not_served() {
+    tokio::time::timeout(TEST_TIMEOUT, run_one_circuit_per_link_test())
         .await
         .expect("test timed out");
 }
 
-async fn run_sequential_circuit_test() {
+async fn run_one_circuit_per_link_test() {
     ensure_crypto_provider();
     let keydir = tempfile::tempdir().expect("keydir");
     let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
@@ -813,8 +803,6 @@ async fn run_sequential_circuit_test() {
     let connector = Arc::new(make_connector(&pki));
     let over = default_override();
 
-    // The exit is the simplest role for this: its inbound link is one layer
-    // deep and it needs no next hop.
     let exit = spawn_relay(
         Role::Exit,
         &auth_priv,
@@ -831,7 +819,7 @@ async fn run_sequential_circuit_test() {
     let mut sock = tls_connect(&connector, exit.addr).await;
     sock.write_all(&[super::PROTO_RELAY]).await.expect("proto");
 
-    // Circuit one: handshake, then a CLOSE_REQUEST split across two writes.
+    // Control: the first circuit on this link completes its handshake.
     let (init1, msg1) = Initiator::start(&exit.static_pubkey).expect("nk start");
     sock.write_all(&[super::CIRCUIT_START])
         .await
@@ -839,51 +827,44 @@ async fn run_sequential_circuit_test() {
     sock.write_all(&msg1).await.expect("msg1");
     sock.flush().await.expect("flush");
     let mut msg2 = [0u8; NOISE_MSG_LEN];
-    sock.read_exact(&mut msg2).await.expect("msg2");
+    sock.read_exact(&mut msg2)
+        .await
+        .expect("the first circuit must be served");
     let mut tx1 = init1.finish(&msg2).expect("nk finish");
 
+    // End the first circuit cleanly.
     let close = Cell::new(CellType::CloseRequest, Vec::new()).expect("close cell");
     let close_wire = seal_to_me(&mut tx1, &close, 1).expect("seal close");
-    assert_eq!(close_wire.len(), frame_len);
-
-    // Circuit two's preamble, which must survive circuit one closing.
-    let (init2, msg1_b) = Initiator::start(&exit.static_pubkey).expect("nk start 2");
-    let mut tail = Vec::new();
-    tail.extend_from_slice(&close_wire[frame_len - 1..]);
-    tail.push(super::CIRCUIT_START);
-    tail.extend_from_slice(&msg1_b);
-
-    // All but the last byte of the final frame, flushed on its own, so the
-    // relay buffers a partial frame.
-    sock.write_all(&close_wire[..frame_len - 1])
-        .await
-        .expect("frame part 1");
-    sock.flush().await.expect("flush");
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    // The last byte plus circuit two's preamble, together.
-    sock.write_all(&tail)
-        .await
-        .expect("frame part 2 and preamble");
+    sock.write_all(&close_wire).await.expect("close request");
     sock.flush().await.expect("flush");
 
-    // Circuit one's CLOSE_ACK.
     let mut ack = vec![0u8; frame_len];
-    sock.read_exact(&mut ack).await.expect("close ack frame");
+    sock.read_exact(&mut ack).await.expect("close ack");
     match peel(&mut tx1, &ack, 1).expect("peel ack") {
         Peeled::ToMe(c) => assert_eq!(c.cell_type, CellType::CloseAck, "expected CLOSE_ACK"),
         Peeled::Forward(_) => panic!("FORWARD at the innermost layer"),
     }
 
-    // Circuit two must now complete its handshake. If the previous circuit's
-    // reader swallowed part of the preamble, this read never produces a usable
-    // message 2.
+    // A second CIRCUIT_START must not be served. The relay has closed the link,
+    // so either the write fails or the read reaches EOF. What must not happen is
+    // a usable handshake reply.
+    let (init2, msg1_b) = Initiator::start(&exit.static_pubkey).expect("nk start 2");
+    let _ = sock.write_all(&[super::CIRCUIT_START]).await;
+    let _ = sock.write_all(&msg1_b).await;
+    let _ = sock.flush().await;
+
     let mut msg2_b = [0u8; NOISE_MSG_LEN];
-    let read = tokio::time::timeout(Duration::from_secs(10), sock.read_exact(&mut msg2_b)).await;
-    let read = read.expect("the relay never answered circuit two's handshake");
-    read.expect("circuit two's handshake message 2 was not readable");
-    init2
-        .finish(&msg2_b)
-        .expect("circuit two's handshake did not complete");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), sock.read_exact(&mut msg2_b)).await;
+    match outcome {
+        Err(_) => {}
+        Ok(Err(_)) => {}
+        Ok(Ok(_)) => {
+            assert!(
+                init2.finish(&msg2_b).is_err(),
+                "a second circuit was served on a link that had already finished one"
+            );
+        }
+    }
 }
 
 /// A TCP proxy that forwards both directions in 1 to 7 byte writes, yielding
