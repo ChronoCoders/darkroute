@@ -324,10 +324,18 @@ ck_dash_staged() {
 # is local and does not survive a fresh clone, so the hook is what actually stops
 # them from being committed.
 CK_PRIVATE_PATHS='^(ARCHITECTURE\.md|SECURITY_MODEL\.md|SESSION_LOG\.md|STATUS_REPORT\.md|docs/DECISIONS\.md|authority/\.env|authority/keys/)'
+# authority/.env.example is deliberately tracked: .gitignore ignores .env and
+# .env.* and then re-includes it, because it documents the variables the service
+# needs. The pattern above stays broad, so authority/.env.local and
+# authority/.env.production are still refused, and the one tracked template is
+# excepted by name rather than by narrowing the rule.
+CK_PRIVATE_ALLOW='^authority/\.env\.example$'
 
 ck_private_staged() {
 	local hits
-	hits=$(git diff --cached --name-only --diff-filter=ACMR | grep -E "$CK_PRIVATE_PATHS" || true)
+	hits=$(git diff --cached --name-only --diff-filter=ACMR \
+		| grep -E "$CK_PRIVATE_PATHS" \
+		| grep -vE "$CK_PRIVATE_ALLOW" || true)
 	[ -z "$hits" ] && return 0
 	echo "REJECT staged path: these stay untracked and must not be committed" >&2
 	printf '%s\n' "$hits" | sed 's/^/    /' >&2
