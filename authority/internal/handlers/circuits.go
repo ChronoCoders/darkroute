@@ -21,10 +21,28 @@ func NewCircuitHandler(pool *pgxpool.Pool) *CircuitHandler {
 	return &CircuitHandler{pool: pool}
 }
 
+// circuitHop carries an IP literal and a separate TLS name. The client dials
+// ip:port and sends tls_name as SNI, so no name is resolved while a path is
+// constructed (SECURITY_MODEL 5.3). static_pubkey is hex; it is public key
+// material and the client pins the NK handshake to it.
 type circuitHop struct {
-	ID       string `json:"id"`
-	Endpoint string `json:"endpoint"`
-	Region   string `json:"region"`
+	ID           string `json:"id"`
+	IP           string `json:"ip"`
+	Port         int    `json:"port"`
+	TLSName      string `json:"tls_name"`
+	Region       string `json:"region"`
+	StaticPubkey string `json:"static_pubkey"`
+}
+
+func hopOf(r *relay.Relay) circuitHop {
+	return circuitHop{
+		ID:           r.ID,
+		IP:           r.IP,
+		Port:         r.Port,
+		TLSName:      r.TLSName,
+		Region:       r.Region,
+		StaticPubkey: r.StaticPubkeyHex(),
+	}
 }
 
 type circuitRouteResponse struct {
@@ -97,9 +115,9 @@ func (h *CircuitHandler) HandleRoute(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, circuitRouteResponse{
-		Guard:  circuitHop{ID: guard.ID, Endpoint: guard.Endpoint, Region: guard.Region},
-		Middle: circuitHop{ID: middle.ID, Endpoint: middle.Endpoint, Region: middle.Region},
-		Exit:   circuitHop{ID: exit.ID, Endpoint: exit.Endpoint, Region: exit.Region},
+		Guard:  hopOf(guard),
+		Middle: hopOf(middle),
+		Exit:   hopOf(exit),
 	})
 }
 

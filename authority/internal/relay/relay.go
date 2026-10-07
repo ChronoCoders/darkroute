@@ -1,11 +1,13 @@
 package relay
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"net/netip"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -13,17 +15,48 @@ import (
 )
 
 var (
-	ErrInvalidRole  = errors.New("invalid relay role")
-	ErrUnknownRelay = errors.New("unknown relay")
+	ErrInvalidRole       = errors.New("invalid relay role")
+	ErrUnknownRelay      = errors.New("unknown relay")
+	ErrInvalidStaticKey  = errors.New("static public key is not 32 bytes")
+	ErrInvalidAddress    = errors.New("invalid relay address")
+	ErrStaticKeyMismatch = errors.New("static public key does not match the provisioned one")
 )
+
+// StaticKeyLen is the X25519 public key length. The database enforces the same
+// bound with a CHECK constraint, so a direct insert cannot bypass it.
+const StaticKeyLen = 32
 
 type Relay struct {
 	ID            string     `json:"id"`
-	Endpoint      string     `json:"endpoint"`
+	TLSName       string     `json:"tls_name"`
+	IP            string     `json:"ip"`
+	Port          int        `json:"port"`
 	Region        string     `json:"region"`
 	Role          string     `json:"role"`
 	Status        string     `json:"status"`
 	LastHeartbeat *time.Time `json:"last_heartbeat,omitempty"`
+	// StaticPubkey is raw bytes in Go and hex on the wire. Handlers encode it;
+	// it is public key material, so it carries no disclosure risk.
+	StaticPubkey []byte `json:"-"`
+}
+
+// StaticPubkeyHex renders the key for a JSON response.
+func (r *Relay) StaticPubkeyHex() string {
+	return hex.EncodeToString(r.StaticPubkey)
+}
+
+const relayColumns = `id, tls_name, host(ip), port, region, role, status, last_heartbeat, static_pubkey`
+
+func scanRelay(row pgx.Row, r *Relay) error {
+	return row.Scan(&r.ID, &r.TLSName, &r.IP, &r.Port, &r.Region, &r.Role, &r.Status, &r.LastHeartbeat, &r.StaticPubkey)
+}
+
+// ValidateStaticKey rejects anything that is not exactly an X25519 public key.
+func ValidateStaticKey(key []byte) error {
+	if len(key) != StaticKeyLen {
+		return ErrInvalidStaticKey
+	}
+	return nil
 }
 
 func validRole(role string) bool {
@@ -54,9 +87,18 @@ func generateAPIKey() (string, error) {
 
 // The plaintext key is returned to the caller exactly once and never
 // persisted; only its salted SHA-256 hash is stored.
-func ProvisionRelay(ctx context.Context, pool *pgxpool.Pool, salt, endpoint, region, role string) (string, string, error) {
+func ProvisionRelay(ctx context.Context, pool *pgxpool.Pool, salt, tlsName, region, role, ip string, port int, staticPubkey []byte) (string, string, error) {
 	if !validRole(role) {
 		return "", "", ErrInvalidRole
+	}
+	if err := ValidateStaticKey(staticPubkey); err != nil {
+		return "", "", err
+	}
+	if _, err := netip.ParseAddr(ip); err != nil {
+		return "", "", ErrInvalidAddress
+	}
+	if port < 1 || port > 65535 {
+		return "", "", ErrInvalidAddress
 	}
 	plaintext, err := generateAPIKey()
 	if err != nil {
@@ -65,10 +107,10 @@ func ProvisionRelay(ctx context.Context, pool *pgxpool.Pool, salt, endpoint, reg
 	hash := hashAPIKey(salt, plaintext)
 	var id string
 	err = pool.QueryRow(ctx,
-		`INSERT INTO relay_nodes (id, api_key_hash, endpoint, region, role, status)
-		 VALUES (gen_random_uuid(), $1, $2, $3, $4, 'inactive')
+		`INSERT INTO relay_nodes (id, api_key_hash, tls_name, region, role, status, ip, port, static_pubkey)
+		 VALUES (gen_random_uuid(), $1, $2, $3, $4, 'inactive', $5, $6, $7)
 		 RETURNING id`,
-		hash, endpoint, region, role,
+		hash, tlsName, region, role, ip, port, staticPubkey,
 	).Scan(&id)
 	if err != nil {
 		return "", "", err
@@ -76,23 +118,49 @@ func ProvisionRelay(ctx context.Context, pool *pgxpool.Pool, salt, endpoint, reg
 	return id, plaintext, nil
 }
 
-func RecordHeartbeat(ctx context.Context, pool *pgxpool.Pool, salt, plaintext string) (string, error) {
+// RecordHeartbeat marks a relay active. The static public key is written only
+// at provisioning time and is immutable (SECURITY_MODEL 7.2). A heartbeat may
+// carry the key; if it differs from the stored one the heartbeat is rejected
+// and nothing is updated. offered may be nil, which skips the comparison.
+//
+// The comparison and the update are one statement so that a heartbeat cannot
+// be admitted on the strength of a key read a moment earlier.
+func RecordHeartbeat(ctx context.Context, pool *pgxpool.Pool, salt, plaintext string, offered []byte) (string, error) {
+	if offered != nil {
+		if err := ValidateStaticKey(offered); err != nil {
+			return "", err
+		}
+	}
 	hash := hashAPIKey(salt, plaintext)
 	var id string
 	err := pool.QueryRow(ctx,
 		`UPDATE relay_nodes
 		 SET status = 'active', last_heartbeat = NOW()
 		 WHERE api_key_hash = $1
+		   AND ($2::bytea IS NULL OR static_pubkey = $2)
 		 RETURNING id`,
-		hash,
+		hash, offered,
 	).Scan(&id)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return "", ErrUnknownRelay
-		}
+	if err == nil {
+		return id, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
 		return "", err
 	}
-	return id, nil
+	// No row changed. Separate an unknown relay from a key mismatch so the
+	// caller can log the relay id. This read cannot re-admit the heartbeat.
+	var knownID string
+	var stored []byte
+	lookupErr := pool.QueryRow(ctx,
+		`SELECT id, static_pubkey FROM relay_nodes WHERE api_key_hash = $1`, hash,
+	).Scan(&knownID, &stored)
+	if lookupErr != nil {
+		return "", ErrUnknownRelay
+	}
+	if offered != nil && !bytes.Equal(offered, stored) {
+		return knownID, ErrStaticKeyMismatch
+	}
+	return "", ErrUnknownRelay
 }
 
 func scanRelays(ctx context.Context, pool *pgxpool.Pool, sql string, args ...any) ([]Relay, error) {
@@ -104,7 +172,7 @@ func scanRelays(ctx context.Context, pool *pgxpool.Pool, sql string, args ...any
 	var out []Relay
 	for rows.Next() {
 		var r Relay
-		if err := rows.Scan(&r.ID, &r.Endpoint, &r.Region, &r.Role, &r.Status, &r.LastHeartbeat); err != nil {
+		if err := scanRelay(rows, &r); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -117,7 +185,7 @@ func scanRelays(ctx context.Context, pool *pgxpool.Pool, sql string, args ...any
 
 func GetActiveRelays(ctx context.Context, pool *pgxpool.Pool) ([]Relay, error) {
 	return scanRelays(ctx, pool,
-		`SELECT id, endpoint, region, role, status, last_heartbeat
+		`SELECT `+relayColumns+`
 		 FROM relay_nodes
 		 WHERE status = 'active'
 		 ORDER BY created_at`)
@@ -145,8 +213,8 @@ func PickRandomActiveByRole(ctx context.Context, pool *pgxpool.Pool, role string
 		excludeIDs = []string{}
 	}
 	r := &Relay{}
-	err := pool.QueryRow(ctx,
-		`SELECT id, endpoint, region, role, status, last_heartbeat
+	row := pool.QueryRow(ctx,
+		`SELECT `+relayColumns+`
 		 FROM relay_nodes
 		 WHERE role = $1
 		   AND status = 'active'
@@ -154,8 +222,8 @@ func PickRandomActiveByRole(ctx context.Context, pool *pgxpool.Pool, role string
 		 ORDER BY random()
 		 LIMIT 1`,
 		role, excludeIDs,
-	).Scan(&r.ID, &r.Endpoint, &r.Region, &r.Role, &r.Status, &r.LastHeartbeat)
-	if err != nil {
+	)
+	if err := scanRelay(row, r); err != nil {
 		return nil, err
 	}
 	return r, nil

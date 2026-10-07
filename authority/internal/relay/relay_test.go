@@ -1,7 +1,9 @@
 package relay
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -99,7 +101,7 @@ func TestProvisionAndSweep(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 
-	id, plaintext, err := ProvisionRelay(ctx, pool, "test-salt-1234567890", "10.0.0.50:9001", "us-east", "guard")
+	id, plaintext, err := ProvisionRelay(ctx, pool, "test-salt-1234567890", "node.test", "us-east", "guard", "10.0.0.50", 9001, testPubkey())
 	if err != nil {
 		t.Fatalf("ProvisionRelay: %v", err)
 	}
@@ -108,7 +110,7 @@ func TestProvisionAndSweep(t *testing.T) {
 		t.Errorf("plaintext key not 64-char hex: %q", plaintext)
 	}
 
-	gotID, err := RecordHeartbeat(ctx, pool, "test-salt-1234567890", plaintext)
+	gotID, err := RecordHeartbeat(ctx, pool, "test-salt-1234567890", plaintext, nil)
 	if err != nil {
 		t.Fatalf("RecordHeartbeat: %v", err)
 	}
@@ -116,7 +118,7 @@ func TestProvisionAndSweep(t *testing.T) {
 		t.Errorf("heartbeat returned id %q want %q", gotID, id)
 	}
 
-	if _, err := RecordHeartbeat(ctx, pool, "test-salt-1234567890", "wrong-key"); err == nil {
+	if _, err := RecordHeartbeat(ctx, pool, "test-salt-1234567890", "wrong-key", nil); err == nil {
 		t.Errorf("expected unknown relay error for bad key")
 	}
 
@@ -164,8 +166,8 @@ func TestSweepFloorsSubSecondTTL(t *testing.T) {
 
 	var id string
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO relay_nodes (id, api_key_hash, endpoint, region, role, status, last_heartbeat)
-		 VALUES (gen_random_uuid(), $1, '10.0.0.77:9001', 'us-east', 'guard', 'active', NOW())
+		`INSERT INTO relay_nodes (id, api_key_hash, tls_name, region, role, status, last_heartbeat, ip, port, static_pubkey)
+		 VALUES (gen_random_uuid(), $1, 'floor.test', 'us-east', 'guard', 'active', NOW(), '10.0.0.77', 9001, decode(repeat('ab', 32), 'hex'))
 		 RETURNING id`,
 		"test-hash-floor-"+time.Now().Format("150405.000000"),
 	).Scan(&id); err != nil {
@@ -195,8 +197,8 @@ func TestPickRandomActiveByRoleExcludesIDs(t *testing.T) {
 	seedActiveGuard := func(tag string) string {
 		var id string
 		if err := pool.QueryRow(ctx,
-			`INSERT INTO relay_nodes (id, api_key_hash, endpoint, region, role, status, last_heartbeat)
-			 VALUES (gen_random_uuid(), $1, '10.0.0.99:9001', 'us-east', 'guard', 'active', NOW())
+			`INSERT INTO relay_nodes (id, api_key_hash, tls_name, region, role, status, last_heartbeat, ip, port, static_pubkey)
+			 VALUES (gen_random_uuid(), $1, 'exclude.test', 'us-east', 'guard', 'active', NOW(), '10.0.0.99', 9001, decode(repeat('ab', 32), 'hex'))
 			 RETURNING id`,
 			"test-hash-exclude-"+tag+"-"+time.Now().Format("150405.000000"),
 		).Scan(&id); err != nil {
@@ -247,8 +249,104 @@ func TestPickRandomActiveByRoleExcludesIDs(t *testing.T) {
 
 func TestProvisionRejectsInvalidRole(t *testing.T) {
 	// No DB needed: the role check happens before any query.
-	_, _, err := ProvisionRelay(context.Background(), nil, "salt", "endpoint", "region", "admin")
+	_, _, err := ProvisionRelay(context.Background(), nil, "salt", "node.test", "region", "admin", "10.0.0.1", 443, testPubkey())
 	if err != ErrInvalidRole {
 		t.Errorf("expected ErrInvalidRole, got %v", err)
+	}
+}
+
+// testPubkey returns a fixed 32-byte static public key. Public key material, so
+// a constant is safe. No test in this package generates or writes a private key.
+func testPubkey() []byte {
+	key := make([]byte, StaticKeyLen)
+	for i := range key {
+		key[i] = 0xAB
+	}
+	return key
+}
+
+// TestHeartbeatPinsStaticKey covers the three ways a heartbeat can present a
+// static public key: matching, mismatched and absent. SECURITY_MODEL 7.2 makes
+// the key immutable after provisioning, so a mismatch must change nothing.
+func TestHeartbeatPinsStaticKey(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	const salt = "test-salt-pinning-00"
+
+	id, plaintext, err := ProvisionRelay(ctx, pool, salt, "pin.test", "us-east", "guard", "10.0.0.60", 9001, testPubkey())
+	if err != nil {
+		t.Fatalf("ProvisionRelay: %v", err)
+	}
+	cleanupRow(t, pool, deleteRelayByID, id)
+
+	// Matching key: accepted, relay becomes active.
+	gotID, err := RecordHeartbeat(ctx, pool, salt, plaintext, testPubkey())
+	if err != nil {
+		t.Fatalf("matching key rejected: %v", err)
+	}
+	if gotID != id {
+		t.Errorf("matching key returned id %q, want %q", gotID, id)
+	}
+	if got := relayStatus(t, pool, id); got != "active" {
+		t.Fatalf("after a matching heartbeat status = %q, want active", got)
+	}
+
+	// Park it inactive so a rejected heartbeat has something to fail to change.
+	if _, err := pool.Exec(ctx, `UPDATE relay_nodes SET status = 'inactive' WHERE id = $1`, id); err != nil {
+		t.Fatalf("park inactive: %v", err)
+	}
+
+	// Mismatched key: rejected, nothing updated, the id comes back for logging.
+	wrong := testPubkey()
+	wrong[0] ^= 0xFF
+	mismatchID, err := RecordHeartbeat(ctx, pool, salt, plaintext, wrong)
+	if !errors.Is(err, ErrStaticKeyMismatch) {
+		t.Fatalf("mismatched key: err = %v, want ErrStaticKeyMismatch", err)
+	}
+	if mismatchID != id {
+		t.Errorf("mismatch returned id %q, want %q for the log line", mismatchID, id)
+	}
+	if got := relayStatus(t, pool, id); got != "inactive" {
+		t.Errorf("a rejected heartbeat marked the relay %q, want it left inactive", got)
+	}
+
+	// The stored key is untouched.
+	var stored []byte
+	if err := pool.QueryRow(ctx, `SELECT static_pubkey FROM relay_nodes WHERE id = $1`, id).Scan(&stored); err != nil {
+		t.Fatalf("read back stored key: %v", err)
+	}
+	if !bytes.Equal(stored, testPubkey()) {
+		t.Error("a rejected heartbeat changed the stored static public key")
+	}
+
+	// Absent key: accepted, because the field is optional.
+	if _, err := RecordHeartbeat(ctx, pool, salt, plaintext, nil); err != nil {
+		t.Fatalf("absent key rejected: %v", err)
+	}
+	if got := relayStatus(t, pool, id); got != "active" {
+		t.Errorf("after a keyless heartbeat status = %q, want active", got)
+	}
+}
+
+func TestHeartbeatRejectsWrongLengthKey(t *testing.T) {
+	// No DB needed: the length check runs before any query.
+	_, err := RecordHeartbeat(context.Background(), nil, "salt", "key", []byte{1, 2, 3})
+	if !errors.Is(err, ErrInvalidStaticKey) {
+		t.Errorf("err = %v, want ErrInvalidStaticKey", err)
+	}
+}
+
+func TestProvisionRejectsBadKeyAndAddress(t *testing.T) {
+	ctx := context.Background()
+	if _, _, err := ProvisionRelay(ctx, nil, "salt", "n.test", "r", "guard", "10.0.0.1", 443, []byte{1}); !errors.Is(err, ErrInvalidStaticKey) {
+		t.Errorf("short key: err = %v, want ErrInvalidStaticKey", err)
+	}
+	if _, _, err := ProvisionRelay(ctx, nil, "salt", "n.test", "r", "guard", "not-an-ip", 443, testPubkey()); !errors.Is(err, ErrInvalidAddress) {
+		t.Errorf("bad ip: err = %v, want ErrInvalidAddress", err)
+	}
+	for _, port := range []int{0, 65536} {
+		if _, _, err := ProvisionRelay(ctx, nil, "salt", "n.test", "r", "guard", "10.0.0.1", port, testPubkey()); !errors.Is(err, ErrInvalidAddress) {
+			t.Errorf("port %d: err = %v, want ErrInvalidAddress", port, err)
+		}
 	}
 }

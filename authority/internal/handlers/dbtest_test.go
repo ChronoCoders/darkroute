@@ -121,11 +121,11 @@ func seedActiveRelay(t *testing.T, pool *pgxpool.Pool, role, tag string) string 
 	t.Helper()
 	var id string
 	if err := pool.QueryRow(context.Background(),
-		`INSERT INTO relay_nodes (id, api_key_hash, endpoint, region, role, status, last_heartbeat)
-		 VALUES (gen_random_uuid(), $1, $2, 'us-east', $3, 'active', NOW())
+		`INSERT INTO relay_nodes (id, api_key_hash, tls_name, region, role, status, last_heartbeat, ip, port, static_pubkey)
+		 VALUES (gen_random_uuid(), $1, $2, 'us-east', $3, 'active', NOW(), '10.0.0.50', 9001, $4)
 		 RETURNING id`,
 		"test-hash-"+tag+"-"+role+"-"+time.Now().Format("150405.000000"),
-		"10.0.0.50:9001", role,
+		"node.test", role, testStaticPubkey(),
 	).Scan(&id); err != nil {
 		t.Fatalf("seed %s relay: %v", role, err)
 	}
@@ -156,4 +156,15 @@ func requireNoActiveRelays(t *testing.T, pool *pgxpool.Pool, role string) {
 			"observe the no-eligible-relay path. Another package or a previous run left "+
 			"rows behind.", n, role)
 	}
+}
+
+// testStaticPubkey returns a fixed 32-byte value for the static_pubkey column.
+// It is public key material, so a constant is safe here; no private key is
+// generated, written or logged by any test in this package.
+func testStaticPubkey() []byte {
+	key := make([]byte, 32)
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	return key
 }

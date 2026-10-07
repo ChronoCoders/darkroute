@@ -1,8 +1,10 @@
 package handlers
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"strings"
@@ -59,7 +61,30 @@ func (h *RelayHandler) HandleRelayHeartbeat(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	key := strings.TrimPrefix(authHeader, "Bearer ")
-	if _, err := relay.RecordHeartbeat(r.Context(), h.pool, h.salt, key); err != nil {
+
+	// The body is optional. When it carries a static public key the authority
+	// compares it with the provisioned one and rejects a mismatch without
+	// updating anything (SECURITY_MODEL 7.2).
+	var offered []byte
+	var body heartbeatRequest
+	if err := json.NewDecoder(r.Body).Decode(&body); err == nil && body.StaticPubkey != "" {
+		decoded, decodeErr := hex.DecodeString(body.StaticPubkey)
+		if decodeErr != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_static_pubkey"})
+			return
+		}
+		offered = decoded
+	}
+
+	id, err := relay.RecordHeartbeat(r.Context(), h.pool, h.salt, key, offered)
+	if err != nil {
+		if errors.Is(err, relay.ErrStaticKeyMismatch) {
+			// The relay id identifies which node to investigate. The key
+			// bytes are deliberately not logged.
+			slog.Warn("relay heartbeat rejected: static public key does not match the provisioned one", "relay_id", id)
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "static_pubkey_mismatch"})
+			return
+		}
 		// Same response for unknown relay and infrastructure failures.
 		// Do not leak which check failed.
 		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
@@ -68,10 +93,17 @@ func (h *RelayHandler) HandleRelayHeartbeat(w http.ResponseWriter, r *http.Reque
 	w.WriteHeader(http.StatusNoContent)
 }
 
+type heartbeatRequest struct {
+	StaticPubkey string `json:"static_pubkey"`
+}
+
 type provisionRelayRequest struct {
-	Endpoint string `json:"endpoint"`
-	Region   string `json:"region"`
-	Role     string `json:"role"`
+	TLSName      string `json:"tls_name"`
+	IP           string `json:"ip"`
+	Port         int    `json:"port"`
+	Region       string `json:"region"`
+	Role         string `json:"role"`
+	StaticPubkey string `json:"static_pubkey"`
 }
 
 func (h *RelayHandler) HandleProvisionRelay(w http.ResponseWriter, r *http.Request) {
@@ -80,17 +112,27 @@ func (h *RelayHandler) HandleProvisionRelay(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
 		return
 	}
-	if req.Endpoint == "" || req.Region == "" {
+	if req.TLSName == "" || req.Region == "" || req.IP == "" || req.StaticPubkey == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_fields"})
 		return
 	}
-	id, plaintext, err := relay.ProvisionRelay(r.Context(), h.pool, h.salt, req.Endpoint, req.Region, req.Role)
+	pubkey, err := hex.DecodeString(req.StaticPubkey)
 	if err != nil {
-		if errors.Is(err, relay.ErrInvalidRole) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_static_pubkey"})
+		return
+	}
+	id, plaintext, err := relay.ProvisionRelay(r.Context(), h.pool, h.salt, req.TLSName, req.Region, req.Role, req.IP, req.Port, pubkey)
+	if err != nil {
+		switch {
+		case errors.Is(err, relay.ErrInvalidRole):
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_role"})
-			return
+		case errors.Is(err, relay.ErrInvalidStaticKey):
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_static_pubkey"})
+		case errors.Is(err, relay.ErrInvalidAddress):
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_address"})
+		default:
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		}
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
 	// Plaintext API key is returned exactly once. The hash-only store ensures
