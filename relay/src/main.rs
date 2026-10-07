@@ -214,7 +214,12 @@ async fn main() -> ExitCode {
     };
 
     let shutdown = Arc::new(Notify::new());
-    let hb_handle = heartbeat::spawn(cfg.clone(), heartbeat_client, shutdown.clone());
+    let hb_handle = heartbeat::spawn(
+        cfg.clone(),
+        heartbeat_client,
+        heartbeat::pubkey_hex(&static_key.public),
+        shutdown.clone(),
+    );
 
     let accept_handle = tokio::spawn(accept_loop(
         relay_listener,
@@ -611,19 +616,17 @@ async fn run_circuit_io(
     let mut next_link: Option<NextLinkState> = None;
     let mut dest_link: Option<TcpStream> = None;
 
-    let in_len = inbound_len(role);
     let layers = inbound_layers(role);
     let out_len = outbound_len(role);
+    // Cancel safe: FrameReader keeps any partial frame across a select branch
+    // that loses the race. read_exact would drop those bytes and every later
+    // read would start mid-cell.
+    let mut inbound = layer::FrameReader::new(&mut *sock_read, inbound_len(role));
 
     loop {
         tokio::select! {
             biased;
-            res = async {
-                let mut buf = vec![0u8; in_len];
-                tokio::time::timeout(CELL_READ_TIMEOUT, sock_read.read_exact(&mut buf))
-                    .await
-                    .map(|r| r.map(|_| buf))
-            } => {
+            res = tokio::time::timeout(CELL_READ_TIMEOUT, inbound.next_frame()) => {
                 let wire = match res {
                     Ok(Ok(b)) => b,
                     Ok(Err(e)) => return Err(HandleError::Io(e)),
@@ -644,9 +647,17 @@ async fn run_circuit_io(
                                 return Err(HandleError::IllegalCellForRole(CellType::Extend, role));
                             }
                             let extend = ExtendForward::decode(&cell.payload)?;
-                            let nl =
-                                open_next_link(&extend, &ctx.pool, &ctx.cfg, &ctx.connector)
-                                    .await?;
+                            let out = out_len.ok_or(
+                                HandleError::IllegalCellForRole(CellType::Extend, role),
+                            )?;
+                            let nl = open_next_link(
+                                &extend,
+                                &ctx.pool,
+                                &ctx.cfg,
+                                &ctx.connector,
+                                out,
+                            )
+                            .await?;
                             let reply = Cell::new(
                                 CellType::Extend,
                                 cell::extend_backward_payload(&nl.noise_msg2),
@@ -701,10 +712,9 @@ async fn run_circuit_io(
                                 // The inner CLOSE_REQUESTs ran before this
                                 // outer one, so the next-hop link is back
                                 // in "waiting for CIRCUIT_START" state and
-                                // safe to reuse.
-                                let addr = nl.addr;
-                                let stream = nl.read.unsplit(nl.write);
-                                ctx.pool.release(addr, PooledConn::new(stream));
+                                // safe to reuse, provided its reader holds
+                                // nothing belonging to this circuit.
+                                release_or_discard(&ctx.pool, nl.addr, nl.read, nl.write);
                             }
                             drop(dest_link.take());
                             return Ok(());
@@ -720,18 +730,15 @@ async fn run_circuit_io(
             }
 
             res = async {
-                match (next_link.as_mut(), out_len) {
-                    (Some(nl), Some(n)) => {
-                        let mut buf = vec![0u8; n];
-                        nl.read.read_exact(&mut buf).await.map(|_| buf)
-                    }
-                    _ => std::future::pending().await,
+                match next_link.as_mut() {
+                    Some(nl) => nl.read.next_frame().await,
+                    None => std::future::pending().await,
                 }
             } => {
                 let blob = res?;
                 // Wrap the next hop's cell in this relay's own layer. No RELAY
                 // cell and no header: the client peels until it reaches TO_ME.
-                let framed = layer::seal_forward(transport, &blob)?;
+                let framed = layer::seal_forward(transport, &blob, layers)?;
                 sock_write.write_all(&framed).await?;
                 sock_write.flush().await?;
             }
@@ -766,8 +773,36 @@ async fn run_circuit_io(
     }
 }
 
+/// Hand a finished next link back to the pool, or drop it.
+///
+/// A reader still holding a partial frame holds bytes that belong to the
+/// circuit just closing. Pooling that stream would surface them as a corrupt
+/// frame for whichever circuit acquires it next, so it is discarded instead.
+/// Losing a pooled connection costs one TLS handshake; pooling a dirty one
+/// breaks the next circuit.
+fn release_or_discard<S>(
+    pool: &ConnectionPool<S>,
+    addr: SocketAddr,
+    read: layer::FrameReader<ReadHalf<S>>,
+    write: WriteHalf<S>,
+) where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let pending = read.pending();
+    if pending != 0 {
+        warn!(
+            peer = %addr,
+            pending,
+            "discarding a next-hop link rather than pooling it: its reader holds a partial frame"
+        );
+        return;
+    }
+    let stream = read.into_inner().unsplit(write);
+    pool.release(addr, PooledConn::new(stream));
+}
+
 struct NextLinkState {
-    read: ReadHalf<OutboundStream>,
+    read: layer::FrameReader<ReadHalf<OutboundStream>>,
     write: WriteHalf<OutboundStream>,
     noise_msg2: [u8; NOISE_MSG_LEN],
     addr: SocketAddr,
@@ -787,6 +822,7 @@ async fn open_next_link(
     pool: &ConnectionPool<OutboundStream>,
     cfg: &RelayConfig,
     connector: &TlsConnector,
+    frame_len: usize,
 ) -> Result<NextLinkState, HandleError> {
     let stream: OutboundStream = match pool.acquire(&extend.next_hop) {
         Some(PooledConn { stream, .. }) => stream,
@@ -811,7 +847,7 @@ async fn open_next_link(
         Err(_) => return Err(HandleError::Timeout),
     }
     Ok(NextLinkState {
-        read,
+        read: layer::FrameReader::new(read, frame_len),
         write,
         noise_msg2,
         addr: extend.next_hop,
@@ -907,6 +943,74 @@ async fn metrics_accept_loop(listener: TcpListener, shutdown: Arc<Notify>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A clean reader gives its stream back to the pool.
+    ///
+    /// This is the positive half of the pooling decision: without it, a test
+    /// that only checks the discard path would pass even if nothing were ever
+    /// pooled.
+    #[tokio::test]
+    async fn clean_next_link_is_returned_to_the_pool() {
+        let pool: ConnectionPool<tokio::io::DuplexStream> = ConnectionPool::new();
+        let addr: SocketAddr = "127.0.0.1:9001".parse().expect("addr");
+        let (near, mut far) = tokio::io::duplex(256);
+
+        const FRAME: usize = 8;
+        far.write_all(&[5u8; FRAME]).await.expect("write a frame");
+        far.flush().await.expect("flush");
+
+        let (read, write) = tokio::io::split(near);
+        let mut reader = layer::FrameReader::new(read, FRAME);
+        let frame = reader.next_frame().await.expect("frame");
+        assert_eq!(frame.len(), FRAME);
+        assert_eq!(reader.pending(), 0, "nothing should be left over");
+
+        release_or_discard(&pool, addr, reader, write);
+        assert_eq!(pool.len(), 1, "a clean link must be pooled");
+        assert!(
+            pool.acquire(&addr).is_some(),
+            "and must be acquirable again"
+        );
+    }
+
+    /// A reader holding a partial frame must not be pooled. Those bytes belong
+    /// to the circuit that is closing and would corrupt the next one's framing.
+    #[tokio::test]
+    async fn next_link_holding_a_partial_frame_is_discarded() {
+        let pool: ConnectionPool<tokio::io::DuplexStream> = ConnectionPool::new();
+        let addr: SocketAddr = "127.0.0.1:9002".parse().expect("addr");
+        let (near, mut far) = tokio::io::duplex(256);
+
+        const FRAME: usize = 8;
+        // Three bytes of a frame, and a competing branch that is ready at once,
+        // so next_frame is cancelled with a partial frame retained.
+        far.write_all(&[1, 2, 3])
+            .await
+            .expect("write a partial frame");
+        far.flush().await.expect("flush");
+
+        let (read, write) = tokio::io::split(near);
+        let mut reader = layer::FrameReader::new(read, FRAME);
+        let (other_tx, mut other_rx) = tokio::io::duplex(8);
+        drop(other_tx);
+        let mut obuf = [0u8; 1];
+        // biased so next_frame is polled first and takes the three bytes
+        // before the other branch wins. Unbiased, the runtime may never poll
+        // it and the retained-partial assertion would pass vacuously.
+        tokio::select! {
+            biased;
+            r = reader.next_frame() => panic!("a frame appeared from three bytes: {r:?}"),
+            _ = other_rx.read(&mut obuf) => {}
+        }
+        assert_eq!(reader.pending(), 3, "the partial frame must be retained");
+
+        release_or_discard(&pool, addr, reader, write);
+        assert!(
+            pool.is_empty(),
+            "a link whose reader holds {} buffered bytes must be discarded, not pooled",
+            3
+        );
+    }
 
     #[test]
     fn redact_proxy_url_strips_userinfo() {

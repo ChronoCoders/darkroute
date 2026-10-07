@@ -7,3 +7,10 @@ license.workspace = true
 [dependencies]
 thiserror = { workspace = true }
 snow = { workspace = true }
+# FrameReader owns a read half and fills it with read(), the cancel-safe
+# primitive, so this crate needs tokio's io traits. io-util only.
+tokio = { workspace = true }
+
+[dev-dependencies]
+# The cancellation tests need a runtime and timers on top of the io traits.
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "time"] }

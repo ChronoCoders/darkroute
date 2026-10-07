@@ -19,7 +19,7 @@ use quiethop_crypto::cell::{
     link_cell_len, parse_extend_backward, Cell, CellType, ConnectPayload, ExtendForward,
     CELL_PAYLOAD_LEN,
 };
-use quiethop_crypto::layer::{peel, seal_forward, seal_to_me, Peeled};
+use quiethop_crypto::layer::{peel, seal_forward, seal_to_me, FrameReader, Peeled};
 use quiethop_crypto::noise::{Initiator, Transport, NOISE_MSG_LEN};
 use quiethop_crypto::wire::PROTO_CLIENT;
 
@@ -51,8 +51,8 @@ impl Layers {
     /// Seal a cell for the exit and wrap it for the middle and the guard.
     fn seal_for_exit(&mut self, cell: &Cell) -> Result<Vec<u8>, ClientError> {
         let inner = seal_to_me(&mut self.exit, cell, 1)?;
-        let mid = seal_forward(&mut self.middle, &inner)?;
-        Ok(seal_forward(&mut self.guard, &mid)?)
+        let mid = seal_forward(&mut self.middle, &inner, CLIENT_LAYERS - 1)?;
+        Ok(seal_forward(&mut self.guard, &mid, CLIENT_LAYERS)?)
     }
 
     /// Peel every layer off an inbound frame until a cell appears.
@@ -146,7 +146,7 @@ async fn extend_hop(
         None => (seal_to_me(guard, &cell, CLIENT_LAYERS)?, None),
         Some(mid) => {
             let inner = seal_to_me(mid, &cell, CLIENT_LAYERS - 1)?;
-            (seal_forward(guard, &inner)?, Some(mid))
+            (seal_forward(guard, &inner, CLIENT_LAYERS)?, Some(mid))
         }
     };
     tls.write_all(&wire).await?;
@@ -181,9 +181,12 @@ async fn circuit_task(
     mut layers: Layers,
     internal: tokio::io::DuplexStream,
 ) {
-    let (mut tls_read, mut tls_write) = tokio::io::split(tls);
+    let (tls_read, mut tls_write) = tokio::io::split(tls);
     let (mut from_user, mut to_user) = tokio::io::split(internal);
-    let frame_len = link_cell_len(CLIENT_LAYERS);
+    // Cancel safe: FrameReader keeps any partial frame when the user-write
+    // branch wins the race. read_exact would drop those bytes and leave every
+    // later read starting mid-cell.
+    let mut inbound = FrameReader::new(tls_read, link_cell_len(CLIENT_LAYERS));
     let mut user_buf = vec![0u8; USER_READ_BUF];
 
     loop {
@@ -216,10 +219,7 @@ async fn circuit_task(
                 }
             }
 
-            res = async {
-                let mut frame = vec![0u8; frame_len];
-                tls_read.read_exact(&mut frame).await.map(|_| frame)
-            } => {
+            res = inbound.next_frame() => {
                 let frame = match res {
                     Ok(f) => f,
                     Err(_) => break,

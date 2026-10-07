@@ -322,10 +322,15 @@ impl MockClient {
         };
         // Wrap once per hop nearer the client.
         if depth >= 3 {
-            buf = seal_forward(self.middle.as_mut().expect("middle"), &buf).expect("wrap middle");
+            buf = seal_forward(
+                self.middle.as_mut().expect("middle"),
+                &buf,
+                CLIENT_LAYERS - 1,
+            )
+            .expect("wrap middle");
         }
         if depth >= 2 {
-            buf = seal_forward(&mut self.guard, &buf).expect("wrap guard");
+            buf = seal_forward(&mut self.guard, &buf, CLIENT_LAYERS).expect("wrap guard");
         }
         buf
     }
@@ -777,6 +782,218 @@ async fn run_data_test() {
         .expect("no DATA came back");
     assert_eq!(back.cell_type, CellType::Data);
     assert_eq!(back.payload, payload, "echo did not round trip");
+}
+
+/// A TCP proxy that forwards both directions in 1 to 7 byte writes, yielding
+/// between each one.
+///
+/// This is the condition that exposes a cancellation-unsafe read. TLS sits on
+/// top, so plaintext reads come back in small pieces and a cell is almost never
+/// delivered in one read. If a select branch holds partial bytes in a buffer it
+/// then drops, framing shifts and the next cell fails authentication.
+async fn run_chunking_proxy(listener: TcpListener, target: SocketAddr) {
+    loop {
+        let Ok((inbound, _)) = listener.accept().await else {
+            return;
+        };
+        tokio::spawn(async move {
+            let Ok(outbound) = TcpStream::connect(target).await else {
+                return;
+            };
+            let (ci, co) = tokio::io::split(inbound);
+            let (si, so) = tokio::io::split(outbound);
+            tokio::spawn(dribble(ci, so));
+            tokio::spawn(dribble(si, co));
+        });
+    }
+}
+
+async fn dribble<R, W>(mut r: R, mut w: W)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    let mut buf = vec![0u8; 8192];
+    let mut chunk = 1usize;
+    loop {
+        let n = match r.read(&mut buf).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        let mut off = 0;
+        while off < n {
+            let take = chunk.min(n - off);
+            if w.write_all(&buf[off..off + take]).await.is_err() {
+                return;
+            }
+            if w.flush().await.is_err() {
+                return;
+            }
+            off += take;
+            chunk = if chunk == 7 { 1 } else { chunk + 1 };
+            tokio::task::yield_now().await;
+        }
+    }
+    let _ = w.shutdown().await;
+}
+
+async fn spawn_chunking_proxy(target: SocketAddr) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("proxy bind");
+    let addr = listener.local_addr().expect("proxy addr");
+    tokio::spawn(run_chunking_proxy(listener, target));
+    addr
+}
+
+/// Robustness under adverse byte delivery. Not regression evidence for the
+/// cancellation-safety bug.
+///
+/// Every link sits behind a proxy that forwards in 1 to 7 byte writes, and
+/// traffic runs in both directions at once. The circuit must carry every byte
+/// intact regardless.
+///
+/// This does not exercise the cancellation-safety defect and passed on 328cbbd
+/// with all three select loops still using read_exact. The chunking happens
+/// below TLS, and rustls hands up whole records, so a cell written as one
+/// record arrives as one plaintext read. The regression evidence for that bug
+/// is the pair of deterministic tests in quiethop-crypto's layer module.
+#[tokio::test]
+async fn circuit_carries_traffic_under_adverse_byte_delivery() {
+    tokio::time::timeout(TEST_TIMEOUT, run_adverse_delivery_test())
+        .await
+        .expect("test timed out");
+}
+
+async fn run_adverse_delivery_test() {
+    ensure_crypto_provider();
+
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.expect("echo bind");
+    let echo_addr = echo_listener.local_addr().expect("echo addr");
+    tokio::spawn(run_echo_server(echo_listener));
+
+    let socks_listener = TcpListener::bind("127.0.0.1:0").await.expect("socks bind");
+    let socks_addr = socks_listener.local_addr().expect("socks addr");
+    tokio::spawn(run_socks5_stub(socks_listener, echo_addr));
+
+    let keydir = tempfile::tempdir().expect("keydir");
+    let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+    let pki = make_pki();
+    let server_config = make_server_config(&pki);
+    let connector = Arc::new(make_connector(&pki));
+    let over = RelayOverride {
+        decodo_proxy_url: Some(format!("socks5://user:pass@{socks_addr}")),
+        allowed_exit_ports: vec![echo_addr.port()],
+    };
+
+    // Each hop reaches the next through a chunking proxy, so all three links
+    // deliver partial cells: client to guard, guard to middle, middle to exit.
+    let exit = spawn_relay(
+        Role::Exit,
+        &auth_priv,
+        &over,
+        HashMap::new(),
+        server_config.clone(),
+        connector.clone(),
+        keydir.path(),
+    )
+    .await;
+    let exit_via = spawn_chunking_proxy(exit.addr).await;
+
+    let middle = spawn_relay(
+        Role::Middle,
+        &auth_priv,
+        &over,
+        std::iter::once((exit_via, TEST_HOSTNAME.to_string())).collect(),
+        server_config.clone(),
+        connector.clone(),
+        keydir.path(),
+    )
+    .await;
+    let middle_via = spawn_chunking_proxy(middle.addr).await;
+
+    let guard = spawn_relay(
+        Role::Guard,
+        &auth_priv,
+        &over,
+        std::iter::once((middle_via, TEST_HOSTNAME.to_string())).collect(),
+        server_config,
+        connector.clone(),
+        keydir.path(),
+    )
+    .await;
+    let guard_via = spawn_chunking_proxy(guard.addr).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Dial the guard through its proxy, still pinning the guard's real key.
+    let guard_hop = SpawnedRelay {
+        addr: guard_via,
+        static_pubkey: guard.static_pubkey,
+    };
+    let mut client = MockClient::connect(&connector, &guard_hop, &auth_priv).await;
+    client
+        .extend_to(&SpawnedRelay {
+            addr: middle_via,
+            static_pubkey: middle.static_pubkey,
+        })
+        .await;
+    client
+        .extend_to(&SpawnedRelay {
+            addr: exit_via,
+            static_pubkey: exit.static_pubkey,
+        })
+        .await;
+
+    let connect = ConnectPayload {
+        host: echo_addr.ip().to_string(),
+        port: echo_addr.port(),
+    };
+    let cell = Cell::new(CellType::Connect, connect.encode().expect("encode")).expect("cell");
+    client.send_to_deepest(&cell).await;
+
+    // Bidirectional pressure: write the next cell before reading the previous
+    // echo, so the inbound branch and the destination branch are both hot while
+    // partial cells are in flight.
+    let payloads: Vec<Vec<u8>> = (0..6u8)
+        .map(|i| {
+            let n = 1 + (i as usize) * 97;
+            vec![0xB0 | i; n.min(CELL_PAYLOAD_LEN)]
+        })
+        .collect();
+
+    for p in &payloads {
+        let data = Cell::new(CellType::Data, p.clone()).expect("data cell");
+        client.send_to_deepest(&data).await;
+    }
+
+    // Collect the echoed bytes. The exit splits a destination read across
+    // cells, so compare the concatenation rather than cell boundaries.
+    let expected: Vec<u8> = payloads.iter().flatten().copied().collect();
+    let mut seen: Vec<u8> = Vec::new();
+    while seen.len() < expected.len() {
+        let back = tokio::time::timeout(Duration::from_secs(60), client.read_cell())
+            .await
+            .expect("no DATA came back before the deadline");
+        assert_eq!(
+            back.cell_type,
+            CellType::Data,
+            "circuit tore down mid-stream"
+        );
+        seen.extend_from_slice(&back.payload);
+    }
+    assert_eq!(
+        seen,
+        expected,
+        "echoed bytes did not survive partial reads: got {} of {} bytes",
+        seen.len(),
+        expected.len()
+    );
+
+    for (i, n) in client.observed.iter().enumerate() {
+        assert_eq!(
+            *n,
+            link_cell_len(CLIENT_LAYERS),
+            "frame {i} on the client-guard link was {n} bytes"
+        );
+    }
 }
 
 /// Minimal SOCKS5 stub: accepts no-auth and username/password, then connects to

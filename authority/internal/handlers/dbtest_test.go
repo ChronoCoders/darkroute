@@ -5,7 +5,9 @@ import (
 	"testing"
 	"time"
 
+	"encoding/hex"
 	"github.com/ChronoCoders/quiethop/authority/internal/dbtest"
+	"github.com/ChronoCoders/quiethop/authority/internal/relay"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -167,4 +169,39 @@ func testStaticPubkey() []byte {
 		key[i] = byte(i + 1)
 	}
 	return key
+}
+
+func reqCtx() context.Context {
+	return context.Background()
+}
+
+func hexOf(b []byte) string {
+	return hex.EncodeToString(b)
+}
+
+// provisionForTest creates a relay with a known static public key and returns
+// its id and plaintext API key. The key is public material, so a fixed value
+// is safe; no private key is generated or written by any test here.
+func provisionForTest(t *testing.T, pool *pgxpool.Pool, salt string, pubkey []byte) (string, string) {
+	t.Helper()
+	id, apiKey, err := relay.ProvisionRelay(
+		reqCtx(), pool, salt,
+		"pin.test", "us-east", "guard",
+		"10.0.0.70", 9001, pubkey,
+	)
+	if err != nil {
+		t.Fatalf("ProvisionRelay: %v", err)
+	}
+	cleanupRelay(t, pool, id)
+	return id, apiKey
+}
+
+func relayStatusByID(t *testing.T, pool *pgxpool.Pool, id string) string {
+	t.Helper()
+	var status string
+	if err := pool.QueryRow(reqCtx(),
+		`SELECT status FROM relay_nodes WHERE id = $1`, id).Scan(&status); err != nil {
+		t.Fatalf("read status for %s: %v", id, err)
+	}
+	return status
 }

@@ -1446,6 +1446,7 @@ version = "0.1.0"
 dependencies = [
  "snow",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]

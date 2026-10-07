@@ -16,6 +16,130 @@ use crate::cell::{body_len, link_cell_len, Cell, CellError, CELL_PLAINTEXT_LEN};
 use crate::noise::{NoiseError, Transport, NOISE_TAG_LEN};
 use crate::wire::{DISPOSITION_FORWARD, DISPOSITION_LEN, DISPOSITION_TO_ME};
 
+/// Accumulates fixed-length frames across cancellations.
+///
+/// `AsyncReadExt::read_exact` is not cancel safe: used directly as a
+/// `tokio::select!` branch, bytes already moved into its buffer are lost when
+/// another branch completes first. Under fixed-length framing that shifts every
+/// later read off a cell boundary, so the next frame fails authentication and
+/// the circuit tears down.
+///
+/// `read` is cancel safe, so the caller performs one `read` per select
+/// iteration and hands the bytes here. All partial state lives in this struct,
+/// outside the future that select may drop, so a cancelled branch loses
+/// nothing.
+#[derive(Debug)]
+pub struct FrameAccumulator {
+    frame_len: usize,
+    buf: Vec<u8>,
+}
+
+impl FrameAccumulator {
+    pub fn new(frame_len: usize) -> Self {
+        Self {
+            frame_len,
+            buf: Vec::with_capacity(frame_len),
+        }
+    }
+
+    /// Add freshly read bytes. A single read may carry part of a frame, a whole
+    /// frame, or several, so the caller drains with `next_frame` afterwards.
+    pub fn push(&mut self, bytes: &[u8]) {
+        self.buf.extend_from_slice(bytes);
+    }
+
+    /// Take one complete frame, if one has accumulated.
+    pub fn next_frame(&mut self) -> Option<Vec<u8>> {
+        if self.buf.len() < self.frame_len {
+            return None;
+        }
+        let rest = self.buf.split_off(self.frame_len);
+        Some(std::mem::replace(&mut self.buf, rest))
+    }
+
+    /// Bytes held that do not yet make a frame. Used by tests to show that a
+    /// partial frame survives a cancelled branch.
+    pub fn pending(&self) -> usize {
+        self.buf.len()
+    }
+}
+
+/// A read half plus its partial-frame buffer, yielding only whole frames.
+///
+/// This is the type the relay and the client both use in their `select!`
+/// loops. `next_frame` is cancel safe: its only await point is `read`, which
+/// tokio documents as cancel safe, and every byte already read lives in this
+/// struct rather than in the future, so a dropped branch loses nothing.
+///
+/// Below TLS a partial plaintext read is rare, because rustls hands up whole
+/// records and a cell is normally written as one record. It is not impossible.
+/// In tokio-rustls 0.26.4, the version this workspace locks, `poll_write` ends
+/// with
+///
+/// ```text
+/// return match (pos, would_block) {
+///     (0, true) => Poll::Pending,
+///     (n, true) => Poll::Ready(Ok(n)),
+///     (_, false) => continue,
+/// };
+/// ```
+///
+/// so when the socket would block after some bytes are buffered it returns a
+/// short write. `write_all` then calls `poll_write` again with the remainder,
+/// which enters the rustls writer as a separate plaintext write after the
+/// first part has already been encrypted and emitted. One cell can therefore
+/// span two records, and the reader on the other side sees a partial cell.
+///
+/// Tokio makes no cancel-safety guarantee for `read_exact` in any case, so this
+/// code does not depend on record boundaries.
+#[derive(Debug)]
+pub struct FrameReader<R> {
+    inner: R,
+    acc: FrameAccumulator,
+    scratch: Vec<u8>,
+}
+
+impl<R: tokio::io::AsyncRead + Unpin> FrameReader<R> {
+    pub fn new(inner: R, frame_len: usize) -> Self {
+        Self {
+            inner,
+            acc: FrameAccumulator::new(frame_len),
+            scratch: vec![0u8; frame_len],
+        }
+    }
+
+    /// Yield the next whole frame. Safe to use as a `tokio::select!` branch.
+    pub async fn next_frame(&mut self) -> std::io::Result<Vec<u8>> {
+        use tokio::io::AsyncReadExt;
+        loop {
+            if let Some(frame) = self.acc.next_frame() {
+                return Ok(frame);
+            }
+            let n = self.inner.read(&mut self.scratch).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "peer closed mid-frame",
+                ));
+            }
+            self.acc.push(&self.scratch[..n]);
+        }
+    }
+
+    /// Bytes buffered that do not yet make a frame.
+    ///
+    /// A caller that intends to hand the underlying stream to someone else must
+    /// check this first: those bytes belong to the current circuit and would
+    /// surface as a corrupt frame for the next one.
+    pub fn pending(&self) -> usize {
+        self.acc.pending()
+    }
+
+    pub fn into_inner(self) -> R {
+        self.inner
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LayerError {
     #[error("noise: {0}")]
@@ -57,8 +181,19 @@ pub fn seal_to_me(tx: &mut Transport, cell: &Cell, layers: usize) -> Result<Vec<
     Ok(out)
 }
 
-/// Seal `blob` for forwarding. `blob` must be the adjacent link's full cell.
-pub fn seal_forward(tx: &mut Transport, blob: &[u8]) -> Result<Vec<u8>, LayerError> {
+/// Seal `blob` for forwarding at a link `layers` deep.
+///
+/// `blob` must be exactly the adjacent link's cell size. Accepting any length
+/// would let a caller emit a frame that is not the fixed size for its link,
+/// which is the one property the whole layout exists to hold.
+pub fn seal_forward(tx: &mut Transport, blob: &[u8], layers: usize) -> Result<Vec<u8>, LayerError> {
+    let want = link_cell_len(layers - 1);
+    if blob.len() != want {
+        return Err(LayerError::WrongSize {
+            got: blob.len(),
+            want,
+        });
+    }
     let mut plain = vec![0u8; DISPOSITION_LEN + blob.len()];
     plain[0] = DISPOSITION_FORWARD;
     plain[DISPOSITION_LEN..].copy_from_slice(blob);
@@ -156,7 +291,7 @@ mod tests {
         // middle->exit cell forwarded by the middle, wrapped for guard->middle.
         let (mut client, mut relay) = pair();
         let blob = vec![0xC3; link_cell_len(1)];
-        let wire = seal_forward(&mut client, &blob).unwrap();
+        let wire = seal_forward(&mut client, &blob, 2).unwrap();
         assert_eq!(wire.len(), link_cell_len(2));
         match peel(&mut relay, &wire, 2).unwrap() {
             Peeled::Forward(got) => assert_eq!(got, blob),
@@ -173,9 +308,9 @@ mod tests {
         let cell = Cell::new(CellType::Data, b"payload".to_vec()).unwrap();
         let inner = seal_to_me(&mut k_exit, &cell, 1).unwrap();
         assert_eq!(inner.len(), 530);
-        let mid = seal_forward(&mut k_mid, &inner).unwrap();
+        let mid = seal_forward(&mut k_mid, &inner, 2).unwrap();
         assert_eq!(mid.len(), 547);
-        let outer = seal_forward(&mut k_guard, &mid).unwrap();
+        let outer = seal_forward(&mut k_guard, &mid, 3).unwrap();
         assert_eq!(outer.len(), 564);
 
         // Guard peels and forwards, middle peels and forwards, exit reads.
@@ -270,6 +405,87 @@ mod tests {
     }
 
     #[test]
+    fn seal_forward_rejects_a_blob_that_is_not_the_adjacent_link_size() {
+        let (mut client, _) = pair();
+        let right = vec![0u8; link_cell_len(1)];
+        // Control: the correct size is accepted at this depth.
+        assert!(seal_forward(&mut client, &right, 2).is_ok());
+
+        for bad in [
+            link_cell_len(1) - 1,
+            link_cell_len(1) + 1,
+            0,
+            link_cell_len(2),
+        ] {
+            let (mut c, _) = pair();
+            let blob = vec![0u8; bad];
+            match seal_forward(&mut c, &blob, 2) {
+                Err(LayerError::WrongSize { got, want }) => {
+                    assert_eq!(got, bad);
+                    assert_eq!(want, link_cell_len(1));
+                }
+                other => panic!("blob of {bad} bytes was accepted at depth 2: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn seal_forward_wants_the_depth_specific_size() {
+        // The same blob is right at one depth and wrong at another, so the
+        // parameter is doing work rather than being decorative.
+        let blob = vec![0u8; link_cell_len(2)];
+        let (mut a, _) = pair();
+        assert!(seal_forward(&mut a, &blob, 3).is_ok());
+        let (mut b, _) = pair();
+        assert!(matches!(
+            seal_forward(&mut b, &blob, 2),
+            Err(LayerError::WrongSize { .. })
+        ));
+    }
+
+    #[test]
+    fn accumulator_yields_whole_frames_from_dribbled_bytes() {
+        let n = link_cell_len(3);
+        let mut acc = FrameAccumulator::new(n);
+        let frame: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+
+        // One to seven bytes at a time, the shape a chunking transport gives.
+        let mut sent = 0;
+        let mut got = None;
+        let mut chunk = 1;
+        while sent < n {
+            let take = chunk.min(n - sent);
+            acc.push(&frame[sent..sent + take]);
+            sent += take;
+            chunk = if chunk == 7 { 1 } else { chunk + 1 };
+            if let Some(f) = acc.next_frame() {
+                got = Some(f);
+            }
+        }
+        assert_eq!(got.expect("no frame assembled"), frame);
+        assert_eq!(acc.pending(), 0);
+    }
+
+    #[test]
+    fn accumulator_keeps_a_partial_frame_and_splits_several() {
+        let n = link_cell_len(1);
+        let mut acc = FrameAccumulator::new(n);
+        acc.push(&vec![1u8; n - 1]);
+        assert!(acc.next_frame().is_none(), "a partial frame must not yield");
+        assert_eq!(acc.pending(), n - 1, "the partial frame must be retained");
+
+        // Complete the first and deliver two more in one push.
+        acc.push(&vec![2u8; 1 + 2 * n]);
+        let first = acc.next_frame().expect("first frame");
+        assert_eq!(first.len(), n);
+        assert_eq!(first[0], 1, "the retained bytes must lead the first frame");
+        assert!(acc.next_frame().is_some(), "second frame");
+        assert!(acc.next_frame().is_some(), "third frame");
+        assert!(acc.next_frame().is_none());
+        assert_eq!(acc.pending(), 0);
+    }
+
+    #[test]
     fn replayed_frame_is_rejected_at_the_layer() {
         let (mut client, mut relay) = pair();
         let cell = Cell::new(CellType::Data, b"once".to_vec()).unwrap();
@@ -279,5 +495,134 @@ mod tests {
             peel(&mut relay, &wire, 3),
             Err(LayerError::Noise(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod cancel_safety {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const FRAME: usize = 8;
+
+    /// Drive two sources with controlled timing: a partial frame on A, then a
+    /// byte on B to make the other branch win, then the rest of A.
+    async fn feed(mut a: tokio::io::DuplexStream, mut b: tokio::io::DuplexStream) {
+        a.write_all(&[1, 2, 3]).await.unwrap();
+        a.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        b.write_all(&[9]).await.unwrap();
+        b.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        a.write_all(&[4, 5, 6, 7, 8]).await.unwrap();
+        a.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    /// The defect: read_exact as a select branch. Shows that bytes already
+    /// taken into its buffer are lost when the other branch completes first.
+    #[tokio::test]
+    async fn read_exact_in_select_loses_partial_bytes() {
+        let (a_tx, mut a_rx) = tokio::io::duplex(64);
+        let (b_tx, mut b_rx) = tokio::io::duplex(64);
+        tokio::spawn(feed(a_tx, b_tx));
+
+        let mut got: Vec<u8> = Vec::new();
+        let mut bbuf = [0u8; 1];
+        let outcome = tokio::time::timeout(Duration::from_millis(600), async {
+            while got.len() < FRAME {
+                tokio::select! {
+                    biased;
+                    r = async {
+                        let mut f = [0u8; FRAME];
+                        a_rx.read_exact(&mut f).await.map(|_| f)
+                    } => {
+                        match r {
+                            Ok(f) => got.extend_from_slice(&f),
+                            // An early eof here is the loss itself: the first
+                            // three bytes went into the dropped buffer, so the
+                            // source runs out before a whole frame arrives.
+                            Err(e) => return Err(e),
+                        }
+                    }
+                    _ = b_rx.read(&mut bbuf) => {}
+                }
+            }
+            Ok(())
+        })
+        .await;
+
+        let intact = matches!(outcome, Ok(Ok(()))) && got == vec![1, 2, 3, 4, 5, 6, 7, 8];
+        assert!(
+            !intact,
+            "read_exact as a select branch delivered the frame intact, so the \
+             cancellation loss this guard exists for was not reproduced here"
+        );
+    }
+
+    /// The fix, exercised through FrameReader itself, which is the exact type
+    /// the relay and the client use in production. Same controlled timing as
+    /// the control test above: partial bytes on A, the other branch wins, the
+    /// rest arrives, and the frame must come through intact.
+    #[tokio::test]
+    async fn frame_reader_in_select_keeps_partial_bytes() {
+        let (a_tx, a_rx) = tokio::io::duplex(64);
+        let (b_tx, mut b_rx) = tokio::io::duplex(64);
+        tokio::spawn(feed(a_tx, b_tx));
+
+        let mut reader = super::FrameReader::new(a_rx, FRAME);
+        let mut bbuf = [0u8; 1];
+        let frame = tokio::time::timeout(Duration::from_millis(600), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    r = reader.next_frame() => {
+                        return r.expect("FrameReader must assemble the frame");
+                    }
+                    _ = b_rx.read(&mut bbuf) => {}
+                }
+            }
+        })
+        .await
+        .expect("FrameReader should assemble the frame within the deadline");
+
+        assert_eq!(frame, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    /// A cancelled `next_frame` retains the partial frame, and `pending`
+    /// reports it. This is the predicate the relay checks before handing a
+    /// stream back to the pool: those bytes belong to the circuit that is
+    /// closing, and pooling the stream would surface them as a corrupt frame
+    /// for whichever circuit picks it up next.
+    #[tokio::test]
+    async fn cancelled_next_frame_retains_the_partial_and_reports_it() {
+        let (mut a_tx, a_rx) = tokio::io::duplex(64);
+        let (mut b_tx, mut b_rx) = tokio::io::duplex(64);
+
+        // Three bytes of a frame on A, and a byte on B so the other branch is
+        // ready and wins while next_frame is still short of a frame.
+        a_tx.write_all(&[1, 2, 3]).await.unwrap();
+        a_tx.flush().await.unwrap();
+        b_tx.write_all(&[9]).await.unwrap();
+        b_tx.flush().await.unwrap();
+
+        let mut reader = super::FrameReader::new(a_rx, FRAME);
+        let mut bbuf = [0u8; 1];
+        // biased is load bearing: next_frame must be polled first so it takes
+        // the three bytes before the other branch wins. Unbiased, the runtime
+        // may pick the other branch, nothing is read, and the assertion below
+        // would hold for the wrong reason.
+        tokio::select! {
+            biased;
+            r = reader.next_frame() => {
+                panic!("a whole frame appeared from three bytes: {r:?}");
+            }
+            _ = b_rx.read(&mut bbuf) => {}
+        }
+        assert_eq!(
+            reader.pending(),
+            3,
+            "the partial frame must survive the cancelled branch"
+        );
     }
 }

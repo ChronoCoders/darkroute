@@ -99,3 +99,55 @@ func TestHeartbeatRejectsNonBearerAuthorization(t *testing.T) {
 		t.Fatalf("status: got %d want 401", rec.Code)
 	}
 }
+
+// A relay whose key file differs from the key recorded at provisioning time
+// must be rejected over HTTP with 409 and must not be marked active. This is
+// the contract the relay's heartbeat task depends on: it sends the public half
+// of whatever key file it loaded, and a mismatch means an operator has to
+// re-provision or restore the original file.
+func TestHeartbeatHTTPRejectsMismatchedStaticKey(t *testing.T) {
+	pool := testPool(t)
+	h := NewRelayHandler(pool, "salt-pin-http", []string{"127.0.0.1"})
+
+	provisioned := make([]byte, 32)
+	for i := range provisioned {
+		provisioned[i] = 0x11
+	}
+	id, apiKey := provisionForTest(t, pool, "salt-pin-http", provisioned)
+
+	post := func(keyHex string) *httptest.ResponseRecorder {
+		body := bytes.NewBufferString(`{"static_pubkey":"` + keyHex + `"}`)
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/relay/heartbeat", body)
+		req.RemoteAddr = "127.0.0.1:55000"
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.HandleRelayHeartbeat(rec, req)
+		return rec
+	}
+
+	// Control: the provisioned key is accepted and the relay goes active.
+	if rec := post(hexOf(provisioned)); rec.Code != http.StatusNoContent {
+		t.Fatalf("matching key: status got %d want 204, body=%s", rec.Code, rec.Body.String())
+	}
+	if got := relayStatusByID(t, pool, id); got != "active" {
+		t.Fatalf("after a matching heartbeat status = %q, want active", got)
+	}
+
+	// Park it inactive so a rejected heartbeat has something to fail to change.
+	if _, err := pool.Exec(reqCtx(), `UPDATE relay_nodes SET status='inactive' WHERE id=$1`, id); err != nil {
+		t.Fatalf("park inactive: %v", err)
+	}
+
+	// A different key: 409, nothing updated.
+	wrong := make([]byte, 32)
+	copy(wrong, provisioned)
+	wrong[0] ^= 0xFF
+	rec := post(hexOf(wrong))
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("mismatched key: status got %d want 409, body=%s", rec.Code, rec.Body.String())
+	}
+	if got := relayStatusByID(t, pool, id); got != "inactive" {
+		t.Errorf("a rejected heartbeat marked the relay %q, want it left inactive", got)
+	}
+}
