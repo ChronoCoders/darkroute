@@ -8,7 +8,7 @@ use crate::error::ClientError;
 #[derive(Debug, Clone, Deserialize)]
 pub struct CircuitHop {
     pub id: String,
-    /// `host:port` form, e.g. `node01.darkrouter.com:443`.
+    /// `host:port` form, e.g. `node01.example:443`.
     pub endpoint: String,
     pub region: String,
 }

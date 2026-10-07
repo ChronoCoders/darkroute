@@ -134,7 +134,7 @@ secret=$(openssl rand -hex 32)
 blinded=$(client-blind "$secret")
 
 # Request a signed key
-curl -X POST https://api.darkrouter.com/api/v1/tokens/issue \\
+curl -X POST https://api.quiethop.com/api/v1/tokens/issue \\
   -H "Authorization: Bearer $JWT" \\
   -H "Content-Type: application/json" \\
   -d "{\\"blinded\\": \\"$blinded\\"}"

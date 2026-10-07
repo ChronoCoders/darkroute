@@ -2,7 +2,7 @@
 
 ## Reporting a vulnerability
 
-Report suspected vulnerabilities by email to **security@darkrouter.com**.
+Report suspected vulnerabilities by email to **security@quiethop.com**.
 
 Include enough detail to reproduce the issue: affected component, version or
 commit, reproduction steps, and the impact you observed. If you have a proof of
