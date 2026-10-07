@@ -20,8 +20,6 @@ use std::fmt;
 use thiserror::Error;
 use tracing::warn;
 
-use crate::crypto::SessionKey;
-
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum CircuitError {
     #[error("illegal state transition from {from} to {to}")]
@@ -47,19 +45,21 @@ impl fmt::Display for State {
     }
 }
 
-/// A per-connection circuit. Constructed in `Pending`; advances to
-/// `Active` once the ECDH handshake succeeds and the session key is
-/// derived; ends in `Closed` (graceful) or `Failed` (any error path).
+/// A per-connection circuit. Constructed in `Pending`, advances to `Active`
+/// once the Noise NK handshake completes, and ends in `Closed` (graceful) or
+/// `Failed` (any error path).
+///
+/// The circuit does not hold the Noise transport state. snow's `TransportState`
+/// is not clonable and the frame loop needs it mutably for the whole circuit,
+/// so the handler owns it and this type tracks only the state machine.
 pub struct Circuit {
     state: State,
-    session_key: Option<SessionKey>,
 }
 
 impl Circuit {
     pub fn new() -> Self {
         Self {
             state: State::Pending,
-            session_key: None,
         }
     }
 
@@ -67,8 +67,8 @@ impl Circuit {
         self.state
     }
 
-    /// Transition Pending → Active, storing the derived session key.
-    pub fn activate(&mut self, key: SessionKey) -> Result<(), CircuitError> {
+    /// Transition Pending to Active, once the handshake has completed.
+    pub fn activate(&mut self) -> Result<(), CircuitError> {
         if self.state != State::Pending {
             return Err(CircuitError::IllegalTransition {
                 from: self.state,
@@ -76,16 +76,7 @@ impl Circuit {
             });
         }
         self.state = State::Active;
-        self.session_key = Some(key);
         Ok(())
-    }
-
-    /// Borrow the session key. Returns None if the circuit is not Active.
-    pub fn session_key(&self) -> Option<&SessionKey> {
-        match self.state {
-            State::Active => self.session_key.as_ref(),
-            _ => None,
-        }
     }
 
     /// Transition to Closed. Legal from Pending or Active.
@@ -93,7 +84,6 @@ impl Circuit {
         match self.state {
             State::Pending | State::Active => {
                 self.state = State::Closed;
-                self.session_key = None;
                 Ok(())
             }
             _ => Err(CircuitError::IllegalTransition {
@@ -110,7 +100,6 @@ impl Circuit {
         match self.state {
             State::Pending | State::Active => {
                 self.state = State::Failed;
-                self.session_key = None;
             }
             State::Failed => {}
             State::Closed => {
@@ -133,28 +122,20 @@ impl Default for Circuit {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::SessionKey;
-
-    fn dummy_key() -> SessionKey {
-        SessionKey::from_raw([0u8; 32])
-    }
 
     #[test]
     fn starts_pending() {
         let c = Circuit::new();
         assert_eq!(c.state(), State::Pending);
-        assert!(c.session_key().is_none());
     }
 
     #[test]
     fn pending_to_active_to_closed() {
         let mut c = Circuit::new();
-        c.activate(dummy_key()).unwrap();
+        c.activate().unwrap();
         assert_eq!(c.state(), State::Active);
-        assert!(c.session_key().is_some());
         c.close().unwrap();
         assert_eq!(c.state(), State::Closed);
-        assert!(c.session_key().is_none());
     }
 
     #[test]
@@ -167,17 +148,16 @@ mod tests {
     #[test]
     fn active_to_failed_clears_key() {
         let mut c = Circuit::new();
-        c.activate(dummy_key()).unwrap();
+        c.activate().unwrap();
         c.fail();
         assert_eq!(c.state(), State::Failed);
-        assert!(c.session_key().is_none());
     }
 
     #[test]
     fn double_activate_rejected() {
         let mut c = Circuit::new();
-        c.activate(dummy_key()).unwrap();
-        let err = c.activate(dummy_key()).unwrap_err();
+        c.activate().unwrap();
+        let err = c.activate().unwrap_err();
         assert_eq!(
             err,
             CircuitError::IllegalTransition {

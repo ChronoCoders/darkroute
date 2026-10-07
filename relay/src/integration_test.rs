@@ -1,32 +1,31 @@
-//! End-to-end integration test for the Phase 4b telescoping protocol.
+//! End-to-end integration test for the Noise NK telescoping protocol.
 //!
-//! Spawns three relay tasks (guard, middle, exit) in-process on
-//! localhost ephemeral ports and runs a mock client that:
+//! Spawns three relay tasks (guard, middle, exit) in-process on localhost
+//! ephemeral ports, each with its own static keypair written to a tempdir, and
+//! runs a mock client that:
 //!
-//!   1. Connects to the guard, presents a valid Phase 3 token.
-//!   2. Performs the X25519 ECDH handshake to derive K_guard.
-//!   3. Sends an EXTEND cell to add the middle hop; receives the
-//!      middle's ephemeral pubkey wrapped in EXTEND-backward; derives
-//!      K_middle.
-//!   4. Sends a RELAY-wrapped EXTEND through guard to extend to exit;
-//!      receives the exit's pubkey wrapped in RELAY+EXTEND-backward;
-//!      derives K_exit.
-//!   5. Sends a CONNECT cell triple-wrapped under K_exit, K_middle,
-//!      K_guard. Asserts the exit relay receives the cell with the
-//!      expected destination via the in-process test hook.
-//!   6. Sends a CLOSE_REQUEST to the guard and receives CLOSE_ACK.
+//!   1. Connects to the guard and presents a valid token.
+//!   2. Runs a Noise NK handshake against the guard's static public key.
+//!   3. Sends an EXTEND cell carrying the middle's Noise message 1; the guard
+//!      couriers it and returns message 2, completing the client's handshake
+//!      with the middle.
+//!   4. Does the same for the exit, through the middle.
+//!   5. Sends CONNECT and DATA cells sealed under all three layers.
+//!   6. Sends CLOSE_REQUEST and receives CLOSE_ACK.
 //!
-//! This proves the wire protocol, layered AES-256-GCM encryption,
-//! cell encode/decode, EXTEND processing, and RELAY forwarding all
-//! work end to end across three independent relay processes.
+//! Every cell on the client-guard link is asserted to be exactly
+//! `link_cell_len(3)` bytes, whatever the payload.
+//!
+//! The negative tests cover a wrong static key, a tampered cell, a replayed
+//! cell and a wrong-size cell. All four must end with the relay closing the
+//! connection and sending nothing.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use rand_core::OsRng;
 use rcgen::{generate_simple_self_signed, CertifiedKey};
 use rsa::{RsaPrivateKey, RsaPublicKey};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -36,20 +35,23 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Notify};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::TlsConnector;
-use x25519_dalek::{EphemeralSecret, PublicKey};
 
-use quiethop_crypto::cell::{parse_extend_backward, Cell, CellType, ConnectPayload, ExtendForward};
-use quiethop_crypto::crypto::{
-    decrypt_frame, derive_session_key, encrypt_frame, X25519_PUBKEY_LEN,
+use quiethop_crypto::cell::{
+    link_cell_len, parse_extend_backward, Cell, CellType, ConnectPayload, ExtendForward,
+    CELL_PAYLOAD_LEN,
 };
+use quiethop_crypto::layer::{peel, seal_forward, seal_to_me, Peeled};
+use quiethop_crypto::noise::{Initiator, Transport, NOISE_MSG_LEN, STATIC_KEY_LEN};
 
 use crate::authority::AuthorityClient;
 use crate::config::{RelayConfig, Role};
 use crate::pool::ConnectionPool;
+use crate::static_key;
 use crate::test_hooks;
 use crate::token::{raw_sign, ReplayWindow};
 
 const TEST_HOSTNAME: &str = "localhost";
+const TEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 static CRYPTO_PROVIDER_INSTALL: OnceLock<()> = OnceLock::new();
 
@@ -60,58 +62,61 @@ fn ensure_crypto_provider() {
 }
 
 struct TestPki {
-    cert_der: CertificateDer<'static>,
-    key_der: PrivateKeyDer<'static>,
+    cert: CertificateDer<'static>,
+    key: PrivateKeyDer<'static>,
 }
 
 fn make_pki() -> TestPki {
     let CertifiedKey { cert, key_pair } =
-        generate_simple_self_signed(vec![TEST_HOSTNAME.to_string()]).expect("rcgen self-signed");
-    let cert_der = cert.der().clone();
-    let key_der = PrivateKeyDer::try_from(key_pair.serialize_der())
-        .expect("rcgen-emitted key parses as PKCS8");
-    TestPki { cert_der, key_der }
+        generate_simple_self_signed(vec![TEST_HOSTNAME.to_string()]).expect("self-signed");
+    TestPki {
+        cert: CertificateDer::from(cert.der().to_vec()),
+        key: PrivateKeyDer::try_from(key_pair.serialize_der()).expect("key der"),
+    }
 }
 
 fn make_server_config(pki: &TestPki) -> Arc<ServerConfig> {
-    let server_config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![pki.cert_der.clone()], pki.key_der.clone_key())
-        .expect("server config");
-    Arc::new(server_config)
+    Arc::new(
+        ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![pki.cert.clone()], pki.key.clone_key())
+            .expect("server config"),
+    )
 }
 
 fn make_connector(pki: &TestPki) -> TlsConnector {
     let mut roots = RootCertStore::empty();
-    roots.add(pki.cert_der.clone()).expect("add cert to roots");
-    let client_config = ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    TlsConnector::from(Arc::new(client_config))
+    roots.add(pki.cert.clone()).expect("add root");
+    TlsConnector::from(Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ))
 }
 
 async fn tls_connect(connector: &TlsConnector, addr: SocketAddr) -> ClientTlsStream<TcpStream> {
     let tcp = TcpStream::connect(addr).await.expect("tcp connect");
-    tcp.set_nodelay(true).expect("nodelay");
-    let server_name = ServerName::try_from(TEST_HOSTNAME).expect("server name");
-    connector
-        .connect(server_name, tcp)
-        .await
-        .expect("client tls handshake")
+    let name = ServerName::try_from(TEST_HOSTNAME).expect("server name");
+    connector.connect(name, tcp).await.expect("tls connect")
 }
-
-const TEST_TIMEOUT: Duration = Duration::from_secs(120);
-const CIRCUIT_ID: u32 = 1;
 
 struct RelayOverride {
     decodo_proxy_url: Option<String>,
     allowed_exit_ports: Vec<u16>,
 }
 
+fn default_override() -> RelayOverride {
+    RelayOverride {
+        decodo_proxy_url: None,
+        allowed_exit_ports: vec![80, 443],
+    }
+}
+
 fn make_config(
     role: Role,
     over: &RelayOverride,
     peers: HashMap<SocketAddr, String>,
+    static_key_path: PathBuf,
 ) -> Arc<RelayConfig> {
     Arc::new(RelayConfig {
         role,
@@ -122,7 +127,7 @@ fn make_config(
         metrics_bind: "127.0.0.1:0".parse().unwrap(),
         replay_window_ttl: 86_400,
         max_circuits: 16,
-        node_id: format!("test-relay-{}", role),
+        node_id: format!("test-relay-{role}"),
         decodo_proxy_url: if role == Role::Exit {
             over.decodo_proxy_url
                 .clone()
@@ -136,10 +141,20 @@ fn make_config(
         acme_contact_email: "test@example.invalid".to_string(),
         acme_dir: PathBuf::from("/tmp/quiethop-relay-test-acme-unused"),
         acme_staging: true,
+        static_key_path,
         peer_hostnames: peers,
     })
 }
 
+/// A spawned relay: where to reach it and the static public key a client must
+/// pin to handshake with it.
+struct SpawnedRelay {
+    addr: SocketAddr,
+    static_pubkey: [u8; STATIC_KEY_LEN],
+}
+
+/// Spawn one relay. Its keypair is generated at runtime into `keydir`, so no
+/// key material is ever checked in or printed.
 async fn spawn_relay(
     role: Role,
     authority_priv: &RsaPrivateKey,
@@ -147,20 +162,22 @@ async fn spawn_relay(
     peers: HashMap<SocketAddr, String>,
     server_config: Arc<ServerConfig>,
     connector: Arc<TlsConnector>,
-) -> SocketAddr {
+    keydir: &Path,
+) -> SpawnedRelay {
+    let key_path = keydir.join(format!("{role}.key"));
+    static_key::generate(&key_path).expect("keygen");
+    let kp = static_key::load(&key_path).expect("load key");
+    let static_pubkey = kp.public;
+
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
     let authority = Arc::new(AuthorityClient::from_pubkey_for_test(RsaPublicKey::from(
         authority_priv,
     )));
     let replay = Arc::new(ReplayWindow::new(Duration::from_secs(86_400)));
-    let cfg = make_config(role, over, peers);
+    let cfg = make_config(role, over, peers, key_path);
     let pool = Arc::new(ConnectionPool::new());
     let shutdown = Arc::new(Notify::new());
-    // Tests use the same self-signed config for both the normal-traffic
-    // path and the (unused) ACME-TLS-ALPN-01 challenge path. Test
-    // clients never advertise the challenge ALPN, so accept_routed
-    // always selects the default config.
     tokio::spawn(super::accept_loop(
         listener,
         server_config.clone(),
@@ -171,27 +188,219 @@ async fn spawn_relay(
         replay,
         pool,
         connector,
+        Arc::new(kp),
     ));
-    addr
-}
-
-fn default_override() -> RelayOverride {
-    RelayOverride {
-        decodo_proxy_url: None,
-        allowed_exit_ports: vec![80, 443],
+    SpawnedRelay {
+        addr,
+        static_pubkey,
     }
 }
 
-async fn read_frame_raw(sock: &mut ClientTlsStream<TcpStream>) -> Vec<u8> {
-    let mut head = [0u8; 12 + 4];
-    sock.read_exact(&mut head).await.expect("read frame head");
-    let ct_len = u32::from_be_bytes([head[12], head[13], head[14], head[15]]) as usize;
-    let mut out = Vec::with_capacity(16 + ct_len);
-    out.extend_from_slice(&head);
-    let start = out.len();
-    out.resize(start + ct_len, 0);
-    sock.read_exact(&mut out[start..]).await.expect("read ct");
-    out
+/// The three-hop fleet plus the client's pinned keys.
+struct Fleet {
+    guard: SpawnedRelay,
+    middle: SpawnedRelay,
+    exit: SpawnedRelay,
+}
+
+async fn spawn_fleet(
+    auth_priv: &RsaPrivateKey,
+    over: &RelayOverride,
+    server_config: Arc<ServerConfig>,
+    connector: Arc<TlsConnector>,
+    keydir: &Path,
+) -> Fleet {
+    // Exit first: the middle's peer map needs its address, and the guard's
+    // needs the middle's.
+    let exit = spawn_relay(
+        Role::Exit,
+        auth_priv,
+        over,
+        HashMap::new(),
+        server_config.clone(),
+        connector.clone(),
+        keydir,
+    )
+    .await;
+    let middle_peers: HashMap<SocketAddr, String> =
+        std::iter::once((exit.addr, TEST_HOSTNAME.to_string())).collect();
+    let middle = spawn_relay(
+        Role::Middle,
+        auth_priv,
+        over,
+        middle_peers,
+        server_config.clone(),
+        connector.clone(),
+        keydir,
+    )
+    .await;
+    let guard_peers: HashMap<SocketAddr, String> =
+        std::iter::once((middle.addr, TEST_HOSTNAME.to_string())).collect();
+    let guard = spawn_relay(
+        Role::Guard,
+        auth_priv,
+        over,
+        guard_peers,
+        server_config,
+        connector,
+        keydir,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    Fleet {
+        guard,
+        middle,
+        exit,
+    }
+}
+
+/// Mock client holding one Noise transport per hop.
+struct MockClient {
+    sock: ClientTlsStream<TcpStream>,
+    guard: Transport,
+    middle: Option<Transport>,
+    exit: Option<Transport>,
+    /// Every frame size observed on the client-guard link, in both directions.
+    observed: Vec<usize>,
+}
+
+/// The client-guard link carries three layers.
+const CLIENT_LAYERS: usize = 3;
+
+impl MockClient {
+    /// Connect, present the token, and handshake with the guard.
+    async fn connect(
+        connector: &TlsConnector,
+        guard: &SpawnedRelay,
+        auth_priv: &RsaPrivateKey,
+    ) -> Self {
+        let mut sock = tls_connect(connector, guard.addr).await;
+        sock.write_all(&[super::PROTO_CLIENT]).await.expect("proto");
+        let m_raw: [u8; 32] = [0xA5; 32];
+        let token = raw_sign(&m_raw, auth_priv);
+        sock.write_all(&m_raw).await.expect("m_raw");
+        sock.write_all(&token).await.expect("token");
+
+        let (init, msg1) = Initiator::start(&guard.static_pubkey).expect("nk start");
+        sock.write_all(&msg1).await.expect("msg1");
+        sock.flush().await.expect("flush");
+        let mut msg2 = [0u8; NOISE_MSG_LEN];
+        sock.read_exact(&mut msg2).await.expect("msg2");
+        let guard_tx = init.finish(&msg2).expect("nk finish");
+
+        Self {
+            sock,
+            guard: guard_tx,
+            middle: None,
+            exit: None,
+            observed: Vec::new(),
+        }
+    }
+
+    /// Number of hops whose transports are established.
+    fn hops(&self) -> usize {
+        1 + self.middle.is_some() as usize + self.exit.is_some() as usize
+    }
+
+    /// Seal a cell for the deepest established hop and send it, wrapping it
+    /// once per nearer hop. Records the on-wire size.
+    async fn send_to_deepest(&mut self, cell: &Cell) {
+        let wire = self.seal_for_depth(cell, self.hops());
+        self.write_frame(&wire).await;
+    }
+
+    /// Seal `cell` for hop number `depth` (1 = guard, 2 = middle, 3 = exit).
+    fn seal_for_depth(&mut self, cell: &Cell, depth: usize) -> Vec<u8> {
+        // layers counts from the innermost hop outward: the exit is 1.
+        let layers = CLIENT_LAYERS - (depth - 1);
+        let mut buf = match depth {
+            1 => seal_to_me(&mut self.guard, cell, layers).expect("seal guard"),
+            2 => seal_to_me(self.middle.as_mut().expect("middle"), cell, layers)
+                .expect("seal middle"),
+            3 => seal_to_me(self.exit.as_mut().expect("exit"), cell, layers).expect("seal exit"),
+            other => panic!("bad depth {other}"),
+        };
+        // Wrap once per hop nearer the client.
+        if depth >= 3 {
+            buf = seal_forward(self.middle.as_mut().expect("middle"), &buf).expect("wrap middle");
+        }
+        if depth >= 2 {
+            buf = seal_forward(&mut self.guard, &buf).expect("wrap guard");
+        }
+        buf
+    }
+
+    async fn write_frame(&mut self, wire: &[u8]) {
+        assert_eq!(
+            wire.len(),
+            link_cell_len(CLIENT_LAYERS),
+            "a frame on the client-guard link was not the fixed size"
+        );
+        self.observed.push(wire.len());
+        self.sock.write_all(wire).await.expect("write frame");
+        self.sock.flush().await.expect("flush");
+    }
+
+    /// Read exactly one fixed-size frame. No length prefix exists on the wire.
+    async fn read_frame(&mut self) -> std::io::Result<Vec<u8>> {
+        let mut buf = vec![0u8; link_cell_len(CLIENT_LAYERS)];
+        self.sock.read_exact(&mut buf).await?;
+        self.observed.push(buf.len());
+        Ok(buf)
+    }
+
+    /// Read one frame and peel every established layer until a cell appears.
+    async fn read_cell(&mut self) -> Cell {
+        let wire = self.read_frame().await.expect("read frame");
+        let mut blob = match peel(&mut self.guard, &wire, CLIENT_LAYERS).expect("peel guard") {
+            Peeled::ToMe(cell) => return cell,
+            Peeled::Forward(b) => b,
+        };
+        if let Some(mid) = self.middle.as_mut() {
+            blob = match peel(mid, &blob, CLIENT_LAYERS - 1).expect("peel middle") {
+                Peeled::ToMe(cell) => return cell,
+                Peeled::Forward(b) => b,
+            };
+        }
+        let exit = self
+            .exit
+            .as_mut()
+            .expect("exit transport for innermost peel");
+        match peel(exit, &blob, 1).expect("peel exit") {
+            Peeled::ToMe(cell) => cell,
+            Peeled::Forward(_) => panic!("FORWARD arrived at the innermost layer"),
+        }
+    }
+
+    /// Extend the circuit to `next`, which becomes the new deepest hop.
+    async fn extend_to(&mut self, next: &SpawnedRelay) {
+        let (init, msg1) = Initiator::start(&next.static_pubkey).expect("nk start");
+        let extend = ExtendForward {
+            next_hop: next.addr,
+            noise_msg1: msg1,
+        };
+        let cell = Cell::new(CellType::Extend, extend.encode()).expect("extend cell");
+        // The EXTEND is acted on by the current deepest hop.
+        let depth = self.hops();
+        let wire = self.seal_for_depth(&cell, depth);
+        self.write_frame(&wire).await;
+
+        let back = self.read_cell().await;
+        assert_eq!(back.cell_type, CellType::Extend, "expected EXTEND backward");
+        let msg2 = parse_extend_backward(&back.payload).expect("parse msg2");
+        let tx = init.finish(&msg2).expect("nk finish");
+        if self.middle.is_none() {
+            self.middle = Some(tx);
+        } else {
+            self.exit = Some(tx);
+        }
+    }
+
+    /// Build the full three-hop circuit.
+    async fn build_circuit(&mut self, fleet: &Fleet) {
+        self.extend_to(&fleet.middle).await;
+        self.extend_to(&fleet.exit).await;
+    }
 }
 
 #[tokio::test]
@@ -206,283 +415,310 @@ async fn run_test() {
     let (tx, mut connect_rx) = mpsc::unbounded_channel::<ConnectPayload>();
     test_hooks::install_sender(tx);
 
-    let mut rng = OsRng;
-    let auth_priv = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
-
+    let keydir = tempfile::tempdir().expect("keydir");
+    let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
     let pki = make_pki();
     let server_config = make_server_config(&pki);
     let connector = Arc::new(make_connector(&pki));
-
     let over = default_override();
-    // Bootstrapping order: spawn exit and middle first (no peers
-    // needed for exit; middle's peer is exit) so addresses are known
-    // before guard's peer map.
-    let exit_addr = spawn_relay(
-        Role::Exit,
+
+    let fleet = spawn_fleet(
         &auth_priv,
         &over,
-        HashMap::new(),
-        server_config.clone(),
+        server_config,
         connector.clone(),
-    )
-    .await;
-    let middle_peers: HashMap<SocketAddr, String> =
-        std::iter::once((exit_addr, TEST_HOSTNAME.to_string())).collect();
-    let middle_addr = spawn_relay(
-        Role::Middle,
-        &auth_priv,
-        &over,
-        middle_peers,
-        server_config.clone(),
-        connector.clone(),
-    )
-    .await;
-    let guard_peers: HashMap<SocketAddr, String> =
-        std::iter::once((middle_addr, TEST_HOSTNAME.to_string())).collect();
-    let guard_addr = spawn_relay(
-        Role::Guard,
-        &auth_priv,
-        &over,
-        guard_peers,
-        server_config.clone(),
-        connector.clone(),
+        keydir.path(),
     )
     .await;
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut client = MockClient::connect(&connector, &fleet.guard, &auth_priv).await;
+    client.build_circuit(&fleet).await;
 
-    let mut sock = tls_connect(&connector, guard_addr).await;
-
-    sock.write_all(&[super::PROTO_CLIENT])
-        .await
-        .expect("proto byte");
-    let m_raw: [u8; 32] = [0xA5; 32];
-    let token = raw_sign(&m_raw, &auth_priv);
-    sock.write_all(&m_raw).await.expect("m_raw");
-    sock.write_all(&token).await.expect("token");
-    sock.flush().await.expect("flush");
-
-    let client_secret_guard = EphemeralSecret::random_from_rng(OsRng);
-    let client_pk_guard = PublicKey::from(&client_secret_guard);
-    sock.write_all(client_pk_guard.as_bytes())
-        .await
-        .expect("write client pk guard");
-    sock.flush().await.expect("flush");
-    let mut guard_pk_bytes = [0u8; X25519_PUBKEY_LEN];
-    sock.read_exact(&mut guard_pk_bytes)
-        .await
-        .expect("read guard pk");
-    let guard_pk = PublicKey::from(guard_pk_bytes);
-    let k_guard = derive_session_key(client_secret_guard.diffie_hellman(&guard_pk).as_bytes());
-
-    let client_secret_middle = EphemeralSecret::random_from_rng(OsRng);
-    let client_pk_middle = PublicKey::from(&client_secret_middle);
-    let extend_for_middle = ExtendForward {
-        next_hop: middle_addr,
-        client_pk: *client_pk_middle.as_bytes(),
-    };
-    let extend_cell = Cell::new(CellType::Extend, CIRCUIT_ID, extend_for_middle.encode())
-        .expect("build extend cell");
-    let frame = encrypt_frame(&k_guard, &extend_cell.encode()).expect("encrypt");
-    sock.write_all(&frame).await.expect("send extend");
-    sock.flush().await.expect("flush");
-
-    let back_frame = read_frame_raw(&mut sock).await;
-    let back_plain = decrypt_frame(&k_guard, &back_frame).expect("decrypt extend-back");
-    let back_cell = Cell::decode(&back_plain).expect("decode extend-back");
-    assert_eq!(
-        back_cell.cell_type,
-        CellType::Extend,
-        "expected EXTEND-backward"
-    );
-    let middle_pk_bytes = parse_extend_backward(&back_cell.payload).expect("parse middle pk");
-    let middle_pk = PublicKey::from(middle_pk_bytes);
-    let k_middle = derive_session_key(client_secret_middle.diffie_hellman(&middle_pk).as_bytes());
-
-    let client_secret_exit = EphemeralSecret::random_from_rng(OsRng);
-    let client_pk_exit = PublicKey::from(&client_secret_exit);
-    let extend_for_exit = ExtendForward {
-        next_hop: exit_addr,
-        client_pk: *client_pk_exit.as_bytes(),
-    };
-    let inner_extend_cell =
-        Cell::new(CellType::Extend, CIRCUIT_ID, extend_for_exit.encode()).expect("inner extend");
-    let inner_extend_frame =
-        encrypt_frame(&k_middle, &inner_extend_cell.encode()).expect("encrypt inner");
-    let relay_cell =
-        Cell::new(CellType::Relay, CIRCUIT_ID, inner_extend_frame).expect("relay wrap");
-    let outer_frame = encrypt_frame(&k_guard, &relay_cell.encode()).expect("encrypt outer");
-    sock.write_all(&outer_frame)
-        .await
-        .expect("send relay-extend");
-    sock.flush().await.expect("flush");
-
-    let outer_back = read_frame_raw(&mut sock).await;
-    let outer_back_plain = decrypt_frame(&k_guard, &outer_back).expect("decrypt outer-back");
-    let outer_back_cell = Cell::decode(&outer_back_plain).expect("decode outer-back");
-    assert_eq!(
-        outer_back_cell.cell_type,
-        CellType::Relay,
-        "expected RELAY-back from guard"
-    );
-    let inner_back_plain =
-        decrypt_frame(&k_middle, &outer_back_cell.payload).expect("decrypt inner-back");
-    let inner_back_cell = Cell::decode(&inner_back_plain).expect("decode inner-back");
-    assert_eq!(
-        inner_back_cell.cell_type,
-        CellType::Extend,
-        "expected EXTEND-back from middle"
-    );
-    let exit_pk_bytes = parse_extend_backward(&inner_back_cell.payload).expect("parse exit pk");
-    let exit_pk = PublicKey::from(exit_pk_bytes);
-    let k_exit = derive_session_key(client_secret_exit.diffie_hellman(&exit_pk).as_bytes());
-
-    let connect_payload = ConnectPayload {
-        host: "example.com".to_string(),
+    // CONNECT reaches the exit with the destination intact.
+    let connect = ConnectPayload {
+        host: "connect-probe.invalid".to_string(),
         port: 443,
     };
-    let connect_cell =
-        Cell::new(CellType::Connect, CIRCUIT_ID, connect_payload.encode()).expect("connect cell");
-    let exit_frame = encrypt_frame(&k_exit, &connect_cell.encode()).expect("encrypt connect");
-    let mid_relay = Cell::new(CellType::Relay, CIRCUIT_ID, exit_frame).expect("mid relay wrap");
-    let mid_frame = encrypt_frame(&k_middle, &mid_relay.encode()).expect("encrypt middle relay");
-    let guard_relay = Cell::new(CellType::Relay, CIRCUIT_ID, mid_frame).expect("guard relay wrap");
-    let outermost = encrypt_frame(&k_guard, &guard_relay.encode()).expect("encrypt outermost");
-    sock.write_all(&outermost).await.expect("send connect");
-    sock.flush().await.expect("flush");
+    let cell = Cell::new(CellType::Connect, connect.encode().expect("encode")).expect("cell");
+    client.send_to_deepest(&cell).await;
 
-    // The forward RELAY at guard reads a backward frame from middle
-    // (which middle reads from exit) and wraps it as RELAY back to us.
-    // Exit currently sends no response to CONNECT (Phase 4c), so we expect
-    // the chain to hang on the read. Instead, the test verifies that the
-    // exit's CONNECT hook fired with the right payload.
-    // The connect hook is a process-global sink, so a concurrently-running
-    // test may have installed its own sender in between or pushed its own
-    // CONNECT through. Loop until we see the host we sent.
-    let received = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let p = connect_rx.recv().await.expect("connect channel closed");
-            if p.host == "example.com" {
-                return p;
+    // The CONNECT hook is one process-global sink, so another test in this
+    // binary can publish into this channel. Take the first CONNECT that names
+    // the destination this test sent and ignore the rest, rather than assuming
+    // this test is the only one running.
+    const WANT_HOST: &str = "connect-probe.invalid";
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut seen = None;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, connect_rx.recv()).await {
+            Ok(Some(p)) if p.host == WANT_HOST => {
+                seen = Some(p);
+                break;
+            }
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("hook channel closed"),
+            Err(_) => break,
+        }
+    }
+    let seen = seen.expect("exit never saw this test's CONNECT");
+    assert_eq!(seen.host, WANT_HOST);
+    assert_eq!(seen.port, 443);
+
+    // Every frame on the client-guard link was the fixed size.
+    assert!(!client.observed.is_empty(), "no frames were observed");
+    for (i, n) in client.observed.iter().enumerate() {
+        assert_eq!(
+            *n,
+            link_cell_len(CLIENT_LAYERS),
+            "frame {i} on the client-guard link was {n} bytes"
+        );
+    }
+}
+
+/// The headline size claim, asserted against bytes that actually crossed a
+/// socket rather than against the constants alone.
+#[tokio::test]
+async fn on_wire_cells_are_constant_size_whatever_the_payload() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        ensure_crypto_provider();
+        let keydir = tempfile::tempdir().expect("keydir");
+        let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let pki = make_pki();
+        let server_config = make_server_config(&pki);
+        let connector = Arc::new(make_connector(&pki));
+        let over = default_override();
+        let fleet = spawn_fleet(
+            &auth_priv,
+            &over,
+            server_config,
+            connector.clone(),
+            keydir.path(),
+        )
+        .await;
+
+        let mut client = MockClient::connect(&connector, &fleet.guard, &auth_priv).await;
+        client.build_circuit(&fleet).await;
+
+        // A zero-byte payload and a full one must both produce the same size.
+        for n in [0usize, 1, 200, CELL_PAYLOAD_LEN] {
+            let cell = Cell::new(CellType::Data, vec![0x11; n]).expect("cell");
+            let wire = client.seal_for_depth(&cell, 3);
+            assert_eq!(
+                wire.len(),
+                link_cell_len(CLIENT_LAYERS),
+                "payload {n} produced a {}-byte frame",
+                wire.len()
+            );
+            client.write_frame(&wire).await;
+        }
+        assert_eq!(link_cell_len(3), 564);
+        assert_eq!(link_cell_len(2), 547);
+        assert_eq!(link_cell_len(1), 530);
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// A client that pins the wrong static key cannot complete the handshake, and
+/// the relay sends nothing back beyond its own message 2.
+#[tokio::test]
+async fn wrong_static_key_fails_the_handshake() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        ensure_crypto_provider();
+        let keydir = tempfile::tempdir().expect("keydir");
+        let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let pki = make_pki();
+        let server_config = make_server_config(&pki);
+        let connector = Arc::new(make_connector(&pki));
+        let over = default_override();
+        let fleet = spawn_fleet(
+            &auth_priv,
+            &over,
+            server_config,
+            connector.clone(),
+            keydir.path(),
+        )
+        .await;
+
+        // Control: the real key completes.
+        let good = MockClient::connect(&connector, &fleet.guard, &auth_priv).await;
+        drop(good);
+
+        // The impostor key belongs to the exit, not the guard.
+        let impostor = SpawnedRelay {
+            addr: fleet.guard.addr,
+            static_pubkey: fleet.exit.static_pubkey,
+        };
+        assert_ne!(impostor.static_pubkey, fleet.guard.static_pubkey);
+
+        let mut sock = tls_connect(&connector, impostor.addr).await;
+        sock.write_all(&[super::PROTO_CLIENT]).await.expect("proto");
+        let m_raw: [u8; 32] = [0xA5; 32];
+        let token = raw_sign(&m_raw, &auth_priv);
+        sock.write_all(&m_raw).await.expect("m_raw");
+        sock.write_all(&token).await.expect("token");
+        let (init, msg1) = Initiator::start(&impostor.static_pubkey).expect("nk start");
+        sock.write_all(&msg1).await.expect("msg1");
+        sock.flush().await.expect("flush");
+
+        // The guard cannot decrypt message 1 under its own static key, so it
+        // closes without replying. Either an EOF or an unusable message 2 is
+        // acceptable; what must not happen is a working circuit.
+        let mut msg2 = [0u8; NOISE_MSG_LEN];
+        match sock.read_exact(&mut msg2).await {
+            Err(_) => {}
+            Ok(_) => {
+                assert!(
+                    init.finish(&msg2).is_err(),
+                    "a handshake against the wrong static key completed"
+                );
             }
         }
     })
     .await
-    .expect("CONNECT did not reach exit within timeout");
-    assert_eq!(received.host, "example.com");
-    assert_eq!(received.port, 443);
-
-    // Drop the socket to end the circuit. The relays will see EOF and
-    // tear down via run_cell_loop's error path. We do not assert on the
-    // teardown ordering, only that all three relays do not panic, which
-    // is implicitly verified by the test process not crashing.
-    drop(sock);
+    .expect("test timed out");
 }
 
-/// Minimal SOCKS5 server stub used by the Phase 4c test only. Accepts
-/// either no-auth or username/password auth (echoing success without
-/// verifying credentials, since the goal is to exercise the relay's
-/// SOCKS5 path, not authenticate). Supports IPv4 and Domain atyps,
-/// dials the target, and tunnels bytes bidirectionally until either
-/// side closes.
-async fn run_socks5_stub(listener: TcpListener) {
-    while let Ok((mut sock, _peer)) = listener.accept().await {
-        tokio::spawn(async move {
-            if let Err(e) = handle_socks5_session(&mut sock).await {
-                // Test stub: errors here are surfaced as panics in the
-                // task; the spawning code does not await this handle.
-                eprintln!("socks5 stub error: {e}");
-            }
-        });
-    }
+/// A tampered cell tears the circuit down with no reply.
+#[tokio::test]
+async fn tampered_cell_tears_down_the_circuit() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        ensure_crypto_provider();
+        let keydir = tempfile::tempdir().expect("keydir");
+        let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let pki = make_pki();
+        let server_config = make_server_config(&pki);
+        let connector = Arc::new(make_connector(&pki));
+        let over = default_override();
+        let fleet = spawn_fleet(
+            &auth_priv,
+            &over,
+            server_config,
+            connector.clone(),
+            keydir.path(),
+        )
+        .await;
+
+        let mut client = MockClient::connect(&connector, &fleet.guard, &auth_priv).await;
+        let cell = Cell::new(CellType::Data, b"tamper".to_vec()).expect("cell");
+        let mut wire = client.seal_for_depth(&cell, 1);
+        wire[30] ^= 0x01;
+        client.sock.write_all(&wire).await.expect("write");
+        client.sock.flush().await.expect("flush");
+
+        // The guard closes. Reading must reach EOF rather than a frame.
+        let mut buf = vec![0u8; link_cell_len(CLIENT_LAYERS)];
+        let res = tokio::time::timeout(Duration::from_secs(10), client.sock.read_exact(&mut buf))
+            .await
+            .expect("relay neither replied nor closed");
+        assert!(res.is_err(), "the relay answered a tampered cell");
+    })
+    .await
+    .expect("test timed out");
 }
 
-async fn handle_socks5_session(sock: &mut TcpStream) -> std::io::Result<()> {
-    let mut greet = [0u8; 2];
-    sock.read_exact(&mut greet).await?;
-    let nmethods = greet[1] as usize;
-    let mut methods = vec![0u8; nmethods];
-    sock.read_exact(&mut methods).await?;
+/// A replayed cell tears the circuit down: the Noise counter has advanced.
+#[tokio::test]
+async fn replayed_cell_tears_down_the_circuit() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        ensure_crypto_provider();
+        let keydir = tempfile::tempdir().expect("keydir");
+        let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let pki = make_pki();
+        let server_config = make_server_config(&pki);
+        let connector = Arc::new(make_connector(&pki));
+        let over = default_override();
+        let fleet = spawn_fleet(
+            &auth_priv,
+            &over,
+            server_config,
+            connector.clone(),
+            keydir.path(),
+        )
+        .await;
 
-    let chosen: u8 = if methods.contains(&0x02) { 0x02 } else { 0x00 };
-    sock.write_all(&[0x05, chosen]).await?;
+        let mut client = MockClient::connect(&connector, &fleet.guard, &auth_priv).await;
+        client.extend_to(&fleet.middle).await;
 
-    if chosen == 0x02 {
-        let mut auth_head = [0u8; 2];
-        sock.read_exact(&mut auth_head).await?;
-        let ulen = auth_head[1] as usize;
-        let mut user = vec![0u8; ulen];
-        sock.read_exact(&mut user).await?;
-        let mut plen_buf = [0u8; 1];
-        sock.read_exact(&mut plen_buf).await?;
-        let plen = plen_buf[0] as usize;
-        let mut pass = vec![0u8; plen];
-        sock.read_exact(&mut pass).await?;
-        // Always succeed, because this is a test stub.
-        sock.write_all(&[0x01, 0x00]).await?;
-    }
+        // Re-send the EXTEND frame the guard already accepted. Capture it by
+        // sealing a fresh one and sending it twice: the first is legitimate,
+        // the second is a byte-identical replay.
+        let (_, msg1) = Initiator::start(&fleet.exit.static_pubkey).expect("nk start");
+        let extend = ExtendForward {
+            next_hop: fleet.exit.addr,
+            noise_msg1: msg1,
+        };
+        let cell = Cell::new(CellType::Extend, extend.encode()).expect("cell");
+        let wire = client.seal_for_depth(&cell, 2);
+        client.sock.write_all(&wire).await.expect("first send");
+        client.sock.flush().await.expect("flush");
+        client.sock.write_all(&wire).await.expect("replay");
+        client.sock.flush().await.expect("flush");
 
-    let mut req_head = [0u8; 4];
-    sock.read_exact(&mut req_head).await?;
-    let atyp = req_head[3];
-
-    let target_addr: SocketAddr = match atyp {
-        0x01 => {
-            let mut buf = [0u8; 4];
-            sock.read_exact(&mut buf).await?;
-            let mut port_buf = [0u8; 2];
-            sock.read_exact(&mut port_buf).await?;
-            let port = u16::from_be_bytes(port_buf);
-            SocketAddr::from(([buf[0], buf[1], buf[2], buf[3]], port))
-        }
-        0x03 => {
-            let mut len = [0u8; 1];
-            sock.read_exact(&mut len).await?;
-            let dlen = len[0] as usize;
-            let mut domain = vec![0u8; dlen];
-            sock.read_exact(&mut domain).await?;
-            let mut port_buf = [0u8; 2];
-            sock.read_exact(&mut port_buf).await?;
-            let port = u16::from_be_bytes(port_buf);
-            let s = std::str::from_utf8(&domain)
-                .map_err(|_| std::io::Error::other("invalid utf8 domain"))?;
-            format!("{s}:{port}")
-                .parse()
-                .map_err(|_| std::io::Error::other("test stub: domain must be a numeric IP"))?
-        }
-        _ => return Err(std::io::Error::other("unsupported atyp")),
-    };
-
-    let target = TcpStream::connect(target_addr).await?;
-
-    // SOCKS5 success reply: VER, REP=00, RSV=00, ATYP=01, BND.ADDR=0.0.0.0, BND.PORT=0
-    sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-        .await?;
-
-    let (mut sr, mut sw) = sock.split();
-    let (mut tr, mut tw) = target.into_split();
-    let fwd = async { tokio::io::copy(&mut sr, &mut tw).await };
-    let bck = async { tokio::io::copy(&mut tr, &mut sw).await };
-    let _ = tokio::join!(fwd, bck);
-    Ok(())
-}
-
-async fn run_echo_server(listener: TcpListener) {
-    while let Ok((mut sock, _peer)) = listener.accept().await {
-        tokio::spawn(async move {
-            let mut buf = [0u8; 4096];
-            loop {
-                let n = match sock.read(&mut buf).await {
-                    Ok(0) => return,
-                    Ok(n) => n,
-                    Err(_) => return,
-                };
-                if sock.write_all(&buf[..n]).await.is_err() {
-                    return;
+        // The middle rejects the replay, which tears down the whole circuit,
+        // so the client eventually sees the guard close.
+        let mut buf = vec![0u8; link_cell_len(CLIENT_LAYERS)];
+        let mut closed = false;
+        for _ in 0..3 {
+            match tokio::time::timeout(Duration::from_secs(10), client.sock.read_exact(&mut buf))
+                .await
+            {
+                Ok(Err(_)) => {
+                    closed = true;
+                    break;
                 }
+                Ok(Ok(_)) => continue,
+                Err(_) => break,
             }
-        });
-    }
+        }
+        assert!(closed, "the replayed cell did not tear the circuit down");
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// A wrong-size frame desynchronises framing and tears the circuit down.
+#[tokio::test]
+async fn wrong_size_cell_tears_down_the_circuit() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        ensure_crypto_provider();
+        let keydir = tempfile::tempdir().expect("keydir");
+        let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let pki = make_pki();
+        let server_config = make_server_config(&pki);
+        let connector = Arc::new(make_connector(&pki));
+        let over = default_override();
+        let fleet = spawn_fleet(
+            &auth_priv,
+            &over,
+            server_config,
+            connector.clone(),
+            keydir.path(),
+        )
+        .await;
+
+        let mut client = MockClient::connect(&connector, &fleet.guard, &auth_priv).await;
+        let cell = Cell::new(CellType::Data, b"short".to_vec()).expect("cell");
+        let wire = client.seal_for_depth(&cell, 1);
+
+        // One byte short of a cell, then close the write half. The guard is
+        // blocked in read_exact for a full cell and must never process this.
+        client
+            .sock
+            .write_all(&wire[..wire.len() - 1])
+            .await
+            .expect("write short");
+        client.sock.flush().await.expect("flush");
+        client.sock.shutdown().await.ok();
+
+        let mut buf = vec![0u8; link_cell_len(CLIENT_LAYERS)];
+        let res = tokio::time::timeout(Duration::from_secs(10), client.sock.read_exact(&mut buf))
+            .await
+            .expect("relay neither replied nor closed");
+        assert!(res.is_err(), "the relay answered a short cell");
+    })
+    .await
+    .expect("test timed out");
 }
 
 #[tokio::test]
@@ -494,169 +730,137 @@ async fn end_to_end_data_round_trip_via_socks5() {
 
 async fn run_data_test() {
     ensure_crypto_provider();
-    let echo_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
+    // An echo server behind a minimal SOCKS5 stub, so the exit's dial path runs
+    // for real without reaching the internet.
+    let echo_listener = TcpListener::bind("127.0.0.1:0").await.expect("echo bind");
     let echo_addr = echo_listener.local_addr().expect("echo addr");
     tokio::spawn(run_echo_server(echo_listener));
 
-    let socks_listener = TcpListener::bind("127.0.0.1:0").await.expect("bind socks");
+    let socks_listener = TcpListener::bind("127.0.0.1:0").await.expect("socks bind");
     let socks_addr = socks_listener.local_addr().expect("socks addr");
-    tokio::spawn(run_socks5_stub(socks_listener));
+    tokio::spawn(run_socks5_stub(socks_listener, echo_addr));
 
-    let socks_url = format!("socks5://user:pass@{socks_addr}");
-    let over = RelayOverride {
-        decodo_proxy_url: Some(socks_url),
-        allowed_exit_ports: vec![echo_addr.port(), 80, 443],
-    };
-
-    let mut rng = OsRng;
-    let auth_priv = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
-
+    let keydir = tempfile::tempdir().expect("keydir");
+    let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
     let pki = make_pki();
     let server_config = make_server_config(&pki);
     let connector = Arc::new(make_connector(&pki));
-
-    let exit_addr = spawn_relay(
-        Role::Exit,
-        &auth_priv,
-        &over,
-        HashMap::new(),
-        server_config.clone(),
-        connector.clone(),
-    )
-    .await;
-    let middle_peers: HashMap<SocketAddr, String> =
-        std::iter::once((exit_addr, TEST_HOSTNAME.to_string())).collect();
-    let middle_addr = spawn_relay(
-        Role::Middle,
-        &auth_priv,
-        &over,
-        middle_peers,
-        server_config.clone(),
-        connector.clone(),
-    )
-    .await;
-    let guard_peers: HashMap<SocketAddr, String> =
-        std::iter::once((middle_addr, TEST_HOSTNAME.to_string())).collect();
-    let guard_addr = spawn_relay(
-        Role::Guard,
-        &auth_priv,
-        &over,
-        guard_peers,
-        server_config.clone(),
-        connector.clone(),
-    )
-    .await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let mut sock = tls_connect(&connector, guard_addr).await;
-
-    sock.write_all(&[super::PROTO_CLIENT]).await.expect("proto");
-    let m_raw: [u8; 32] = [0x77; 32];
-    let token = raw_sign(&m_raw, &auth_priv);
-    sock.write_all(&m_raw).await.expect("m_raw");
-    sock.write_all(&token).await.expect("token");
-    let client_secret_guard = EphemeralSecret::random_from_rng(OsRng);
-    let client_pk_guard = PublicKey::from(&client_secret_guard);
-    sock.write_all(client_pk_guard.as_bytes())
-        .await
-        .expect("client pk");
-    sock.flush().await.expect("flush");
-    let mut guard_pk = [0u8; X25519_PUBKEY_LEN];
-    sock.read_exact(&mut guard_pk).await.expect("guard pk");
-    let k_guard = derive_session_key(
-        client_secret_guard
-            .diffie_hellman(&PublicKey::from(guard_pk))
-            .as_bytes(),
-    );
-
-    let client_secret_middle = EphemeralSecret::random_from_rng(OsRng);
-    let client_pk_middle = PublicKey::from(&client_secret_middle);
-    let extend_for_middle = ExtendForward {
-        next_hop: middle_addr,
-        client_pk: *client_pk_middle.as_bytes(),
+    let over = RelayOverride {
+        decodo_proxy_url: Some(format!("socks5://user:pass@{socks_addr}")),
+        allowed_exit_ports: vec![echo_addr.port()],
     };
-    let extend_cell = Cell::new(CellType::Extend, CIRCUIT_ID, extend_for_middle.encode()).unwrap();
-    let frame = encrypt_frame(&k_guard, &extend_cell.encode()).unwrap();
-    sock.write_all(&frame).await.unwrap();
-    let back = read_frame_raw(&mut sock).await;
-    let cell = Cell::decode(&decrypt_frame(&k_guard, &back).unwrap()).unwrap();
-    let middle_pk_bytes = parse_extend_backward(&cell.payload).unwrap();
-    let k_middle = derive_session_key(
-        client_secret_middle
-            .diffie_hellman(&PublicKey::from(middle_pk_bytes))
-            .as_bytes(),
-    );
+    let fleet = spawn_fleet(
+        &auth_priv,
+        &over,
+        server_config,
+        connector.clone(),
+        keydir.path(),
+    )
+    .await;
 
-    let client_secret_exit = EphemeralSecret::random_from_rng(OsRng);
-    let client_pk_exit = PublicKey::from(&client_secret_exit);
-    let extend_for_exit = ExtendForward {
-        next_hop: exit_addr,
-        client_pk: *client_pk_exit.as_bytes(),
-    };
-    let inner_extend = Cell::new(CellType::Extend, CIRCUIT_ID, extend_for_exit.encode()).unwrap();
-    let inner_frame = encrypt_frame(&k_middle, &inner_extend.encode()).unwrap();
-    let relay_wrap = Cell::new(CellType::Relay, CIRCUIT_ID, inner_frame).unwrap();
-    let outer = encrypt_frame(&k_guard, &relay_wrap.encode()).unwrap();
-    sock.write_all(&outer).await.unwrap();
-    let back = read_frame_raw(&mut sock).await;
-    let cell = Cell::decode(&decrypt_frame(&k_guard, &back).unwrap()).unwrap();
-    let inner = decrypt_frame(&k_middle, &cell.payload).unwrap();
-    let inner_cell = Cell::decode(&inner).unwrap();
-    let exit_pk_bytes = parse_extend_backward(&inner_cell.payload).unwrap();
-    let k_exit = derive_session_key(
-        client_secret_exit
-            .diffie_hellman(&PublicKey::from(exit_pk_bytes))
-            .as_bytes(),
-    );
+    let mut client = MockClient::connect(&connector, &fleet.guard, &auth_priv).await;
+    client.build_circuit(&fleet).await;
 
-    let connect_payload = ConnectPayload {
-        host: format!("{}", echo_addr.ip()),
+    let connect = ConnectPayload {
+        host: echo_addr.ip().to_string(),
         port: echo_addr.port(),
     };
-    let connect_cell = Cell::new(CellType::Connect, CIRCUIT_ID, connect_payload.encode()).unwrap();
-    let f_exit = encrypt_frame(&k_exit, &connect_cell.encode()).unwrap();
-    let r_mid = Cell::new(CellType::Relay, CIRCUIT_ID, f_exit).unwrap();
-    let f_mid = encrypt_frame(&k_middle, &r_mid.encode()).unwrap();
-    let r_guard = Cell::new(CellType::Relay, CIRCUIT_ID, f_mid).unwrap();
-    let f_guard = encrypt_frame(&k_guard, &r_guard.encode()).unwrap();
-    sock.write_all(&f_guard).await.unwrap();
+    let cell = Cell::new(CellType::Connect, connect.encode().expect("encode")).expect("cell");
+    client.send_to_deepest(&cell).await;
 
-    // Wait briefly so the exit completes the SOCKS5 dial before DATA arrives.
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let payload = b"quiethop round trip".to_vec();
+    let data = Cell::new(CellType::Data, payload.clone()).expect("data cell");
+    client.send_to_deepest(&data).await;
 
-    let payload_bytes = b"hello-quiethop".to_vec();
-    let data_cell = Cell::new(CellType::Data, CIRCUIT_ID, payload_bytes.clone()).unwrap();
-    let f_exit = encrypt_frame(&k_exit, &data_cell.encode()).unwrap();
-    let r_mid = Cell::new(CellType::Relay, CIRCUIT_ID, f_exit).unwrap();
-    let f_mid = encrypt_frame(&k_middle, &r_mid.encode()).unwrap();
-    let r_guard = Cell::new(CellType::Relay, CIRCUIT_ID, f_mid).unwrap();
-    let f_guard = encrypt_frame(&k_guard, &r_guard.encode()).unwrap();
-    sock.write_all(&f_guard).await.unwrap();
-    sock.flush().await.unwrap();
+    let back = tokio::time::timeout(Duration::from_secs(20), client.read_cell())
+        .await
+        .expect("no DATA came back");
+    assert_eq!(back.cell_type, CellType::Data);
+    assert_eq!(back.payload, payload, "echo did not round trip");
+}
 
-    // Read echo: the echo flows back through exit → middle → guard, each
-    // wrapping in RELAY then DATA at the exit's layer.
-    let received = tokio::time::timeout(Duration::from_secs(10), async {
-        let mut accumulated = Vec::new();
-        while accumulated.len() < payload_bytes.len() {
-            let back = read_frame_raw(&mut sock).await;
-            let outer_plain = decrypt_frame(&k_guard, &back).unwrap();
-            let outer_cell = Cell::decode(&outer_plain).unwrap();
-            assert_eq!(outer_cell.cell_type, CellType::Relay);
-            let mid_plain = decrypt_frame(&k_middle, &outer_cell.payload).unwrap();
-            let mid_cell = Cell::decode(&mid_plain).unwrap();
-            assert_eq!(mid_cell.cell_type, CellType::Relay);
-            let exit_plain = decrypt_frame(&k_exit, &mid_cell.payload).unwrap();
-            let exit_cell = Cell::decode(&exit_plain).unwrap();
-            assert_eq!(exit_cell.cell_type, CellType::Data);
-            accumulated.extend_from_slice(&exit_cell.payload);
+/// Minimal SOCKS5 stub: accepts no-auth and username/password, then connects to
+/// a fixed address regardless of the requested one.
+async fn run_socks5_stub(listener: TcpListener, target: SocketAddr) {
+    loop {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        tokio::spawn(async move {
+            if handle_socks5_session(&mut sock, target).await.is_err() {
+                // A test stub: a failed session just ends.
+            }
+        });
+    }
+}
+
+async fn handle_socks5_session(sock: &mut TcpStream, target: SocketAddr) -> std::io::Result<()> {
+    let mut head = [0u8; 2];
+    sock.read_exact(&mut head).await?;
+    let nmethods = head[1] as usize;
+    let mut methods = vec![0u8; nmethods];
+    sock.read_exact(&mut methods).await?;
+
+    if methods.contains(&0x02) {
+        sock.write_all(&[0x05, 0x02]).await?;
+        let mut uhead = [0u8; 2];
+        sock.read_exact(&mut uhead).await?;
+        let mut user = vec![0u8; uhead[1] as usize];
+        sock.read_exact(&mut user).await?;
+        let mut plen = [0u8; 1];
+        sock.read_exact(&mut plen).await?;
+        let mut pass = vec![0u8; plen[0] as usize];
+        sock.read_exact(&mut pass).await?;
+        sock.write_all(&[0x01, 0x00]).await?;
+    } else {
+        sock.write_all(&[0x05, 0x00]).await?;
+    }
+
+    let mut req = [0u8; 4];
+    sock.read_exact(&mut req).await?;
+    match req[3] {
+        0x01 => {
+            let mut rest = [0u8; 6];
+            sock.read_exact(&mut rest).await?;
         }
-        accumulated
-    })
-    .await
-    .expect("data round-trip timed out");
+        0x03 => {
+            let mut l = [0u8; 1];
+            sock.read_exact(&mut l).await?;
+            let mut rest = vec![0u8; l[0] as usize + 2];
+            sock.read_exact(&mut rest).await?;
+        }
+        0x04 => {
+            let mut rest = [0u8; 18];
+            sock.read_exact(&mut rest).await?;
+        }
+        _ => return Ok(()),
+    }
 
-    assert_eq!(received, payload_bytes, "echo mismatch");
+    sock.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await?;
 
-    drop(sock);
+    let mut upstream = TcpStream::connect(target).await?;
+    tokio::io::copy_bidirectional(sock, &mut upstream).await?;
+    Ok(())
+}
+
+async fn run_echo_server(listener: TcpListener) {
+    loop {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            return;
+        };
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+    }
 }

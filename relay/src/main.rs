@@ -9,6 +9,7 @@ mod heartbeat;
 mod metrics;
 mod pool;
 mod port80;
+mod static_key;
 mod tls;
 mod token;
 
@@ -30,10 +31,10 @@ use tokio_rustls::TlsConnector;
 use tracing::{error, info, warn};
 
 use quiethop_crypto::cell::{self, Cell, CellType, ConnectPayload, ExtendForward};
-use quiethop_crypto::crypto::{self, SessionKey};
+use quiethop_crypto::layer;
+use quiethop_crypto::noise::{self, StaticKeypair, Transport, NOISE_MSG_LEN};
 use quiethop_crypto::wire::{
-    CIRCUIT_ID, CIRCUIT_START, M_RAW_LEN, PRESENTATION_LEN, PROTO_CLIENT, PROTO_RELAY,
-    X25519_PK_LEN,
+    CIRCUIT_START, M_RAW_LEN, PRESENTATION_LEN, PROTO_CLIENT, PROTO_RELAY,
 };
 
 use crate::authority::AuthorityClient;
@@ -47,7 +48,9 @@ const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CELL_READ_TIMEOUT: Duration = Duration::from_secs(120);
 const POOL_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 const POOL_IDLE_TTL: Duration = Duration::from_secs(300);
-const DEST_READ_BUF: usize = 16 * 1024;
+// Read in whole cells. 32 payloads per read keeps the syscall count near the
+// old 16 KiB buffer while every cell on the wire stays CELL_PAYLOAD_LEN.
+const DEST_READ_BUF: usize = cell::CELL_PAYLOAD_LEN * 32;
 
 pub type InboundStream = ServerTlsStream<TcpStream>;
 pub type OutboundStream = ClientTlsStream<TcpStream>;
@@ -61,6 +64,21 @@ async fn main() -> ExitCode {
         )
         .json()
         .init();
+
+    // `quiethop-relay keygen` writes the static keypair and exits. It runs
+    // before any config or TLS work because it needs neither, and a relay must
+    // never generate a key on the serving path (ARCHITECTURE §5.2 step 3).
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("keygen") {
+        return run_keygen(args.get(1).map(String::as_str));
+    }
+    if !args.is_empty() {
+        error!(
+            "unknown arguments; usage: quiethop-relay [keygen [path]] with all other \
+             configuration in the environment"
+        );
+        return ExitCode::from(2);
+    }
 
     // rustls 0.23 panics on first ClientConfig/ServerConfig build if
     // no process-global CryptoProvider is installed. Install ring once
@@ -79,6 +97,20 @@ async fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // ARCHITECTURE §5.2 step 3. Exit on any failure: missing, unreadable, a
+    // mode looser than 0600, the wrong length, or halves that do not match.
+    let static_key = match static_key::load(&cfg.static_key_path) {
+        Ok(kp) => Arc::new(kp),
+        Err(e) => {
+            error!(error = %e, "static key load failed");
+            return ExitCode::from(1);
+        }
+    };
+    info!(
+        static_pubkey_len = static_key.public.len(),
+        "static key loaded"
+    );
+
     info!(
         role = %cfg.role,
         node_id = %cfg.node_id,
@@ -194,6 +226,7 @@ async fn main() -> ExitCode {
         replay.clone(),
         outbound_pool.clone(),
         outbound_connector.clone(),
+        static_key.clone(),
     ));
     let metrics_handle = tokio::spawn(metrics_accept_loop(metrics_listener, shutdown.clone()));
     let pool_sweep_handle = tokio::spawn(pool_sweep_loop(outbound_pool.clone(), shutdown.clone()));
@@ -244,6 +277,7 @@ async fn accept_loop(
     replay: Arc<ReplayWindow>,
     pool: Arc<ConnectionPool<OutboundStream>>,
     connector: Arc<TlsConnector>,
+    static_key: Arc<StaticKeypair>,
 ) {
     loop {
         tokio::select! {
@@ -253,11 +287,14 @@ async fn accept_loop(
             }
             res = listener.accept() => match res {
                 Ok((tcp, peer)) => {
-                    let cfg = cfg.clone();
-                    let auth = authority.clone();
-                    let rep = replay.clone();
-                    let pl = pool.clone();
-                    let conn = connector.clone();
+                    let ctx = ConnCtx {
+                        cfg: cfg.clone(),
+                        authority: authority.clone(),
+                        replay: replay.clone(),
+                        pool: pool.clone(),
+                        connector: connector.clone(),
+                        static_key: static_key.clone(),
+                    };
                     let dc = default_config.clone();
                     let cc = challenge_config.clone();
                     tokio::spawn(async move {
@@ -283,7 +320,7 @@ async fn accept_loop(
                                 return;
                             }
                         };
-                        if let Err(e) = handle_connection(tls, peer, cfg, auth, rep, pl, conn).await {
+                        if let Err(e) = handle_connection(tls, peer, ctx).await {
                             warn!(peer = %peer, reason = %e, "connection terminated");
                         }
                     });
@@ -296,6 +333,49 @@ async fn accept_loop(
     }
 }
 
+/// Per-connection dependencies, cloned once per accepted connection.
+///
+/// These travel together through every layer of the connection handler, so
+/// they move as one value rather than as six positional arguments.
+#[derive(Clone)]
+struct ConnCtx {
+    cfg: Arc<RelayConfig>,
+    authority: Arc<AuthorityClient>,
+    replay: Arc<ReplayWindow>,
+    pool: Arc<ConnectionPool<OutboundStream>>,
+    connector: Arc<TlsConnector>,
+    static_key: Arc<StaticKeypair>,
+}
+
+/// Write a fresh static keypair and print only the public half.
+///
+/// The private half never leaves the file. Nothing about it is logged, so a
+/// shell transcript or a log shipper cannot carry it off the host.
+fn run_keygen(path_arg: Option<&str>) -> ExitCode {
+    let path = match path_arg {
+        Some(p) => std::path::PathBuf::from(p),
+        None => match std::env::var("RELAY_STATIC_KEY_PATH") {
+            Ok(v) if !v.is_empty() => std::path::PathBuf::from(v),
+            _ => {
+                error!("keygen needs a path argument or RELAY_STATIC_KEY_PATH");
+                return ExitCode::from(2);
+            }
+        },
+    };
+    match static_key::generate(&path) {
+        Ok(public_hex) => {
+            info!(path = %path.display(), "static keypair written with mode 0600");
+            // The operator passes this to /admin/relays/provision.
+            println!("{public_hex}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error!(error = %e, "keygen failed");
+            ExitCode::from(1)
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 enum HandleError {
     #[error("io: {0}")]
@@ -304,8 +384,10 @@ enum HandleError {
     Timeout,
     #[error("token verification failed: {0}")]
     Token(token::TokenError),
-    #[error("crypto: {0}")]
-    Crypto(#[from] crypto::CryptoError),
+    #[error("noise handshake failed")]
+    Handshake,
+    #[error("layer: {0}")]
+    Layer(#[from] layer::LayerError),
     #[error("circuit: {0}")]
     Circuit(#[from] circuit::CircuitError),
     #[error("cell: {0}")]
@@ -324,6 +406,8 @@ enum HandleError {
     MissingDecodoUrl,
     #[error("no peer hostname configured for next-hop {0}")]
     PeerHostnameMissing(SocketAddr),
+    #[error("FORWARD cell arrived at role {0} with no next link")]
+    ForwardWithoutNextLink(Role),
     #[error("tls error: {0}")]
     Tls(#[from] tls::TlsError),
 }
@@ -331,11 +415,7 @@ enum HandleError {
 async fn handle_connection(
     sock: InboundStream,
     peer: SocketAddr,
-    cfg: Arc<RelayConfig>,
-    authority: Arc<AuthorityClient>,
-    replay: Arc<ReplayWindow>,
-    pool: Arc<ConnectionPool<OutboundStream>>,
-    connector: Arc<TlsConnector>,
+    ctx: ConnCtx,
 ) -> Result<(), HandleError> {
     let (mut r, mut w) = tokio::io::split(sock);
 
@@ -346,12 +426,10 @@ async fn handle_connection(
         Err(_) => return Err(HandleError::Timeout),
     }
 
-    match (proto[0], cfg.role) {
-        (PROTO_CLIENT, Role::Guard) => {
-            handle_client_connection(r, w, peer, cfg, authority, replay, pool, connector).await
-        }
+    match (proto[0], ctx.cfg.role) {
+        (PROTO_CLIENT, Role::Guard) => handle_client_connection(r, w, peer, ctx).await,
         (PROTO_RELAY, Role::Middle) | (PROTO_RELAY, Role::Exit) => {
-            handle_relay_connection(r, w, peer, cfg, pool, connector).await
+            handle_relay_connection(r, w, peer, ctx).await
         }
         (b, _) => {
             // Ignore shutdown errors since we're already rejecting.
@@ -365,16 +443,11 @@ async fn handle_connection(
 /// after CLOSE_REQUEST the stream is closed (clients reconnect for a
 /// new circuit). Token verification runs first; only then does the
 /// per-hop ECDH and cell loop start.
-#[allow(clippy::too_many_arguments)]
 async fn handle_client_connection(
     mut r: ReadHalf<InboundStream>,
     mut w: WriteHalf<InboundStream>,
     peer: SocketAddr,
-    cfg: Arc<RelayConfig>,
-    authority: Arc<AuthorityClient>,
-    replay: Arc<ReplayWindow>,
-    pool: Arc<ConnectionPool<OutboundStream>>,
-    connector: Arc<TlsConnector>,
+    ctx: ConnCtx,
 ) -> Result<(), HandleError> {
     let mut buf = [0u8; PRESENTATION_LEN];
     match tokio::time::timeout(PRESENTATION_READ_TIMEOUT, r.read_exact(&mut buf)).await {
@@ -384,13 +457,13 @@ async fn handle_client_connection(
     }
     let m_raw = &buf[..M_RAW_LEN];
     let token = &buf[M_RAW_LEN..];
-    if let Err(e) = token::verify(m_raw, token, authority.pubkey(), &replay) {
+    if let Err(e) = token::verify(m_raw, token, ctx.authority.pubkey(), &ctx.replay) {
         metrics::record_rejected(&e);
         return Err(HandleError::Token(e));
     }
     metrics::record_verified();
 
-    drive_circuit(&mut r, &mut w, peer, Role::Guard, cfg, pool, connector).await
+    drive_circuit(&mut r, &mut w, peer, Role::Guard, ctx).await
 }
 
 /// Relay-mode inbound (middle or exit). Peer IP must be in the
@@ -402,15 +475,13 @@ async fn handle_relay_connection(
     mut r: ReadHalf<InboundStream>,
     mut w: WriteHalf<InboundStream>,
     peer: SocketAddr,
-    cfg: Arc<RelayConfig>,
-    pool: Arc<ConnectionPool<OutboundStream>>,
-    connector: Arc<TlsConnector>,
+    ctx: ConnCtx,
 ) -> Result<(), HandleError> {
     let peer_ip = match peer {
         SocketAddr::V4(a) => IpAddr::V4(*a.ip()),
         SocketAddr::V6(a) => IpAddr::V6(*a.ip()),
     };
-    if !cfg.peer_allowlist.contains(&peer_ip) {
+    if !ctx.cfg.peer_allowlist.contains(&peer_ip) {
         return Err(HandleError::PeerNotAllowed);
     }
 
@@ -425,62 +496,65 @@ async fn handle_relay_connection(
             // Any byte other than CIRCUIT_START terminates the link.
             return Ok(());
         }
-        drive_circuit(
-            &mut r,
-            &mut w,
-            peer,
-            cfg.role,
-            cfg.clone(),
-            pool.clone(),
-            connector.clone(),
-        )
-        .await?;
+        drive_circuit(&mut r, &mut w, peer, ctx.cfg.role, ctx.clone()).await?;
     }
 }
 
-/// Bring up one circuit: run the per-hop X25519 handshake, activate the
-/// state machine, run the bidirectional cell loop. On CLOSE_REQUEST:
-/// send CLOSE_ACK, release the next-link to the pool (if any), drop
-/// the destination link (if any), close the circuit.
-#[allow(clippy::too_many_arguments)]
+/// Bring up one circuit: run the Noise NK responder handshake against this
+/// relay's static key, activate the state machine, run the bidirectional cell
+/// loop. On CLOSE_REQUEST: send CLOSE_ACK, release the next link to the pool
+/// (if any), drop the destination link (if any), close the circuit.
+///
+/// Every failure below takes the same path: close the connection, fail the
+/// circuit, send nothing back. The peer cannot tell a bad handshake from a bad
+/// cell from a bad size, because in all three cases it receives a closed
+/// connection and no bytes.
 async fn drive_circuit(
     r: &mut ReadHalf<InboundStream>,
     w: &mut WriteHalf<InboundStream>,
     peer: SocketAddr,
     role: Role,
-    cfg: Arc<RelayConfig>,
-    pool: Arc<ConnectionPool<OutboundStream>>,
-    connector: Arc<TlsConnector>,
+    ctx: ConnCtx,
 ) -> Result<(), HandleError> {
     let mut circuit = circuit::Circuit::new();
 
-    let session_key =
-        match tokio::time::timeout(HANDSHAKE_READ_TIMEOUT, crypto::relay_handshake(r, w)).await {
-            Ok(Ok(k)) => k,
-            Ok(Err(e)) => {
-                circuit.fail();
-                return Err(HandleError::Crypto(e));
-            }
-            Err(_) => {
-                circuit.fail();
-                return Err(HandleError::Timeout);
-            }
-        };
-    if let Err(e) = circuit.activate(session_key) {
+    let mut msg1 = [0u8; NOISE_MSG_LEN];
+    match tokio::time::timeout(HANDSHAKE_READ_TIMEOUT, r.read_exact(&mut msg1)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => {
+            circuit.fail();
+            return Err(HandleError::Io(e));
+        }
+        Err(_) => {
+            circuit.fail();
+            return Err(HandleError::Timeout);
+        }
+    }
+
+    let (mut transport, msg2) = match noise::respond(ctx.static_key.private(), &msg1) {
+        Ok(pair) => pair,
+        Err(_) => {
+            circuit.fail();
+            return Err(HandleError::Handshake);
+        }
+    };
+
+    if let Err(e) = w.write_all(&msg2).await {
+        circuit.fail();
+        return Err(HandleError::Io(e));
+    }
+    if let Err(e) = w.flush().await {
+        circuit.fail();
+        return Err(HandleError::Io(e));
+    }
+
+    if let Err(e) = circuit.activate() {
         circuit.fail();
         return Err(HandleError::Circuit(e));
     }
     info!(peer = %peer, role = %role, state = %circuit.state(), "circuit active");
 
-    let key: SessionKey = circuit
-        .session_key()
-        .expect(
-            "drive_circuit just activated the circuit, so session_key() returns Some. \
-             This invariant is enforced by the state machine",
-        )
-        .clone();
-
-    let outcome = run_circuit_io(r, w, &key, role, cfg, pool, connector).await;
+    let outcome = run_circuit_io(r, w, &mut transport, role, &ctx).await;
     match &outcome {
         Ok(()) => {
             if let Err(e) = circuit.close() {
@@ -493,127 +567,173 @@ async fn drive_circuit(
     outcome
 }
 
-/// One circuit's bidirectional control + data loop. Reads from three
-/// sources via `tokio::select!`:
+/// How many AEAD layers this role's inbound link carries. The client wraps one
+/// layer per hop, so the guard sees three and the exit one.
+fn inbound_layers(role: Role) -> usize {
+    match role {
+        Role::Guard => 3,
+        Role::Middle => 2,
+        Role::Exit => 1,
+    }
+}
+
+/// Cell size on this role's inbound link. Derived, never a literal.
+fn inbound_len(role: Role) -> usize {
+    cell::link_cell_len(inbound_layers(role))
+}
+
+/// Cell size on this role's outbound relay link, if it has one.
+fn outbound_len(role: Role) -> Option<usize> {
+    match role {
+        Role::Exit => None,
+        other => Some(cell::link_cell_len(inbound_layers(other) - 1)),
+    }
+}
+
+/// One circuit's bidirectional control and data loop.
 ///
-///   1. inbound read half (cells from the previous-hop client/relay)
-///   2. `next_link.read` (raw frame bytes from the next-hop relay,
-///      forwarded as RELAY cells back toward the client)
-///   3. `dest_link` (bytes from the SOCKS5 destination, wrapped as
-///      DATA cells back toward the client; exit role only)
+/// Reads from three sources via `tokio::select!`:
 ///
-/// CLOSE_REQUEST triggers: send CLOSE_ACK, release next_link to the
-/// pool (so the underlying TLS stream can carry another circuit), drop
-/// dest_link, return. Any other error path drops both, terminating
-/// the dialer side cleanly.
-#[allow(clippy::too_many_arguments)]
+///   1. the inbound read half, a fixed `inbound_len(role)` bytes per cell
+///   2. the next link, a fixed `outbound_len(role)` bytes per cell, wrapped
+///      back toward the client behind a FORWARD disposition
+///   3. the destination socket, split into DATA cells (exit only)
+///
+/// No length appears on the wire in either direction: both sizes come from the
+/// role, so a reader always knows how many bytes one cell is.
 async fn run_circuit_io(
     sock_read: &mut ReadHalf<InboundStream>,
     sock_write: &mut WriteHalf<InboundStream>,
-    key: &SessionKey,
+    transport: &mut Transport,
     role: Role,
-    cfg: Arc<RelayConfig>,
-    pool: Arc<ConnectionPool<OutboundStream>>,
-    connector: Arc<TlsConnector>,
+    ctx: &ConnCtx,
 ) -> Result<(), HandleError> {
     let mut next_link: Option<NextLinkState> = None;
     let mut dest_link: Option<TcpStream> = None;
 
+    let in_len = inbound_len(role);
+    let layers = inbound_layers(role);
+    let out_len = outbound_len(role);
+
     loop {
         tokio::select! {
             biased;
-            res = tokio::time::timeout(CELL_READ_TIMEOUT, crypto::read_frame(sock_read, key)) => {
-                let frame = match res {
-                    Ok(Ok(f)) => f,
-                    Ok(Err(e)) => return Err(HandleError::Crypto(e)),
+            res = async {
+                let mut buf = vec![0u8; in_len];
+                tokio::time::timeout(CELL_READ_TIMEOUT, sock_read.read_exact(&mut buf))
+                    .await
+                    .map(|r| r.map(|_| buf))
+            } => {
+                let wire = match res {
+                    Ok(Ok(b)) => b,
+                    Ok(Err(e)) => return Err(HandleError::Io(e)),
                     Err(_) => return Err(HandleError::Timeout),
                 };
-                let cell = Cell::decode(&frame)?;
-                match (cell.cell_type, role) {
-                    (CellType::Extend, Role::Guard) | (CellType::Extend, Role::Middle) => {
-                        if next_link.is_some() {
-                            return Err(HandleError::IllegalCellForRole(CellType::Extend, role));
-                        }
-                        let extend = ExtendForward::decode(&cell.payload)?;
-                        let nl = open_next_link(&extend, &pool, &cfg, &connector).await?;
-                        let reply = Cell::new(
-                            CellType::Extend,
-                            CIRCUIT_ID,
-                            cell::extend_backward_payload(&nl.peer_pk),
-                        )?;
-                        crypto::write_frame(sock_write, key, &reply.encode()).await?;
-                        next_link = Some(nl);
-                    }
-                    (CellType::Relay, Role::Guard) | (CellType::Relay, Role::Middle) => {
+
+                match layer::peel(transport, &wire, layers)? {
+                    layer::Peeled::Forward(blob) => {
                         let nl = next_link
                             .as_mut()
-                            .ok_or(HandleError::IllegalCellForRole(CellType::Relay, role))?;
-                        nl.write.write_all(&cell.payload).await?;
+                            .ok_or(HandleError::ForwardWithoutNextLink(role))?;
+                        nl.write.write_all(&blob).await?;
                         nl.write.flush().await?;
                     }
-                    (CellType::Connect, Role::Exit) => {
-                        if dest_link.is_some() {
-                            return Err(HandleError::IllegalCellForRole(CellType::Connect, role));
+                    layer::Peeled::ToMe(cell) => match (cell.cell_type, role) {
+                        (CellType::Extend, Role::Guard) | (CellType::Extend, Role::Middle) => {
+                            if next_link.is_some() {
+                                return Err(HandleError::IllegalCellForRole(CellType::Extend, role));
+                            }
+                            let extend = ExtendForward::decode(&cell.payload)?;
+                            let nl =
+                                open_next_link(&extend, &ctx.pool, &ctx.cfg, &ctx.connector)
+                                    .await?;
+                            let reply = Cell::new(
+                                CellType::Extend,
+                                cell::extend_backward_payload(&nl.noise_msg2),
+                            )?;
+                            let framed = layer::seal_to_me(transport, &reply, layers)?;
+                            sock_write.write_all(&framed).await?;
+                            sock_write.flush().await?;
+                            next_link = Some(nl);
                         }
-                        let payload = ConnectPayload::decode(&cell.payload)?;
-                        publish_connect_for_test(&payload);
-                        let proxy_url = cfg
-                            .decodo_proxy_url
-                            .as_deref()
-                            .ok_or(HandleError::MissingDecodoUrl)?;
-                        // Port validation happens inside dial_via_socks5
-                        // BEFORE any network I/O; the destination host
-                        // and port are deliberately not logged.
-                        let dest = exit::dial_via_socks5(
-                            proxy_url,
-                            &payload.host,
-                            payload.port,
-                            &cfg.allowed_exit_ports,
-                        )
-                        .await?;
-                        info!(role = %role, "exit dialed destination via SOCKS5");
-                        dest_link = Some(dest);
-                    }
-                    (CellType::Data, Role::Exit) => {
-                        let dl = dest_link
-                            .as_mut()
-                            .ok_or(HandleError::IllegalCellForRole(CellType::Data, role))?;
-                        dl.write_all(&cell.payload).await?;
-                        dl.flush().await?;
-                    }
-                    (CellType::CloseRequest, _) => {
-                        let ack = Cell::new(CellType::CloseAck, CIRCUIT_ID, Vec::new())?;
-                        crypto::write_frame(sock_write, key, &ack.encode()).await?;
-                        if let Some(nl) = next_link.take() {
-                            // The inner CLOSE_REQUESTs ran before this
-                            // outer one, so the next-hop link is back
-                            // in "waiting for CIRCUIT_START" state and
-                            // safe to reuse.
-                            let addr = nl.addr;
-                            let stream = nl.read.unsplit(nl.write);
-                            pool.release(addr, PooledConn::new(stream));
+                        (CellType::Connect, Role::Exit) => {
+                            if dest_link.is_some() {
+                                return Err(HandleError::IllegalCellForRole(CellType::Connect, role));
+                            }
+                            let payload = ConnectPayload::decode(&cell.payload)?;
+                            publish_connect_for_test(&payload);
+                            let proxy_url = ctx
+                                .cfg
+                                .decodo_proxy_url
+                                .as_deref()
+                                .ok_or(HandleError::MissingDecodoUrl)?;
+                            // Port validation happens inside dial_via_socks5
+                            // BEFORE any network I/O; the destination host
+                            // and port are deliberately not logged.
+                            let dest = exit::dial_via_socks5(
+                                proxy_url,
+                                &payload.host,
+                                payload.port,
+                                &ctx.cfg.allowed_exit_ports,
+                            )
+                            .await?;
+                            info!(role = %role, "exit dialed destination via SOCKS5");
+                            dest_link = Some(dest);
                         }
-                        drop(dest_link.take());
-                        return Ok(());
-                    }
-                    (CellType::CloseAck, _) => {
-                        // CLOSE_ACK on the forward path is unexpected;
-                        // treat as a peer-initiated teardown.
-                        return Err(HandleError::PeerClosed);
-                    }
-                    (t, r) => return Err(HandleError::IllegalCellForRole(t, r)),
+                        (CellType::Data, Role::Exit) => {
+                            // A zero-length DATA cell is legal and is a no-op,
+                            // which is the hook cover traffic will use.
+                            if cell.payload.is_empty() {
+                                continue;
+                            }
+                            let dl = dest_link
+                                .as_mut()
+                                .ok_or(HandleError::IllegalCellForRole(CellType::Data, role))?;
+                            dl.write_all(&cell.payload).await?;
+                            dl.flush().await?;
+                        }
+                        (CellType::CloseRequest, _) => {
+                            let ack = Cell::new(CellType::CloseAck, Vec::new())?;
+                            let framed = layer::seal_to_me(transport, &ack, layers)?;
+                            sock_write.write_all(&framed).await?;
+                            sock_write.flush().await?;
+                            if let Some(nl) = next_link.take() {
+                                // The inner CLOSE_REQUESTs ran before this
+                                // outer one, so the next-hop link is back
+                                // in "waiting for CIRCUIT_START" state and
+                                // safe to reuse.
+                                let addr = nl.addr;
+                                let stream = nl.read.unsplit(nl.write);
+                                ctx.pool.release(addr, PooledConn::new(stream));
+                            }
+                            drop(dest_link.take());
+                            return Ok(());
+                        }
+                        (CellType::CloseAck, _) => {
+                            // CLOSE_ACK on the forward path is unexpected;
+                            // treat as a peer-initiated teardown.
+                            return Err(HandleError::PeerClosed);
+                        }
+                        (t, r) => return Err(HandleError::IllegalCellForRole(t, r)),
+                    },
                 }
             }
 
             res = async {
-                match next_link.as_mut() {
-                    Some(nl) => crypto::read_frame_bytes(&mut nl.read).await,
-                    None => std::future::pending().await,
+                match (next_link.as_mut(), out_len) {
+                    (Some(nl), Some(n)) => {
+                        let mut buf = vec![0u8; n];
+                        nl.read.read_exact(&mut buf).await.map(|_| buf)
+                    }
+                    _ => std::future::pending().await,
                 }
             } => {
-                let back_bytes = res?;
-                let wrap = Cell::new(CellType::Relay, CIRCUIT_ID, back_bytes)?;
-                crypto::write_frame(sock_write, key, &wrap.encode()).await?;
+                let blob = res?;
+                // Wrap the next hop's cell in this relay's own layer. No RELAY
+                // cell and no header: the client peels until it reaches TO_ME.
+                let framed = layer::seal_forward(transport, &blob)?;
+                sock_write.write_all(&framed).await?;
+                sock_write.flush().await?;
             }
 
             res = async {
@@ -635,8 +755,12 @@ async fn run_circuit_io(
                     drop(dest_link.take());
                     continue;
                 }
-                let data_cell = Cell::new(CellType::Data, CIRCUIT_ID, bytes)?;
-                crypto::write_frame(sock_write, key, &data_cell.encode()).await?;
+                for chunk in bytes.chunks(cell::CELL_PAYLOAD_LEN) {
+                    let data_cell = Cell::new(CellType::Data, chunk.to_vec())?;
+                    let framed = layer::seal_to_me(transport, &data_cell, layers)?;
+                    sock_write.write_all(&framed).await?;
+                }
+                sock_write.flush().await?;
             }
         }
     }
@@ -645,15 +769,19 @@ async fn run_circuit_io(
 struct NextLinkState {
     read: ReadHalf<OutboundStream>,
     write: WriteHalf<OutboundStream>,
-    peer_pk: [u8; X25519_PK_LEN],
+    noise_msg2: [u8; NOISE_MSG_LEN],
     addr: SocketAddr,
 }
 
-/// Acquire (or dial+TLS-handshake) an outbound link to `next_hop` and
-/// run the per-circuit bootstrap: write CIRCUIT_START + client pubkey,
-/// read peer pubkey. A fresh outbound stream gets the PROTO_RELAY
-/// prefix once; pooled streams are already past PROTO_RELAY and ready
-/// for the next CIRCUIT_START.
+/// Acquire (or dial and TLS-handshake) an outbound link to `next_hop` and act
+/// as courier for the client's handshake with that hop: write CIRCUIT_START
+/// and the client's Noise message 1, read the hop's message 2 back.
+///
+/// This relay is not a party to that handshake. It cannot read either message,
+/// and the next hop authenticates to the client, not to this relay.
+///
+/// A fresh outbound stream gets the PROTO_RELAY prefix once; pooled streams are
+/// already past PROTO_RELAY and ready for the next CIRCUIT_START.
 async fn open_next_link(
     extend: &ExtendForward,
     pool: &ConnectionPool<OutboundStream>,
@@ -674,10 +802,10 @@ async fn open_next_link(
     };
     let (mut read, mut write) = tokio::io::split(stream);
     write.write_all(&[CIRCUIT_START]).await?;
-    write.write_all(&extend.client_pk).await?;
+    write.write_all(&extend.noise_msg1).await?;
     write.flush().await?;
-    let mut peer_pk = [0u8; X25519_PK_LEN];
-    match tokio::time::timeout(HANDSHAKE_READ_TIMEOUT, read.read_exact(&mut peer_pk)).await {
+    let mut noise_msg2 = [0u8; NOISE_MSG_LEN];
+    match tokio::time::timeout(HANDSHAKE_READ_TIMEOUT, read.read_exact(&mut noise_msg2)).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => return Err(HandleError::Io(e)),
         Err(_) => return Err(HandleError::Timeout),
@@ -685,7 +813,7 @@ async fn open_next_link(
     Ok(NextLinkState {
         read,
         write,
-        peer_pk,
+        noise_msg2,
         addr: extend.next_hop,
     })
 }

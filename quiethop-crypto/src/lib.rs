@@ -2,5 +2,6 @@
 #![forbid(unsafe_code)]
 
 pub mod cell;
-pub mod crypto;
+pub mod layer;
+pub mod noise;
 pub mod wire;

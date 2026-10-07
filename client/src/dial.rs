@@ -1,31 +1,75 @@
-//! Three-hop telescoping circuit dialer + CircuitStream.
+//! Three-hop telescoping circuit dialer and CircuitStream.
+//!
+//! One Noise NK handshake per hop, against the static public key the authority
+//! published for that hop, so each hop proves it holds the key the registry
+//! names (SECURITY_MODEL §6.1).
+//!
+//! No name is resolved anywhere here. Each hop arrives as an IP literal plus a
+//! separate TLS name, and the literal is what gets dialed.
 
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use rand_core::OsRng;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf, ReadHalf, WriteHalf};
-use tokio::net::{lookup_host, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::net::TcpStream;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
-use x25519_dalek::{EphemeralSecret, PublicKey};
 
-use quiethop_crypto::cell::{parse_extend_backward, Cell, CellType, ConnectPayload, ExtendForward};
-use quiethop_crypto::crypto::{
-    decrypt_frame, derive_session_key, encrypt_frame, read_frame, SessionKey,
+use quiethop_crypto::cell::{
+    link_cell_len, parse_extend_backward, Cell, CellType, ConnectPayload, ExtendForward,
+    CELL_PAYLOAD_LEN,
 };
-use quiethop_crypto::wire::{CIRCUIT_ID, PROTO_CLIENT};
+use quiethop_crypto::layer::{peel, seal_forward, seal_to_me, Peeled};
+use quiethop_crypto::noise::{Initiator, Transport, NOISE_MSG_LEN};
+use quiethop_crypto::wire::PROTO_CLIENT;
 
-use crate::circuits::CircuitRoute;
+use crate::circuits::{CircuitHop, CircuitRoute};
 use crate::error::ClientError;
 use crate::tls;
 
-const CELL_CHUNK: usize = 16 * 1024;
+/// The client-guard link carries one layer per hop.
+const CLIENT_LAYERS: usize = 3;
+
+/// Read from the user in whole cells. Each cell carries at most
+/// CELL_PAYLOAD_LEN bytes, so a larger write is split across cells.
+const USER_READ_BUF: usize = CELL_PAYLOAD_LEN * 32;
+
 const DUPLEX_BUF: usize = 64 * 1024;
 
 pub struct CircuitStream {
     inner: tokio::io::DuplexStream,
+}
+
+/// The three per-hop transports, outermost first.
+struct Layers {
+    guard: Transport,
+    middle: Transport,
+    exit: Transport,
+}
+
+impl Layers {
+    /// Seal a cell for the exit and wrap it for the middle and the guard.
+    fn seal_for_exit(&mut self, cell: &Cell) -> Result<Vec<u8>, ClientError> {
+        let inner = seal_to_me(&mut self.exit, cell, 1)?;
+        let mid = seal_forward(&mut self.middle, &inner)?;
+        Ok(seal_forward(&mut self.guard, &mid)?)
+    }
+
+    /// Peel every layer off an inbound frame until a cell appears.
+    fn peel_inbound(&mut self, wire: &[u8]) -> Result<Cell, ClientError> {
+        let mut blob = match peel(&mut self.guard, wire, CLIENT_LAYERS)? {
+            Peeled::ToMe(cell) => return Ok(cell),
+            Peeled::Forward(b) => b,
+        };
+        blob = match peel(&mut self.middle, &blob, CLIENT_LAYERS - 1)? {
+            Peeled::ToMe(cell) => return Ok(cell),
+            Peeled::Forward(b) => b,
+        };
+        match peel(&mut self.exit, &blob, 1)? {
+            Peeled::ToMe(cell) => Ok(cell),
+            Peeled::Forward(_) => Err(ClientError::UnexpectedCell(CellType::Data)),
+        }
+    }
 }
 
 pub async fn dial(
@@ -36,221 +80,180 @@ pub async fn dial(
     dest_host: &str,
     dest_port: u16,
 ) -> Result<CircuitStream, ClientError> {
-    let (guard_host, guard_port) = route.guard.split()?;
-    let (middle_host, middle_port) = route.middle.split()?;
-    let (exit_host, exit_port) = route.exit.split()?;
+    let guard_addr = route.guard.addr()?;
+    let guard_key = route.guard.pubkey()?;
 
-    let guard_addr = resolve_one(&guard_host, guard_port).await?;
-    let middle_addr = resolve_one(&middle_host, middle_port).await?;
-    let exit_addr = resolve_one(&exit_host, exit_port).await?;
-
-    let mut tls = tls::dial(connector, guard_addr, &guard_host).await?;
+    let mut tls = tls::dial(connector, guard_addr, &route.guard.tls_name).await?;
 
     tls.write_all(&[PROTO_CLIENT]).await?;
     tls.write_all(m_raw).await?;
     tls.write_all(token).await?;
 
-    let client_secret_guard = EphemeralSecret::random_from_rng(OsRng);
-    let client_pk_guard = PublicKey::from(&client_secret_guard);
-    tls.write_all(client_pk_guard.as_bytes()).await?;
+    // Hop 1: the guard, directly on this connection.
+    let (init, msg1) = Initiator::start(&guard_key)?;
+    tls.write_all(&msg1).await?;
     tls.flush().await?;
-    let mut guard_pk_bytes = [0u8; 32];
-    tls.read_exact(&mut guard_pk_bytes).await?;
-    let k_guard = derive_session_key(
-        client_secret_guard
-            .diffie_hellman(&PublicKey::from(guard_pk_bytes))
-            .as_bytes(),
-    );
+    let mut msg2 = [0u8; NOISE_MSG_LEN];
+    tls.read_exact(&mut msg2).await?;
+    let guard_tx = init.finish(&msg2)?;
 
-    let k_middle = extend_hop(&mut tls, &k_guard, &[], middle_addr).await?;
-    let k_exit = extend_hop(
-        &mut tls,
-        &k_guard,
-        std::slice::from_ref(&k_middle),
-        exit_addr,
-    )
-    .await?;
+    let mut guard_tx = guard_tx;
+    // Hop 2: the middle, acted on by the guard.
+    let mut middle_tx = extend_hop(&mut tls, &mut guard_tx, None, &route.middle).await?;
+    // Hop 3: the exit, acted on by the middle.
+    let exit_tx = extend_hop(&mut tls, &mut guard_tx, Some(&mut middle_tx), &route.exit).await?;
 
-    let inner_layers = [k_middle.clone(), k_exit.clone()];
-    send_layered(
-        &mut tls,
-        &k_guard,
-        &inner_layers,
-        Cell::new(
-            CellType::Connect,
-            CIRCUIT_ID,
-            ConnectPayload {
-                host: dest_host.to_string(),
-                port: dest_port,
-            }
-            .encode(),
-        )?,
-    )
-    .await?;
+    let mut layers = Layers {
+        guard: guard_tx,
+        middle: middle_tx,
+        exit: exit_tx,
+    };
+
+    // CONNECT, sealed for the exit.
+    let connect = ConnectPayload {
+        host: dest_host.to_string(),
+        port: dest_port,
+    };
+    let cell = Cell::new(CellType::Connect, connect.encode()?)?;
+    let wire = layers.seal_for_exit(&cell)?;
+    tls.write_all(&wire).await?;
+    tls.flush().await?;
 
     let (user_side, internal_side) = tokio::io::duplex(DUPLEX_BUF);
-    let (tls_read, tls_write) = tokio::io::split(tls);
-    let (internal_read, internal_write) = tokio::io::split(internal_side);
-    let layers = vec![k_guard, k_middle, k_exit];
-
-    tokio::spawn(writer_task(internal_read, tls_write, layers.clone()));
-    tokio::spawn(reader_task(tls_read, internal_write, layers));
-
+    tokio::spawn(circuit_task(tls, layers, internal_side));
     Ok(CircuitStream { inner: user_side })
 }
 
-async fn resolve_one(host: &str, port: u16) -> Result<SocketAddr, ClientError> {
-    lookup_host((host, port)).await?.next().ok_or_else(|| {
-        ClientError::InvalidEndpoint(format!("{host}:{port}"), "no DNS records".into())
-    })
-}
-
+/// Extend the circuit by one hop.
+///
+/// `middle` is None while the guard is the deepest hop, in which case the guard
+/// acts on the EXTEND. Once the middle exists it is the one that acts, and the
+/// cell is wrapped for the guard to forward.
 async fn extend_hop(
     tls: &mut TlsStream<TcpStream>,
-    k_guard: &SessionKey,
-    inner_layers: &[SessionKey],
-    next_hop: SocketAddr,
-) -> Result<SessionKey, ClientError> {
-    let client_secret = EphemeralSecret::random_from_rng(OsRng);
-    let client_pk = PublicKey::from(&client_secret);
+    guard: &mut Transport,
+    middle: Option<&mut Transport>,
+    next: &CircuitHop,
+) -> Result<Transport, ClientError> {
+    let (init, msg1) = Initiator::start(&next.pubkey()?)?;
     let extend = ExtendForward {
-        next_hop,
-        client_pk: *client_pk.as_bytes(),
+        next_hop: next.addr()?,
+        noise_msg1: msg1,
     };
-    let inner_cell = Cell::new(CellType::Extend, CIRCUIT_ID, extend.encode())?;
-    send_layered(tls, k_guard, inner_layers, inner_cell).await?;
+    let cell = Cell::new(CellType::Extend, extend.encode())?;
 
-    let back_plain = read_frame(tls, k_guard).await?;
-    let mut back_cell = Cell::decode(&back_plain)?;
-    for layer in inner_layers {
-        if back_cell.cell_type != CellType::Relay {
-            return Err(ClientError::UnexpectedCell(back_cell.cell_type));
+    let (wire, middle) = match middle {
+        None => (seal_to_me(guard, &cell, CLIENT_LAYERS)?, None),
+        Some(mid) => {
+            let inner = seal_to_me(mid, &cell, CLIENT_LAYERS - 1)?;
+            (seal_forward(guard, &inner)?, Some(mid))
         }
-        let inner = decrypt_frame(layer, &back_cell.payload)?;
-        back_cell = Cell::decode(&inner)?;
-    }
-    if back_cell.cell_type != CellType::Extend {
-        return Err(ClientError::UnexpectedCell(back_cell.cell_type));
-    }
-    let peer_pk = parse_extend_backward(&back_cell.payload)?;
-    Ok(derive_session_key(
-        client_secret
-            .diffie_hellman(&PublicKey::from(peer_pk))
-            .as_bytes(),
-    ))
-}
-
-async fn send_layered(
-    tls: &mut TlsStream<TcpStream>,
-    k_guard: &SessionKey,
-    inner_layers: &[SessionKey],
-    inner_cell: Cell,
-) -> Result<(), ClientError> {
-    let frame = layer_encrypt(k_guard, inner_layers, &inner_cell.encode())?;
-    tls.write_all(&frame).await?;
+    };
+    tls.write_all(&wire).await?;
     tls.flush().await?;
-    Ok(())
-}
 
-fn layer_encrypt(
-    k_guard: &SessionKey,
-    inner_layers: &[SessionKey],
-    inner_plain: &[u8],
-) -> Result<Vec<u8>, ClientError> {
-    let mut payload = inner_plain.to_vec();
-    if let Some(innermost) = inner_layers.last() {
-        payload = encrypt_frame(innermost, &payload)?;
-        for layer in inner_layers.iter().rev().skip(1) {
-            let wrap = Cell::new(CellType::Relay, CIRCUIT_ID, payload)?;
-            payload = encrypt_frame(layer, &wrap.encode())?;
-        }
-        let wrap = Cell::new(CellType::Relay, CIRCUIT_ID, payload)?;
-        payload = wrap.encode();
+    let mut back = vec![0u8; link_cell_len(CLIENT_LAYERS)];
+    tls.read_exact(&mut back).await?;
+
+    let reply = match (peel(guard, &back, CLIENT_LAYERS)?, middle) {
+        (Peeled::ToMe(c), None) => c,
+        (Peeled::Forward(blob), Some(mid)) => match peel(mid, &blob, CLIENT_LAYERS - 1)? {
+            Peeled::ToMe(c) => c,
+            Peeled::Forward(_) => return Err(ClientError::UnexpectedCell(CellType::Extend)),
+        },
+        (Peeled::ToMe(c), Some(_)) => return Err(ClientError::UnexpectedCell(c.cell_type)),
+        (Peeled::Forward(_), None) => return Err(ClientError::UnexpectedCell(CellType::Extend)),
+    };
+    if reply.cell_type != CellType::Extend {
+        return Err(ClientError::UnexpectedCell(reply.cell_type));
     }
-    Ok(encrypt_frame(k_guard, &payload)?)
+    let msg2 = parse_extend_backward(&reply.payload)?;
+    Ok(init.finish(&msg2)?)
 }
 
-async fn writer_task(
-    mut from_user: ReadHalf<tokio::io::DuplexStream>,
-    mut tls_write: WriteHalf<TlsStream<TcpStream>>,
-    layers: Vec<SessionKey>,
+/// Owns the three transports and both halves of the TLS stream.
+///
+/// A single task rather than a writer plus a reader: one Noise transport
+/// carries both directions and needs mutable access for each, so splitting the
+/// work across tasks would mean sharing it behind a lock for no gain.
+async fn circuit_task(
+    tls: TlsStream<TcpStream>,
+    mut layers: Layers,
+    internal: tokio::io::DuplexStream,
 ) {
-    let mut buf = vec![0u8; CELL_CHUNK];
-    let k_guard = &layers[0];
-    let inner_layers = &layers[1..];
+    let (mut tls_read, mut tls_write) = tokio::io::split(tls);
+    let (mut from_user, mut to_user) = tokio::io::split(internal);
+    let frame_len = link_cell_len(CLIENT_LAYERS);
+    let mut user_buf = vec![0u8; USER_READ_BUF];
+
     loop {
-        let n = match from_user.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => n,
-            Err(_) => break,
-        };
-        let cell = match Cell::new(CellType::Data, CIRCUIT_ID, buf[..n].to_vec()) {
-            Ok(c) => c,
-            Err(_) => break,
-        };
-        let frame = match layer_encrypt(k_guard, inner_layers, &cell.encode()) {
-            Ok(f) => f,
-            Err(_) => break,
-        };
-        if tls_write.write_all(&frame).await.is_err() {
-            break;
+        tokio::select! {
+            res = from_user.read(&mut user_buf) => {
+                let n = match res {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                // Split anything larger than one payload across cells. Order
+                // is guaranteed by the Noise counter, so no sequence number
+                // and no reassembly buffer is needed.
+                let mut failed = false;
+                for chunk in user_buf[..n].chunks(CELL_PAYLOAD_LEN) {
+                    let cell = match Cell::new(CellType::Data, chunk.to_vec()) {
+                        Ok(c) => c,
+                        Err(_) => { failed = true; break; }
+                    };
+                    let wire = match layers.seal_for_exit(&cell) {
+                        Ok(w) => w,
+                        Err(_) => { failed = true; break; }
+                    };
+                    if tls_write.write_all(&wire).await.is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+                if failed || tls_write.flush().await.is_err() {
+                    break;
+                }
+            }
+
+            res = async {
+                let mut frame = vec![0u8; frame_len];
+                tls_read.read_exact(&mut frame).await.map(|_| frame)
+            } => {
+                let frame = match res {
+                    Ok(f) => f,
+                    Err(_) => break,
+                };
+                let cell = match layers.peel_inbound(&frame) {
+                    Ok(c) => c,
+                    // Any authentication failure tears the circuit down.
+                    Err(_) => break,
+                };
+                match cell.cell_type {
+                    CellType::Data => {
+                        // A zero-length DATA cell is legal and is a no-op.
+                        if cell.payload.is_empty() {
+                            continue;
+                        }
+                        if to_user.write_all(&cell.payload).await.is_err() {
+                            break;
+                        }
+                    }
+                    CellType::CloseAck => break,
+                    _ => break,
+                }
+            }
         }
-        if tls_write.flush().await.is_err() {
-            break;
+    }
+
+    // Best effort teardown: ask the exit to close, then drop everything.
+    if let Ok(cell) = Cell::new(CellType::CloseRequest, Vec::new()) {
+        if let Ok(wire) = layers.seal_for_exit(&cell) {
+            let _ = tls_write.write_all(&wire).await;
+            let _ = tls_write.flush().await;
         }
     }
     let _ = tls_write.shutdown().await;
-}
-
-async fn reader_task(
-    mut tls_read: ReadHalf<TlsStream<TcpStream>>,
-    mut to_user: WriteHalf<tokio::io::DuplexStream>,
-    layers: Vec<SessionKey>,
-) {
-    let k_guard = &layers[0];
-    let inner_layers = &layers[1..];
-    loop {
-        let plain = match read_frame(&mut tls_read, k_guard).await {
-            Ok(p) => p,
-            Err(_) => break,
-        };
-        let mut cell = match Cell::decode(&plain) {
-            Ok(c) => c,
-            Err(_) => break,
-        };
-        let mut peel_ok = true;
-        for layer in inner_layers {
-            if cell.cell_type != CellType::Relay {
-                peel_ok = false;
-                break;
-            }
-            let inner = match decrypt_frame(layer, &cell.payload) {
-                Ok(p) => p,
-                Err(_) => {
-                    peel_ok = false;
-                    break;
-                }
-            };
-            cell = match Cell::decode(&inner) {
-                Ok(c) => c,
-                Err(_) => {
-                    peel_ok = false;
-                    break;
-                }
-            };
-        }
-        if !peel_ok {
-            break;
-        }
-        match cell.cell_type {
-            CellType::Data => {
-                if to_user.write_all(&cell.payload).await.is_err() {
-                    break;
-                }
-            }
-            _ => break,
-        }
-    }
     let _ = to_user.shutdown().await;
 }
 

@@ -1,5 +1,4 @@
 use quiethop_crypto::cell::CellError;
-use quiethop_crypto::crypto::CryptoError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -28,7 +27,9 @@ pub enum ClientError {
     #[error("invalid endpoint {0:?}: {1}")]
     InvalidEndpoint(String, String),
     #[error("crypto: {0}")]
-    Crypto(#[from] CryptoError),
+    Noise(#[from] quiethop_crypto::noise::NoiseError),
+    #[error("layer: {0}")]
+    Layer(#[from] quiethop_crypto::layer::LayerError),
     #[error("cell: {0}")]
     Cell(#[from] CellError),
     #[error("circuit handshake: unexpected cell type {0:?}")]

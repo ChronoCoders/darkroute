@@ -5,10 +5,5 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-tokio = { workspace = true }
 thiserror = { workspace = true }
-sha2 = { workspace = true }
-x25519-dalek = { workspace = true }
-aes-gcm = { workspace = true }
-hkdf = { workspace = true }
-rand_core = { workspace = true }
+snow = { workspace = true }

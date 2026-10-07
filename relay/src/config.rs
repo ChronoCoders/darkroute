@@ -86,6 +86,10 @@ pub struct RelayConfig {
     /// directory (rate limits are looser; certs are not browser-trusted).
     /// Defaults to false (production directory).
     pub acme_staging: bool,
+    /// Path to the long-term X25519 static key, `private(32) || public(32)`,
+    /// mode 0600. Written by the `keygen` subcommand and never generated at
+    /// startup (ARCHITECTURE §5.2 step 3).
+    pub static_key_path: PathBuf,
     /// Map from next-hop relay socket address to the hostname the
     /// outbound TLS client must present as SNI and verify against the
     /// peer's certificate. Required because the EXTEND wire payload
@@ -133,6 +137,10 @@ impl RelayConfig {
             _ => PathBuf::from("/opt/quiethop/secrets/acme-cache"),
         };
         let acme_staging = parse_bool(&get, "ACME_STAGING", false)?;
+        let static_key_path = match get("RELAY_STATIC_KEY_PATH") {
+            Some(s) if !s.is_empty() => PathBuf::from(s),
+            _ => PathBuf::from("/opt/quiethop/secrets/static.key"),
+        };
         let peer_hostnames = match get("PEER_HOSTNAMES") {
             None => HashMap::new(),
             Some(s) => parse_peer_hostnames(&s)?,
@@ -189,6 +197,7 @@ impl RelayConfig {
             acme_contact_email,
             acme_dir,
             acme_staging,
+            static_key_path,
             peer_hostnames,
         })
     }

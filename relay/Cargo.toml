@@ -27,4 +27,4 @@ futures-util = { workspace = true }
 [dev-dependencies]
 rcgen = "0.13"
 rand_core = { workspace = true }
-x25519-dalek = { workspace = true }
+tempfile = "3"
