@@ -115,7 +115,15 @@ impl<R: tokio::io::AsyncRead + Unpin> FrameReader<R> {
             if let Some(frame) = self.acc.next_frame() {
                 return Ok(frame);
             }
-            let n = self.inner.read(&mut self.scratch).await?;
+            // Read only as far as the end of the frame being assembled.
+            // Sizing this to the whole scratch buffer would let one read take
+            // the rest of the frame plus the bytes after it, and those bytes
+            // would then be dropped along with this reader. On a relay's
+            // inbound link they are the next circuit's CIRCUIT_START and
+            // handshake message. `pending` is below frame_len here, because a
+            // full frame was already drained above, so room is at least 1.
+            let room = self.scratch.len() - self.acc.pending();
+            let n = self.inner.read(&mut self.scratch[..room]).await?;
             if n == 0 {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -587,6 +595,55 @@ mod cancel_safety {
         .expect("FrameReader should assemble the frame within the deadline");
 
         assert_eq!(frame, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    /// A read must never reach past the end of the frame being assembled.
+    ///
+    /// With a partial frame buffered, a read sized to the whole scratch buffer
+    /// can take the rest of the frame plus the bytes that follow it. Those
+    /// trailing bytes then live inside the reader, and anything that drops the
+    /// reader drops them. On a relay's inbound link the bytes after a cell are
+    /// the next circuit's CIRCUIT_START and handshake message.
+    #[tokio::test]
+    async fn next_frame_never_reads_past_the_frame_it_returns() {
+        let (mut tx, rx) = tokio::io::duplex(1024);
+
+        // Three bytes of the frame are available before the first read, so the
+        // reader buffers a partial frame without needing a cancellation.
+        tx.write_all(&[1, 2, 3]).await.unwrap();
+        tx.flush().await.unwrap();
+        let mut reader = super::FrameReader::new(rx, FRAME);
+
+        // The remaining five bytes and three trailing bytes arrive together, so
+        // one read has more available than the frame needs.
+        let writer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            tx.write_all(&[4, 5, 6, 7, 8, 0xAA, 0xBB, 0xCC])
+                .await
+                .unwrap();
+            tx.flush().await.unwrap();
+            // Hold the stream open while the test reads the trailing bytes.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+
+        let frame = reader.next_frame().await.expect("frame");
+        assert_eq!(frame, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            reader.pending(),
+            0,
+            "the reader swallowed {} bytes that belong after the frame",
+            reader.pending()
+        );
+
+        // The trailing bytes must still be in the stream, not inside the reader.
+        let mut inner = reader.into_inner();
+        let mut trailing = [0u8; 3];
+        inner
+            .read_exact(&mut trailing)
+            .await
+            .expect("the bytes after the frame must still be readable");
+        assert_eq!(trailing, [0xAA, 0xBB, 0xCC]);
+        writer.abort();
     }
 
     /// A cancelled `next_frame` retains the partial frame, and `pending`
