@@ -1,15 +1,15 @@
 [package]
-name = "darkrouter-client-sdk"
+name = "quiethop-client-sdk"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 
 [lib]
-name = "darkrouter_client"
+name = "quiethop_client"
 path = "src/lib.rs"
 
 [dependencies]
-darkrouter-crypto = { path = "../darkrouter-crypto" }
+quiethop-crypto = { path = "../quiethop-crypto" }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

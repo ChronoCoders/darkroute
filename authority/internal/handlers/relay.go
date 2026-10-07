@@ -9,7 +9,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/ChronoCoders/darkrouter/authority/internal/relay"
+	"github.com/ChronoCoders/quiethop/authority/internal/relay"
 )
 
 type RelayHandler struct {

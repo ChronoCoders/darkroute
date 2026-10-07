@@ -29,9 +29,9 @@ use tokio_rustls::server::TlsStream as ServerTlsStream;
 use tokio_rustls::TlsConnector;
 use tracing::{error, info, warn};
 
-use darkrouter_crypto::cell::{self, Cell, CellType, ConnectPayload, ExtendForward};
-use darkrouter_crypto::crypto::{self, SessionKey};
-use darkrouter_crypto::wire::{
+use quiethop_crypto::cell::{self, Cell, CellType, ConnectPayload, ExtendForward};
+use quiethop_crypto::crypto::{self, SessionKey};
+use quiethop_crypto::wire::{
     CIRCUIT_ID, CIRCUIT_START, M_RAW_LEN, PRESENTATION_LEN, PROTO_CLIENT, PROTO_RELAY,
     X25519_PK_LEN,
 };
@@ -696,7 +696,7 @@ pub(crate) mod test_hooks {
     use std::sync::OnceLock;
     use tokio::sync::mpsc;
 
-    use darkrouter_crypto::cell::ConnectPayload;
+    use quiethop_crypto::cell::ConnectPayload;
 
     static CONNECT_SINK: OnceLock<Mutex<Option<mpsc::UnboundedSender<ConnectPayload>>>> =
         OnceLock::new();

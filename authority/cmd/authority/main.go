@@ -15,12 +15,12 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/ChronoCoders/darkrouter/authority/internal/auth"
-	"github.com/ChronoCoders/darkrouter/authority/internal/blind"
-	"github.com/ChronoCoders/darkrouter/authority/internal/config"
-	"github.com/ChronoCoders/darkrouter/authority/internal/db"
-	"github.com/ChronoCoders/darkrouter/authority/internal/handlers"
-	"github.com/ChronoCoders/darkrouter/authority/internal/relay"
+	"github.com/ChronoCoders/quiethop/authority/internal/auth"
+	"github.com/ChronoCoders/quiethop/authority/internal/blind"
+	"github.com/ChronoCoders/quiethop/authority/internal/config"
+	"github.com/ChronoCoders/quiethop/authority/internal/db"
+	"github.com/ChronoCoders/quiethop/authority/internal/handlers"
+	"github.com/ChronoCoders/quiethop/authority/internal/relay"
 )
 
 func main() {

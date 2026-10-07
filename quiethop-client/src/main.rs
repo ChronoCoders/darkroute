@@ -1,7 +1,7 @@
 #![deny(warnings)]
 #![forbid(unsafe_code)]
 
-//! SOCKS5 daemon that tunnels CONNECT requests through a 3-hop darkrouter circuit.
+//! SOCKS5 daemon that tunnels CONNECT requests through a 3-hop QuietHop circuit.
 
 mod socks5;
 
@@ -9,7 +9,7 @@ use std::env;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use darkrouter_client::{DarkrouterClient, DarkrouterConfig};
+use quiethop_client::{QuietHopClient, QuietHopConfig};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -61,7 +61,7 @@ async fn main() -> ExitCode {
     };
     let bind = env::var("SOCKS5_BIND").unwrap_or_else(|_| "127.0.0.1:1080".to_string());
 
-    let mut client = match DarkrouterClient::new(DarkrouterConfig {
+    let mut client = match QuietHopClient::new(QuietHopConfig {
         authority_url: authority,
         email,
         password,

@@ -39,14 +39,14 @@ import (
 )
 
 // Prefix every database this helper may create or drop must carry. The template is
-// darkrouter_test with no trailing underscore, so it can never match.
-const Prefix = "darkrouter_test_"
+// quiethop_test with no trailing underscore, so it can never match.
+const Prefix = "quiethop_test_"
 
 // MaxNameLen is PostgreSQL's identifier limit. A longer name would be silently
 // truncated, and two truncated names could collide.
 const MaxNameLen = 63
 
-const DefaultTemplateURL = "postgres:///darkrouter_test?host=/var/run/postgresql&sslmode=disable"
+const DefaultTemplateURL = "postgres:///quiethop_test?host=/var/run/postgresql&sslmode=disable"
 
 // forceDropMinVersion is the server_version_num from which DROP DATABASE accepts
 // WITH (FORCE), which terminates other sessions rather than failing.

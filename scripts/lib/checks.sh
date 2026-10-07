@@ -35,7 +35,7 @@ CK_AUTHOR_EMAIL='altug@bytus.io'
 # wanted. The database check still fails loudly when the cluster is down or the
 # schema is missing. It just no longer fails merely because nobody exported a
 # variable.
-CK_TEST_DB_DEFAULT='postgres:///darkrouter_test?host=/var/run/postgresql&sslmode=disable'
+CK_TEST_DB_DEFAULT='postgres:///quiethop_test?host=/var/run/postgresql&sslmode=disable'
 
 ck_test_db_url() {
 	printf '%s' "${TEST_DATABASE_URL:-$CK_TEST_DB_DEFAULT}"
@@ -559,7 +559,7 @@ ck_test_db() {
 # that holds no server. If that passes, the check cannot tell a missing database
 # from a present one, and a green gate would mean nothing.
 ck_test_db_control() {
-	if ( TEST_DATABASE_URL='postgres:///darkrouter_test?host=/var/empty&sslmode=disable'
+	if ( TEST_DATABASE_URL='postgres:///quiethop_test?host=/var/empty&sslmode=disable'
 		ck_test_db ) >/dev/null 2>&1; then
 		echo "the database check passed against a dead socket, so it detects nothing" >&2
 		return 1

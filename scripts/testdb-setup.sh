@@ -61,7 +61,7 @@ echo "server ready: $(pg_isready 2>&1)"
 # list and an untroubled "no leftover per package databases", which is a clean report
 # of a check that never ran.
 leftovers=$(psql "$MAINT" -tAc \
-	"select datname from pg_database where datname like 'darkrouter\\_test\\_%'" 2>&1)
+	"select datname from pg_database where datname like 'quiethop\\_test\\_%'" 2>&1)
 if [ $? -ne 0 ]; then
 	echo "listing leftover databases failed, so the sweep cannot run:" >&2
 	printf '%s\n' "$leftovers" | sed 's/^/    /' >&2
@@ -76,9 +76,9 @@ else
 	while IFS= read -r db; do
 		[ -z "$db" ] && continue
 		case "$db" in
-		darkrouter_test_*) ;;
+		quiethop_test_*) ;;
 		*)
-			echo "refusing to drop '$db': outside the darkrouter_test_ namespace" >&2
+			echo "refusing to drop '$db': outside the quiethop_test_ namespace" >&2
 			survivors="$survivors $db"
 			continue
 			;;

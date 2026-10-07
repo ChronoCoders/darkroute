@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use darkrouter_client::DarkrouterClient;
+use quiethop_client::QuietHopClient;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -24,7 +24,7 @@ pub enum SocksError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("client SDK: {0}")]
-    Client(#[from] darkrouter_client::ClientError),
+    Client(#[from] quiethop_client::ClientError),
     #[error("unsupported SOCKS version 0x{0:02x}")]
     UnsupportedVersion(u8),
     #[error("unsupported SOCKS command 0x{0:02x}")]
@@ -37,7 +37,7 @@ pub enum SocksError {
 
 pub async fn serve(
     mut sock: TcpStream,
-    client: Arc<Mutex<DarkrouterClient>>,
+    client: Arc<Mutex<QuietHopClient>>,
 ) -> Result<(), SocksError> {
     let mut greet = [0u8; 2];
     sock.read_exact(&mut greet).await?;

@@ -12,7 +12,7 @@ import (
 	"log/slog"
 	"os"
 
-	"github.com/ChronoCoders/darkrouter/authority/internal/db"
+	"github.com/ChronoCoders/quiethop/authority/internal/db"
 )
 
 func main() {

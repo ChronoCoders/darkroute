@@ -38,10 +38,8 @@ use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::TlsConnector;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
-use darkrouter_crypto::cell::{
-    parse_extend_backward, Cell, CellType, ConnectPayload, ExtendForward,
-};
-use darkrouter_crypto::crypto::{
+use quiethop_crypto::cell::{parse_extend_backward, Cell, CellType, ConnectPayload, ExtendForward};
+use quiethop_crypto::crypto::{
     decrypt_frame, derive_session_key, encrypt_frame, X25519_PUBKEY_LEN,
 };
 
@@ -136,7 +134,7 @@ fn make_config(
         peer_allowlist: vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))],
         relay_hostname: TEST_HOSTNAME.to_string(),
         acme_contact_email: "test@example.invalid".to_string(),
-        acme_dir: PathBuf::from("/tmp/darkrouter-relay-test-acme-unused"),
+        acme_dir: PathBuf::from("/tmp/quiethop-relay-test-acme-unused"),
         acme_staging: true,
         peer_hostnames: peers,
     })
@@ -626,7 +624,7 @@ async fn run_data_test() {
     // Wait briefly so the exit completes the SOCKS5 dial before DATA arrives.
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let payload_bytes = b"hello-darkrouter".to_vec();
+    let payload_bytes = b"hello-quiethop".to_vec();
     let data_cell = Cell::new(CellType::Data, CIRCUIT_ID, payload_bytes.clone()).unwrap();
     let f_exit = encrypt_frame(&k_exit, &data_cell.encode()).unwrap();
     let r_mid = Cell::new(CellType::Relay, CIRCUIT_ID, f_exit).unwrap();

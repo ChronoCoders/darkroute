@@ -3,8 +3,8 @@
 //! Exposes a `/metrics` HTTP endpoint on the metrics port (see
 //! ARCHITECTURE.md §5.1). The relay registers two counters at startup:
 //!
-//!   * `darkrouter_tokens_verified_total`: tokens that passed verify()
-//!   * `darkrouter_tokens_rejected_total{reason}`: tokens that failed verify(),
+//!   * `quiethop_tokens_verified_total`: tokens that passed verify()
+//!   * `quiethop_tokens_rejected_total{reason}`: tokens that failed verify(),
 //!     labelled by failure reason (`invalid_signature`, `replayed`,
 //!     `token_too_short`).
 //!
@@ -40,7 +40,7 @@ fn tokens_verified() -> &'static IntCounter {
         // here is a valid prometheus identifier so the panic path is
         // unreachable.
         let c = IntCounter::new(
-            "darkrouter_tokens_verified_total",
+            "quiethop_tokens_verified_total",
             "Tokens that passed verify() since startup",
         )
         .expect("static counter name is valid");
@@ -56,7 +56,7 @@ fn tokens_verified() -> &'static IntCounter {
 fn tokens_rejected() -> &'static IntCounterVec {
     TOKENS_REJECTED.get_or_init(|| {
         let opts = Opts::new(
-            "darkrouter_tokens_rejected_total",
+            "quiethop_tokens_rejected_total",
             "Tokens rejected by verify() since startup, labelled by reason",
         );
         let c = IntCounterVec::new(opts, &["reason"])
@@ -197,8 +197,8 @@ mod tests {
 
         let body = encode_metrics().expect("encode");
         let text = String::from_utf8(body).expect("utf8");
-        assert!(text.contains("darkrouter_tokens_verified_total"));
-        assert!(text.contains("darkrouter_tokens_rejected_total"));
+        assert!(text.contains("quiethop_tokens_verified_total"));
+        assert!(text.contains("quiethop_tokens_rejected_total"));
         assert!(text.contains("reason=\"invalid_signature\""));
         assert!(text.contains("reason=\"replayed\""));
         assert!(text.contains("reason=\"token_too_short\""));

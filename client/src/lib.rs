@@ -1,7 +1,7 @@
 #![deny(warnings)]
 #![forbid(unsafe_code)]
 
-//! darkrouter client SDK: login, blind-token issuance, circuit dialer.
+//! QuietHop client SDK: login, blind-token issuance, circuit dialer.
 
 mod auth;
 mod blind;
@@ -23,22 +23,22 @@ use rsa::RsaPublicKey;
 use tokio_rustls::TlsConnector;
 use url::Url;
 
-pub struct DarkrouterConfig {
+pub struct QuietHopConfig {
     pub authority_url: Url,
     pub email: String,
     pub password: String,
 }
 
-pub struct DarkrouterClient {
-    cfg: DarkrouterConfig,
+pub struct QuietHopClient {
+    cfg: QuietHopConfig,
     http: HttpClient,
     tls: Arc<TlsConnector>,
     session: Option<Session>,
     pubkey: Option<RsaPublicKey>,
 }
 
-impl DarkrouterClient {
-    pub fn new(cfg: DarkrouterConfig) -> Result<Self, ClientError> {
+impl QuietHopClient {
+    pub fn new(cfg: QuietHopConfig) -> Result<Self, ClientError> {
         let http = HttpClient::builder()
             .cookie_store(true)
             .timeout(std::time::Duration::from_secs(30))

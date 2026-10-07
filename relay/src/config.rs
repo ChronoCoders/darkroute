@@ -130,7 +130,7 @@ impl RelayConfig {
         let acme_contact_email = required(&get, "ACME_CONTACT_EMAIL")?;
         let acme_dir = match get("ACME_DIR") {
             Some(s) if !s.is_empty() => PathBuf::from(s),
-            _ => PathBuf::from("/opt/darkrouter/secrets/acme-cache"),
+            _ => PathBuf::from("/opt/quiethop/secrets/acme-cache"),
         };
         let acme_staging = parse_bool(&get, "ACME_STAGING", false)?;
         let peer_hostnames = match get("PEER_HOSTNAMES") {
@@ -558,7 +558,7 @@ mod tests {
         let cfg = RelayConfig::from_source(lookup(&env)).expect("valid");
         assert_eq!(
             cfg.acme_dir,
-            std::path::PathBuf::from("/opt/darkrouter/secrets/acme-cache")
+            std::path::PathBuf::from("/opt/quiethop/secrets/acme-cache")
         );
     }
 

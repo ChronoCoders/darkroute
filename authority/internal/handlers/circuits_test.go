@@ -10,7 +10,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/ChronoCoders/darkrouter/authority/internal/auth"
+	"github.com/ChronoCoders/quiethop/authority/internal/auth"
 )
 
 // routeRequest builds the request HandleRoute expects. The subscriber id goes into

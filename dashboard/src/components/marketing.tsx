@@ -25,7 +25,7 @@ function Logo({ className }: { className?: string }) {
       >
         <span className="block h-3 w-3 rounded-sm bg-zinc-50/90" />
       </span>
-      <span className="text-lg">darkrouter</span>
+      <span className="text-lg">QuietHop</span>
     </Link>
   );
 }

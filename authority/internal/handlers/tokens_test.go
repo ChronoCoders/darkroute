@@ -17,8 +17,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/golang-jwt/jwt/v5"
 
-	"github.com/ChronoCoders/darkrouter/authority/internal/auth"
-	"github.com/ChronoCoders/darkrouter/authority/internal/blind"
+	"github.com/ChronoCoders/quiethop/authority/internal/auth"
+	"github.com/ChronoCoders/quiethop/authority/internal/blind"
 )
 
 const testJWTSecret = "test-secret-of-sufficient-length-please-32+"

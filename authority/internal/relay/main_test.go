@@ -4,7 +4,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/ChronoCoders/darkrouter/authority/internal/dbtest"
+	"github.com/ChronoCoders/quiethop/authority/internal/dbtest"
 )
 
 // This package's tests get a database of their own, created from the migrated

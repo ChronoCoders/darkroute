@@ -35,7 +35,7 @@ pub const TAG_LEN: usize = 16;
 pub const MAX_FRAME_PLAINTEXT: usize = 64 * 1024;
 const MAX_FRAME_CIPHERTEXT: usize = MAX_FRAME_PLAINTEXT + TAG_LEN;
 
-const HKDF_INFO_SESSION_KEY: &[u8] = b"darkrouter/v1/session-key";
+const HKDF_INFO_SESSION_KEY: &[u8] = b"quiethop/v1/session-key";
 
 #[derive(Debug, Error)]
 pub enum CryptoError {
@@ -305,7 +305,7 @@ mod tests {
     async fn frame_round_trip() {
         let key = SessionKey::from_raw([7u8; AES_KEY_LEN]);
         let (mut a, mut b) = duplex(8192);
-        let plaintext = b"darkrouter control cell test payload";
+        let plaintext = b"quiethop control cell test payload";
 
         write_frame(&mut a, &key, plaintext).await.unwrap();
 

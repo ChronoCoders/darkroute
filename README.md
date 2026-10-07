@@ -1,10 +1,10 @@
-# Darkrouter
+# QuietHop
 
 B2B onion routing infrastructure with cryptographic access control and residential exit IPs.
 
 ## What it is
 
-Darkrouter is a managed three-hop circuit routing service for businesses that need to make outbound HTTPS requests from an origin the destination cannot attribute to them. Each request travels through three relay hops before exiting through a sticky residential IP. The destination sees a residential address and nothing that ties the request back to your company.
+QuietHop is a managed three-hop circuit routing service for businesses that need to make outbound HTTPS requests from an origin the destination cannot attribute to them. Each request travels through three relay hops before exiting through a sticky residential IP. The destination sees a residential address and nothing that ties the request back to your company.
 
 Access is gated by a blind-signed token, so a relay can check that a request is paid for without learning which subscriber sent it. It does not make you anonymous to us, and the privacy model below says exactly what holds today and what does not.
 
@@ -39,7 +39,7 @@ The network is built for relays run by several independent operators, each a sep
 | Residential exit | Decodo sticky dedicated IP. The destination sees this IP as the request source. |
 | Dashboard | Operator self-service for subscription, key management, circuit history, and usage. |
 
-All relay hops run on port 443 with real Let's Encrypt certificates obtained via TLS-ALPN-01. Inter-relay traffic is itself TLS with verified hostnames, so a passive observer of any single hop sees only HTTPS to a darkrouter hostname.
+All relay hops run on port 443 with real Let's Encrypt certificates obtained via TLS-ALPN-01. Inter-relay traffic is itself TLS with verified hostnames, so a passive observer of any single hop sees only HTTPS to a QuietHop hostname.
 
 ## Client integration
 
@@ -62,7 +62,7 @@ The Rust SDK is also exposed directly for applications that prefer in-process in
 
 ## Self-hosting
 
-Not supported. Darkrouter runs as managed infrastructure on operator-controlled hosts. The authority, the relay fleet, the residential exit IPs and the certificate lifecycle are run by Distributed Systems Labs today, and relays will also be run by contracted operators as the network grows. Customers do not run relays in either case. Source is published for review under the BSL terms below, not for independent deployment.
+Not supported. QuietHop runs as managed infrastructure on operator-controlled hosts. The authority, the relay fleet, the residential exit IPs and the certificate lifecycle are run by Distributed Systems Labs today, and relays will also be run by contracted operators as the network grows. Customers do not run relays in either case. Source is published for review under the BSL terms below, not for independent deployment.
 
 If you need a private deployment for compliance reasons, contact us.
 

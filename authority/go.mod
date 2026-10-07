@@ -1,4 +1,4 @@
-module github.com/ChronoCoders/darkrouter/authority
+module github.com/ChronoCoders/quiethop/authority
 
 go 1.25.0
 

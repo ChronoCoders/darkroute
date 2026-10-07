@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/ChronoCoders/darkrouter/authority/internal/dbtest"
+	"github.com/ChronoCoders/quiethop/authority/internal/dbtest"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 

@@ -12,7 +12,7 @@
 //! client/.env.example.
 //!
 //! Gated `#[ignore]` so `cargo test` never runs it; only
-//! `cargo test -p darkrouter-client -- --ignored` exercises this path.
+//! `cargo test -p quiethop-client -- --ignored` exercises this path.
 
 use std::process::Stdio;
 use std::time::Duration;
@@ -38,7 +38,7 @@ async fn live_circuit_returns_expected_exit_ip() {
         "EXPECTED_EXIT_IP must be set to the exit address this deployment is expected to leave from",
     );
 
-    let bin = env!("CARGO_BIN_EXE_darkrouter-client");
+    let bin = env!("CARGO_BIN_EXE_quiethop-client");
     let mut child = Command::new(bin)
         .env("AUTHORITY_URL", authority)
         .env("CLIENT_EMAIL", email)
@@ -49,7 +49,7 @@ async fn live_circuit_returns_expected_exit_ip() {
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .spawn()
-        .expect("spawn darkrouter-client");
+        .expect("spawn quiethop-client");
 
     // tracing_subscriber::fmt writes to stdout by default; the daemon's
     // ready marker comes through there.

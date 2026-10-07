@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/ChronoCoders/darkrouter/authority/internal/blind"
+	"github.com/ChronoCoders/quiethop/authority/internal/blind"
 )
 
 // Per SECURITY_MODEL §5.2 step 8, the authority records only that a token

@@ -8,7 +8,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/ChronoCoders/darkrouter/authority/internal/relay"
+	"github.com/ChronoCoders/quiethop/authority/internal/relay"
 )
 
 // SECURITY_MODEL §9 lets the authority know circuit routes. This is the

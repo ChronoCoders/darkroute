@@ -12,7 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/ChronoCoders/darkrouter/authority/internal/auth"
+	"github.com/ChronoCoders/quiethop/authority/internal/auth"
 )
 
 // Precomputed Argon2id hash used to equalize timing when the login flow

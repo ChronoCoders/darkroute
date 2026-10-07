@@ -452,82 +452,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "darkrouter-client"
-version = "0.1.0"
-dependencies = [
- "darkrouter-client-sdk",
- "reqwest",
- "rustls",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
-name = "darkrouter-client-sdk"
-version = "0.1.0"
-dependencies = [
- "darkrouter-crypto",
- "num-bigint-dig",
- "num-traits",
- "rand 0.8.6",
- "rand_core 0.6.4",
- "reqwest",
- "rsa",
- "rustls",
- "rustls-native-certs",
- "serde",
- "sha2",
- "thiserror 1.0.69",
- "tokio",
- "tokio-rustls",
- "url",
- "x25519-dalek",
-]
-
-[[package]]
-name = "darkrouter-crypto"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "hkdf",
- "rand_core 0.6.4",
- "sha2",
- "thiserror 1.0.69",
- "tokio",
- "x25519-dalek",
-]
-
-[[package]]
-name = "darkrouter-relay"
-version = "0.1.0"
-dependencies = [
- "darkrouter-crypto",
- "futures-util",
- "num-bigint",
- "prometheus",
- "rand_core 0.6.4",
- "rcgen",
- "reqwest",
- "rsa",
- "rustls",
- "rustls-acme",
- "rustls-native-certs",
- "serde",
- "sha2",
- "thiserror 1.0.69",
- "tokio",
- "tokio-rustls",
- "tokio-socks",
- "tracing",
- "tracing-subscriber",
- "url",
- "x25519-dalek",
-]
-
-[[package]]
 name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1518,6 +1442,82 @@ checksum = "6f42ea446cab60335f76979ec15e12619a2165b5ae2c12166bef27d283a9fadf"
 dependencies = [
  "idna",
  "psl-types",
+]
+
+[[package]]
+name = "quiethop-client"
+version = "0.1.0"
+dependencies = [
+ "quiethop-client-sdk",
+ "reqwest",
+ "rustls",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
+name = "quiethop-client-sdk"
+version = "0.1.0"
+dependencies = [
+ "num-bigint-dig",
+ "num-traits",
+ "quiethop-crypto",
+ "rand 0.8.6",
+ "rand_core 0.6.4",
+ "reqwest",
+ "rsa",
+ "rustls",
+ "rustls-native-certs",
+ "serde",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-rustls",
+ "url",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "quiethop-crypto"
+version = "0.1.0"
+dependencies = [
+ "aes-gcm",
+ "hkdf",
+ "rand_core 0.6.4",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "quiethop-relay"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "num-bigint",
+ "prometheus",
+ "quiethop-crypto",
+ "rand_core 0.6.4",
+ "rcgen",
+ "reqwest",
+ "rsa",
+ "rustls",
+ "rustls-acme",
+ "rustls-native-certs",
+ "serde",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-rustls",
+ "tokio-socks",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "x25519-dalek",
 ]
 
 [[package]]

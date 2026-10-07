@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["darkrouter-crypto", "relay", "client", "darkrouter-client"]
+members = ["quiethop-crypto", "relay", "client", "quiethop-client"]
 
 [workspace.package]
 edition = "2021"
