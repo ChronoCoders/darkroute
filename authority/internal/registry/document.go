@@ -35,6 +35,18 @@ type Document struct {
 	Relays     []RelayEntry `json:"relays"`
 }
 
+// VersionFor derives the document version from its hour: hours since the Unix
+// epoch.
+//
+// A counted version decouples version order from hour order. Two instances
+// whose clocks differ by minutes can publish out of order, and the older
+// document then carries the higher version, which a client reads as newer.
+// Deriving it makes the two orders the same thing, needs no query, and cannot
+// race. The database enforces the same rule with a CHECK constraint.
+func VersionFor(validAfter time.Time) int64 {
+	return validAfter.UTC().Unix() / 3600
+}
+
 // HourOf truncates to the publication boundary. Every client fetching within
 // one hour must get the same bytes, so the hour is the document's identity.
 func HourOf(t time.Time) time.Time {

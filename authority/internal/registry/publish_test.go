@@ -147,8 +147,99 @@ func TestConcurrentFirstRequestsProduceOneRow(t *testing.T) {
 	}
 }
 
-// version strictly increases across hours and survives a publisher restart,
-// which an in-memory counter would not.
+// Two publishers whose clocks differ by an hour: the later hour always carries
+// the higher version, whichever publishes first. A counted version could not
+// give this, because the order of publication would decide the order of
+// versions rather than the hour.
+func TestLaterHourAlwaysHasTheHigherVersionWhicheverPublishesFirst(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	earlier := time.Date(2026, 10, 7, 9, 0, 0, 0, time.UTC)
+	later := earlier.Add(time.Hour)
+
+	// The slow instance publishes the earlier hour second, which is the order
+	// that breaks a counter.
+	for _, order := range []struct {
+		name  string
+		first time.Time
+		then  time.Time
+	}{
+		{"later first", later, earlier},
+		{"earlier first", earlier, later},
+	} {
+		clearDocuments(t, pool)
+		fast := NewPublisher(pool, signerFor(t))
+		slow := NewPublisher(pool, signerFor(t))
+
+		if _, _, err := fast.Current(ctx, order.first); err != nil {
+			t.Fatalf("%s: first publish: %v", order.name, err)
+		}
+		if _, _, err := slow.Current(ctx, order.then); err != nil {
+			t.Fatalf("%s: second publish: %v", order.name, err)
+		}
+
+		verEarlier := storedVersion(t, pool, HourOf(earlier))
+		verLater := storedVersion(t, pool, HourOf(later))
+		if verLater <= verEarlier {
+			t.Errorf("%s: later hour version %d is not above earlier hour version %d",
+				order.name, verLater, verEarlier)
+		}
+		if want := VersionFor(HourOf(earlier)); verEarlier != want {
+			t.Errorf("%s: earlier version %d, want %d", order.name, verEarlier, want)
+		}
+		if want := VersionFor(HourOf(later)); verLater != want {
+			t.Errorf("%s: later version %d, want %d", order.name, verLater, want)
+		}
+	}
+}
+
+// The database holds the publisher to the derivation, so a row that disagrees
+// cannot be stored even by a direct insert.
+func TestCheckConstraintsRejectOffHourAndMismatchedVersion(t *testing.T) {
+	pool := testPool(t)
+	clearDocuments(t, pool)
+	ctx := context.Background()
+	hour := time.Date(2026, 10, 7, 11, 0, 0, 0, time.UTC)
+
+	// Control: a correct row inserts.
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO registry_documents (version, valid_after, document, signatures)
+		 VALUES ($1, $2, $3, '[]'::jsonb)`,
+		VersionFor(hour), hour, []byte("{}")); err != nil {
+		t.Fatalf("control insert failed: %v", err)
+	}
+
+	// An off-hour valid_after.
+	offHour := hour.Add(30 * time.Minute)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO registry_documents (version, valid_after, document, signatures)
+		 VALUES ($1, $2, $3, '[]'::jsonb)`,
+		VersionFor(offHour), offHour, []byte("{}")); err == nil {
+		t.Error("an off-hour valid_after was stored")
+	}
+
+	// A version that does not match its hour.
+	other := hour.Add(2 * time.Hour)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO registry_documents (version, valid_after, document, signatures)
+		 VALUES ($1, $2, $3, '[]'::jsonb)`,
+		VersionFor(hour)+1, other, []byte("{}")); err == nil {
+		t.Error("a version that does not match its valid_after was stored")
+	}
+}
+
+func storedVersion(t *testing.T, pool *pgxpool.Pool, hour time.Time) int64 {
+	t.Helper()
+	var v int64
+	if err := pool.QueryRow(context.Background(),
+		`SELECT version FROM registry_documents WHERE valid_after = $1`, hour).Scan(&v); err != nil {
+		t.Fatalf("read version for %s: %v", hour, err)
+	}
+	return v
+}
+
+// version follows the hour and survives a publisher restart, which an
+// in-memory counter would not.
 func TestVersionIncreasesAcrossHoursAndSurvivesRestart(t *testing.T) {
 	pool := testPool(t)
 	clearDocuments(t, pool)
@@ -173,6 +264,10 @@ func TestVersionIncreasesAcrossHoursAndSurvivesRestart(t *testing.T) {
 
 	if verB <= verA {
 		t.Errorf("version did not increase across hours: %d then %d", verA, verB)
+	}
+	// And it is the hour, not a count, so the gap is exactly one.
+	if verB-verA != 1 {
+		t.Errorf("consecutive hours differ by %d, want 1", verB-verA)
 	}
 	third := NewPublisher(pool, signerFor(t))
 	docC, _, err := third.Current(ctx, base.Add(2*time.Hour))

@@ -79,14 +79,8 @@ func (p *Publisher) publish(ctx context.Context, hour time.Time) ([]byte, []Sign
 		return nil, nil, fmt.Errorf("read active relays: %w", err)
 	}
 
-	var next int64
-	if err := p.pool.QueryRow(ctx,
-		`SELECT COALESCE(MAX(version), 0) + 1 FROM registry_documents`).Scan(&next); err != nil {
-		return nil, nil, fmt.Errorf("next version: %w", err)
-	}
-
 	doc := Document{
-		Version:    next,
+		Version:    VersionFor(hour),
 		ValidAfter: stamp(hour),
 		FreshUntil: stamp(hour.Add(FreshWindow)),
 		ValidUntil: stamp(hour.Add(ValidWindow)),
@@ -105,8 +99,8 @@ func (p *Publisher) publish(ctx context.Context, hour time.Time) ([]byte, []Sign
 	tag, err := p.pool.Exec(ctx,
 		`INSERT INTO registry_documents (version, valid_after, document, signatures)
 		 VALUES ($1, $2, $3, $4)
-		 ON CONFLICT DO NOTHING`,
-		next, hour, bytes, sigsJSON,
+		 ON CONFLICT (valid_after) DO NOTHING`,
+		VersionFor(hour), hour, bytes, sigsJSON,
 	)
 	if err != nil {
 		return nil, nil, fmt.Errorf("insert document: %w", err)

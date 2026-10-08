@@ -200,6 +200,23 @@ fn check_validity(doc: &Document, now_unix: i64) -> Result<(), ClientError> {
             "valid_until is not after valid_after".into(),
         ));
     }
+    // version is hours since the epoch, derived from valid_after rather than
+    // counted. Checking it here makes version order and hour order the same
+    // thing on both sides, so a document cannot claim to be newer than its own
+    // hour (docs/DECISIONS.md entry 16).
+    if after % 3600 != 0 {
+        return Err(ClientError::Registry(format!(
+            "valid_after {} is not on an exact hour",
+            doc.valid_after
+        )));
+    }
+    let expected = after / 3600;
+    if doc.version != expected {
+        return Err(ClientError::Registry(format!(
+            "version {} does not match valid_after {}, which is hour {expected}",
+            doc.version, doc.valid_after
+        )));
+    }
     if now_unix + SKEW_ALLOWANCE_SECS < after {
         return Err(ClientError::Registry(format!(
             "document is not yet valid: valid_after {} is more than {SKEW_ALLOWANCE_SECS}s ahead",
@@ -360,7 +377,15 @@ mod tests {
         PinnedKey::from_bytes(&k.verifying_key().to_bytes()).unwrap()
     }
 
-    fn doc_bytes(version: i64, valid_after: &str, valid_until: &str) -> Vec<u8> {
+    /// Build a document whose version is derived from its hour, as the
+    /// authority does.
+    fn doc_bytes(valid_after: &str, valid_until: &str) -> Vec<u8> {
+        let version = parse_rfc3339(valid_after).expect("valid_after parses") / 3600;
+        doc_bytes_versioned(version, valid_after, valid_until)
+    }
+
+    /// Build a document with an explicit version, so a mismatch can be tested.
+    fn doc_bytes_versioned(version: i64, valid_after: &str, valid_until: &str) -> Vec<u8> {
         format!(
             r#"{{"version":{version},"valid_after":"{valid_after}","fresh_until":"{valid_after}","valid_until":"{valid_until}","relays":[]}}"#
         )
@@ -368,7 +393,12 @@ mod tests {
     }
 
     fn sample_doc() -> Vec<u8> {
-        doc_bytes(10, "2026-10-07T14:00:00Z", "2026-10-07T20:00:00Z")
+        doc_bytes("2026-10-07T14:00:00Z", "2026-10-07T20:00:00Z")
+    }
+
+    /// The hour number for the sample document's valid_after.
+    fn sample_version() -> i64 {
+        parse_rfc3339("2026-10-07T14:00:00Z").unwrap() / 3600
     }
 
     fn envelope(k: &SigningKey, document: &[u8]) -> Vec<u8> {
@@ -388,7 +418,7 @@ mod tests {
         let k = signing_key(1);
         let doc = sample_doc();
         let v = verify(&envelope(&k, &doc), &[pinned_of(&k)], 1, NOW, None).unwrap();
-        assert_eq!(v.document.version, 10);
+        assert_eq!(v.document.version, sample_version());
         assert_eq!(v.bytes, doc, "the verified bytes must be the signed bytes");
         assert_eq!(v.key_ids, vec![pinned_of(&k).key_id]);
     }
@@ -483,16 +513,18 @@ mod tests {
     #[test]
     fn a_lower_version_after_a_higher_one_is_a_rollback() {
         let k = signing_key(7);
-        let high = doc_bytes(20, "2026-10-07T14:00:00Z", "2026-10-07T20:00:00Z");
+        // Version follows the hour, so an older document is an earlier hour.
+        // The 13:00 document is still inside its six hour validity at 14:30.
+        let high = doc_bytes("2026-10-07T14:00:00Z", "2026-10-07T20:00:00Z");
         let prev = RegistryState {
-            highest_version: 20,
+            highest_version: sample_version(),
             document_b64: B64.encode(&high),
             key_ids: vec![pinned_of(&k).key_id],
         };
         // Control: the same version with the same bytes is accepted.
         assert!(verify(&envelope(&k, &high), &[pinned_of(&k)], 1, NOW, Some(&prev)).is_ok());
 
-        let low = doc_bytes(19, "2026-10-07T14:00:00Z", "2026-10-07T20:00:00Z");
+        let low = doc_bytes("2026-10-07T13:00:00Z", "2026-10-07T19:00:00Z");
         match verify(&envelope(&k, &low), &[pinned_of(&k)], 1, NOW, Some(&prev)) {
             Err(ClientError::Registry(m)) => assert!(m.contains("rollback"), "message was {m}"),
             other => panic!("a rollback was accepted: {other:?}"),
@@ -502,11 +534,15 @@ mod tests {
     #[test]
     fn the_same_version_with_different_bytes_is_equivocation() {
         let k = signing_key(8);
-        let first = doc_bytes(30, "2026-10-07T14:00:00Z", "2026-10-07T20:00:00Z");
-        // Same version, different relay list.
-        let second = br#"{"version":30,"valid_after":"2026-10-07T14:00:00Z","fresh_until":"2026-10-07T15:00:00Z","valid_until":"2026-10-07T20:00:00Z","relays":[{"id":"x","operator_id":"o","host_id":"h","role":"guard","ip":"203.0.113.1","port":443,"tls_name":"n","static_pubkey":"00"}]}"#.to_vec();
+        let first = doc_bytes("2026-10-07T14:00:00Z", "2026-10-07T20:00:00Z");
+        // Same hour and therefore the same version, different relay list.
+        let second = format!(
+            r#"{{"version":{},"valid_after":"2026-10-07T14:00:00Z","fresh_until":"2026-10-07T15:00:00Z","valid_until":"2026-10-07T20:00:00Z","relays":[{{"id":"x","operator_id":"o","host_id":"h","role":"guard","ip":"203.0.113.1","port":443,"tls_name":"n","static_pubkey":"00"}}]}}"#,
+            sample_version()
+        )
+        .into_bytes();
         let prev = RegistryState {
-            highest_version: 30,
+            highest_version: sample_version(),
             document_b64: B64.encode(&first),
             key_ids: vec![pinned_of(&k).key_id],
         };
@@ -517,8 +553,48 @@ mod tests {
             NOW,
             Some(&prev),
         ) {
-            Err(ClientError::RegistryEquivocation(30)) => {}
+            Err(ClientError::RegistryEquivocation(v)) if v == sample_version() => {}
             other => panic!("equivocation was not reported: {other:?}"),
+        }
+    }
+
+    /// A correctly signed document whose version does not match its hour must
+    /// be refused. Version and hour order are the same thing by construction,
+    /// so a document claiming otherwise is either a publisher bug or an attempt
+    /// to look newer than it is.
+    #[test]
+    fn a_version_that_does_not_match_valid_after_is_rejected() {
+        let k = signing_key(20);
+        // Control: the derived version is accepted.
+        let right = doc_bytes("2026-10-07T14:00:00Z", "2026-10-07T20:00:00Z");
+        assert!(verify(&envelope(&k, &right), &[pinned_of(&k)], 1, NOW, None).is_ok());
+
+        for wrong in [sample_version() + 1, sample_version() - 1, 1, 0] {
+            let doc = doc_bytes_versioned(wrong, "2026-10-07T14:00:00Z", "2026-10-07T20:00:00Z");
+            match verify(&envelope(&k, &doc), &[pinned_of(&k)], 1, NOW, None) {
+                Err(ClientError::Registry(m)) => assert!(
+                    m.contains("does not match valid_after"),
+                    "version {wrong}: message was {m}"
+                ),
+                other => panic!("version {wrong} was accepted: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn an_off_hour_valid_after_is_rejected() {
+        let k = signing_key(21);
+        // 14:30 is not a publication boundary, so no version can match it.
+        let doc = doc_bytes_versioned(
+            sample_version(),
+            "2026-10-07T14:30:00Z",
+            "2026-10-07T20:30:00Z",
+        );
+        match verify(&envelope(&k, &doc), &[pinned_of(&k)], 1, NOW, None) {
+            Err(ClientError::Registry(m)) => {
+                assert!(m.contains("not on an exact hour"), "message was {m}")
+            }
+            other => panic!("an off-hour valid_after was accepted: {other:?}"),
         }
     }
 
