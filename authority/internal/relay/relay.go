@@ -18,6 +18,7 @@ var (
 	ErrInvalidRole       = errors.New("invalid relay role")
 	ErrUnknownRelay      = errors.New("unknown relay")
 	ErrInvalidStaticKey  = errors.New("static public key is not 32 bytes")
+	ErrMissingIdentifier = errors.New("operator_id and host_id are required")
 	ErrInvalidAddress    = errors.New("invalid relay address")
 	ErrStaticKeyMismatch = errors.New("static public key does not match the provisioned one")
 )
@@ -34,6 +35,8 @@ type Relay struct {
 	Region        string     `json:"region"`
 	Role          string     `json:"role"`
 	Status        string     `json:"status"`
+	OperatorID    string     `json:"operator_id"`
+	HostID        string     `json:"host_id"`
 	LastHeartbeat *time.Time `json:"last_heartbeat,omitempty"`
 	// StaticPubkey is raw bytes in Go and hex on the wire. Handlers encode it;
 	// it is public key material, so it carries no disclosure risk.
@@ -45,10 +48,10 @@ func (r *Relay) StaticPubkeyHex() string {
 	return hex.EncodeToString(r.StaticPubkey)
 }
 
-const relayColumns = `id, tls_name, host(ip), port, region, role, status, last_heartbeat, static_pubkey`
+const relayColumns = `id, tls_name, host(ip), port, region, role, status, operator_id, host_id, last_heartbeat, static_pubkey`
 
 func scanRelay(row pgx.Row, r *Relay) error {
-	return row.Scan(&r.ID, &r.TLSName, &r.IP, &r.Port, &r.Region, &r.Role, &r.Status, &r.LastHeartbeat, &r.StaticPubkey)
+	return row.Scan(&r.ID, &r.TLSName, &r.IP, &r.Port, &r.Region, &r.Role, &r.Status, &r.OperatorID, &r.HostID, &r.LastHeartbeat, &r.StaticPubkey)
 }
 
 // ValidateStaticKey rejects anything that is not exactly an X25519 public key.
@@ -87,9 +90,15 @@ func generateAPIKey() (string, error) {
 
 // The plaintext key is returned to the caller exactly once and never
 // persisted; only its salted SHA-256 hash is stored.
-func ProvisionRelay(ctx context.Context, pool *pgxpool.Pool, salt, tlsName, region, role, ip string, port int, staticPubkey []byte) (string, string, error) {
+func ProvisionRelay(ctx context.Context, pool *pgxpool.Pool, salt, tlsName, region, role, ip string, port int, staticPubkey []byte, operatorID, hostID string) (string, string, error) {
 	if !validRole(role) {
 		return "", "", ErrInvalidRole
+	}
+	// Both identifiers are assigned here and never by the relay. A relay
+	// without them cannot appear in a registry a client can check
+	// (ARCHITECTURE 4.7).
+	if operatorID == "" || hostID == "" {
+		return "", "", ErrMissingIdentifier
 	}
 	if err := ValidateStaticKey(staticPubkey); err != nil {
 		return "", "", err
@@ -107,10 +116,10 @@ func ProvisionRelay(ctx context.Context, pool *pgxpool.Pool, salt, tlsName, regi
 	hash := hashAPIKey(salt, plaintext)
 	var id string
 	err = pool.QueryRow(ctx,
-		`INSERT INTO relay_nodes (id, api_key_hash, tls_name, region, role, status, ip, port, static_pubkey)
-		 VALUES (gen_random_uuid(), $1, $2, $3, $4, 'inactive', $5, $6, $7)
+		`INSERT INTO relay_nodes (id, api_key_hash, tls_name, region, role, status, ip, port, static_pubkey, operator_id, host_id)
+		 VALUES (gen_random_uuid(), $1, $2, $3, $4, 'inactive', $5, $6, $7, $8, $9)
 		 RETURNING id`,
-		hash, tlsName, region, role, ip, port, staticPubkey,
+		hash, tlsName, region, role, ip, port, staticPubkey, operatorID, hostID,
 	).Scan(&id)
 	if err != nil {
 		return "", "", err

@@ -101,7 +101,7 @@ func TestProvisionAndSweep(t *testing.T) {
 	pool := testPool(t)
 	ctx := context.Background()
 
-	id, plaintext, err := ProvisionRelay(ctx, pool, "test-salt-1234567890", "node.test", "us-east", "guard", "10.0.0.50", 9001, testPubkey())
+	id, plaintext, err := ProvisionRelay(ctx, pool, "test-salt-1234567890", "node.test", "us-east", "guard", "10.0.0.50", 9001, testPubkey(), "op-a", "host-a")
 	if err != nil {
 		t.Fatalf("ProvisionRelay: %v", err)
 	}
@@ -166,8 +166,8 @@ func TestSweepFloorsSubSecondTTL(t *testing.T) {
 
 	var id string
 	if err := pool.QueryRow(ctx,
-		`INSERT INTO relay_nodes (id, api_key_hash, tls_name, region, role, status, last_heartbeat, ip, port, static_pubkey)
-		 VALUES (gen_random_uuid(), $1, 'floor.test', 'us-east', 'guard', 'active', NOW(), '10.0.0.77', 9001, decode(repeat('ab', 32), 'hex'))
+		`INSERT INTO relay_nodes (id, api_key_hash, tls_name, region, role, status, last_heartbeat, ip, port, static_pubkey, operator_id, host_id)
+		 VALUES (gen_random_uuid(), $1, 'floor.test', 'us-east', 'guard', 'active', NOW(), '10.0.0.77', 9001, decode(repeat('ab', 32), 'hex'), 'op-floor', 'host-floor')
 		 RETURNING id`,
 		"test-hash-floor-"+time.Now().Format("150405.000000"),
 	).Scan(&id); err != nil {
@@ -197,8 +197,8 @@ func TestPickRandomActiveByRoleExcludesIDs(t *testing.T) {
 	seedActiveGuard := func(tag string) string {
 		var id string
 		if err := pool.QueryRow(ctx,
-			`INSERT INTO relay_nodes (id, api_key_hash, tls_name, region, role, status, last_heartbeat, ip, port, static_pubkey)
-			 VALUES (gen_random_uuid(), $1, 'exclude.test', 'us-east', 'guard', 'active', NOW(), '10.0.0.99', 9001, decode(repeat('ab', 32), 'hex'))
+			`INSERT INTO relay_nodes (id, api_key_hash, tls_name, region, role, status, last_heartbeat, ip, port, static_pubkey, operator_id, host_id)
+			 VALUES (gen_random_uuid(), $1, 'exclude.test', 'us-east', 'guard', 'active', NOW(), '10.0.0.99', 9001, decode(repeat('ab', 32), 'hex'), 'op-ex', 'host-ex-' || $1)
 			 RETURNING id`,
 			"test-hash-exclude-"+tag+"-"+time.Now().Format("150405.000000"),
 		).Scan(&id); err != nil {
@@ -249,7 +249,7 @@ func TestPickRandomActiveByRoleExcludesIDs(t *testing.T) {
 
 func TestProvisionRejectsInvalidRole(t *testing.T) {
 	// No DB needed: the role check happens before any query.
-	_, _, err := ProvisionRelay(context.Background(), nil, "salt", "node.test", "region", "admin", "10.0.0.1", 443, testPubkey())
+	_, _, err := ProvisionRelay(context.Background(), nil, "salt", "node.test", "region", "admin", "10.0.0.1", 443, testPubkey(), "op-a", "host-a")
 	if err != ErrInvalidRole {
 		t.Errorf("expected ErrInvalidRole, got %v", err)
 	}
@@ -273,7 +273,7 @@ func TestHeartbeatPinsStaticKey(t *testing.T) {
 	ctx := context.Background()
 	const salt = "test-salt-pinning-00"
 
-	id, plaintext, err := ProvisionRelay(ctx, pool, salt, "pin.test", "us-east", "guard", "10.0.0.60", 9001, testPubkey())
+	id, plaintext, err := ProvisionRelay(ctx, pool, salt, "pin.test", "us-east", "guard", "10.0.0.60", 9001, testPubkey(), "op-a", "host-a")
 	if err != nil {
 		t.Fatalf("ProvisionRelay: %v", err)
 	}
@@ -338,15 +338,53 @@ func TestHeartbeatRejectsWrongLengthKey(t *testing.T) {
 
 func TestProvisionRejectsBadKeyAndAddress(t *testing.T) {
 	ctx := context.Background()
-	if _, _, err := ProvisionRelay(ctx, nil, "salt", "n.test", "r", "guard", "10.0.0.1", 443, []byte{1}); !errors.Is(err, ErrInvalidStaticKey) {
+	if _, _, err := ProvisionRelay(ctx, nil, "salt", "n.test", "r", "guard", "10.0.0.1", 443, []byte{1}, "op-a", "host-a"); !errors.Is(err, ErrInvalidStaticKey) {
 		t.Errorf("short key: err = %v, want ErrInvalidStaticKey", err)
 	}
-	if _, _, err := ProvisionRelay(ctx, nil, "salt", "n.test", "r", "guard", "not-an-ip", 443, testPubkey()); !errors.Is(err, ErrInvalidAddress) {
+	if _, _, err := ProvisionRelay(ctx, nil, "salt", "n.test", "r", "guard", "not-an-ip", 443, testPubkey(), "op-a", "host-a"); !errors.Is(err, ErrInvalidAddress) {
 		t.Errorf("bad ip: err = %v, want ErrInvalidAddress", err)
 	}
 	for _, port := range []int{0, 65536} {
-		if _, _, err := ProvisionRelay(ctx, nil, "salt", "n.test", "r", "guard", "10.0.0.1", port, testPubkey()); !errors.Is(err, ErrInvalidAddress) {
+		if _, _, err := ProvisionRelay(ctx, nil, "salt", "n.test", "r", "guard", "10.0.0.1", port, testPubkey(), "op-a", "host-a"); !errors.Is(err, ErrInvalidAddress) {
 			t.Errorf("port %d: err = %v, want ErrInvalidAddress", port, err)
 		}
+	}
+}
+
+func TestProvisionRequiresOperatorAndHostIdentifiers(t *testing.T) {
+	// No DB needed: the check runs before any query. Both identifiers are
+	// assigned by the authority, so an empty one is a caller bug, not a relay
+	// claim that could be validated later.
+	ctx := context.Background()
+	for _, tc := range []struct{ op, host string }{
+		{"", "host-a"},
+		{"op-a", ""},
+		{"", ""},
+	} {
+		_, _, err := ProvisionRelay(ctx, nil, "salt", "n.test", "r", "guard",
+			"10.0.0.1", 443, testPubkey(), tc.op, tc.host)
+		if !errors.Is(err, ErrMissingIdentifier) {
+			t.Errorf("operator_id=%q host_id=%q: err = %v, want ErrMissingIdentifier", tc.op, tc.host, err)
+		}
+	}
+}
+
+func TestProvisionStoresOperatorAndHostIdentifiers(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	id, _, err := ProvisionRelay(ctx, pool, "test-salt-ids-000000", "ids.test", "us-east",
+		"guard", "10.0.0.80", 9001, testPubkey(), "op-zeta", "host-omega")
+	if err != nil {
+		t.Fatalf("ProvisionRelay: %v", err)
+	}
+	cleanupRow(t, pool, deleteRelayByID, id)
+
+	var op, host string
+	if err := pool.QueryRow(ctx,
+		`SELECT operator_id, host_id FROM relay_nodes WHERE id = $1`, id).Scan(&op, &host); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if op != "op-zeta" || host != "host-omega" {
+		t.Errorf("stored operator_id=%q host_id=%q, want op-zeta/host-omega", op, host)
 	}
 }

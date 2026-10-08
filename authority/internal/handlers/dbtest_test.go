@@ -123,8 +123,8 @@ func seedActiveRelay(t *testing.T, pool *pgxpool.Pool, role, tag string) string 
 	t.Helper()
 	var id string
 	if err := pool.QueryRow(context.Background(),
-		`INSERT INTO relay_nodes (id, api_key_hash, tls_name, region, role, status, last_heartbeat, ip, port, static_pubkey)
-		 VALUES (gen_random_uuid(), $1, $2, 'us-east', $3, 'active', NOW(), '10.0.0.50', 9001, $4)
+		`INSERT INTO relay_nodes (id, api_key_hash, tls_name, region, role, status, last_heartbeat, ip, port, static_pubkey, operator_id, host_id)
+		 VALUES (gen_random_uuid(), $1, $2, 'us-east', $3, 'active', NOW(), '10.0.0.50', 9001, $4, 'op-seed', 'host-seed-' || $3)
 		 RETURNING id`,
 		"test-hash-"+tag+"-"+role+"-"+time.Now().Format("150405.000000"),
 		"node.test", role, testStaticPubkey(),
@@ -188,6 +188,7 @@ func provisionForTest(t *testing.T, pool *pgxpool.Pool, salt string, pubkey []by
 		reqCtx(), pool, salt,
 		"pin.test", "us-east", "guard",
 		"10.0.0.70", 9001, pubkey,
+		"op-test", "host-test",
 	)
 	if err != nil {
 		t.Fatalf("ProvisionRelay: %v", err)

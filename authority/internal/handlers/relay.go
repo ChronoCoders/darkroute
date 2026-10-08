@@ -104,6 +104,10 @@ type provisionRelayRequest struct {
 	Region       string `json:"region"`
 	Role         string `json:"role"`
 	StaticPubkey string `json:"static_pubkey"`
+	// Assigned by the authority, one operator_id per legal entity and one
+	// host_id per machine. The relay never declares either.
+	OperatorID string `json:"operator_id"`
+	HostID     string `json:"host_id"`
 }
 
 func (h *RelayHandler) HandleProvisionRelay(w http.ResponseWriter, r *http.Request) {
@@ -112,7 +116,8 @@ func (h *RelayHandler) HandleProvisionRelay(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_request"})
 		return
 	}
-	if req.TLSName == "" || req.Region == "" || req.IP == "" || req.StaticPubkey == "" {
+	if req.TLSName == "" || req.Region == "" || req.IP == "" || req.StaticPubkey == "" ||
+		req.OperatorID == "" || req.HostID == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_fields"})
 		return
 	}
@@ -121,7 +126,7 @@ func (h *RelayHandler) HandleProvisionRelay(w http.ResponseWriter, r *http.Reque
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_static_pubkey"})
 		return
 	}
-	id, plaintext, err := relay.ProvisionRelay(r.Context(), h.pool, h.salt, req.TLSName, req.Region, req.Role, req.IP, req.Port, pubkey)
+	id, plaintext, err := relay.ProvisionRelay(r.Context(), h.pool, h.salt, req.TLSName, req.Region, req.Role, req.IP, req.Port, pubkey, req.OperatorID, req.HostID)
 	if err != nil {
 		switch {
 		case errors.Is(err, relay.ErrInvalidRole):
@@ -130,6 +135,8 @@ func (h *RelayHandler) HandleProvisionRelay(w http.ResponseWriter, r *http.Reque
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_static_pubkey"})
 		case errors.Is(err, relay.ErrInvalidAddress):
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid_address"})
+		case errors.Is(err, relay.ErrMissingIdentifier):
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing_fields"})
 		default:
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		}
