@@ -1,0 +1,9 @@
+{
+  "document_b64": "eyJmcmVzaF91bnRpbCI6IjIwMjYtMTAtMDdUMTU6MDA6MDBaIiwicmVsYXlzIjpbeyJob3N0X2lkIjoiaG9zdC12ZWN0b3IiLCJpZCI6IjI3ZjlhN2M4LWIwYTMtNGIzZC1hMzY2LWQ4N2NmMDZkYmI5MCIsImlwIjoiMjAzLjAuMTEzLjEwIiwib3BlcmF0b3JfaWQiOiJvcC12ZWN0b3IiLCJwb3J0Ijo0NDMsInJvbGUiOiJndWFyZCIsInN0YXRpY19wdWJrZXkiOiJhYmFiMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwIiwidGxzX25hbWUiOiJub2RlMDEuZXhhbXBsZSJ9XSwidmFsaWRfYWZ0ZXIiOiIyMDI2LTEwLTA3VDE0OjAwOjAwWiIsInZhbGlkX3VudGlsIjoiMjAyNi0xMC0wN1QyMDowMDowMFoiLCJ2ZXJzaW9uIjoxfQ==",
+  "domain": "quiethop/v1/registry",
+  "key_id": "219ec80850bdf73c",
+  "note": "Generated once by a throwaway key. The seed was never written to disk or printed and no longer exists. Regenerating this file requires a new key and new signature.",
+  "public_key": "a6c974f15172013b10c6107924170167833d6366cad359d25c232319c661cb9a",
+  "signature_b64": "u1ve43WpKL1BWujSvWa7BnAc6N8IBhnawnu5CGaw/UECxuYsX3SorQ2/ENqlNUWUGeEcBoyJUqI6OMxG/4FtBg=="
+}
+

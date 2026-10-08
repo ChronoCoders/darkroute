@@ -11,6 +11,7 @@ type Config struct {
 	DatabaseURL     string
 	JWTSecret       string
 	RSAKeyPath      string
+	RegistryKeyPath string
 	RelayAPIKeySalt string
 	AllowedRelayIPs []string
 	Port            string
@@ -30,11 +31,20 @@ func Load() *Config {
 		DatabaseURL:     os.Getenv("DATABASE_URL"),
 		JWTSecret:       os.Getenv("JWT_SECRET"),
 		RSAKeyPath:      os.Getenv("RSA_KEY_PATH"),
+		RegistryKeyPath: envOr("REGISTRY_KEY_PATH", "/opt/quiethop/secrets/registry_ed25519.key"),
 		RelayAPIKeySalt: os.Getenv("RELAY_API_KEY_SALT"),
 		AllowedRelayIPs: parseIPList(os.Getenv("ALLOWED_RELAY_IPS")),
 		Port:            port,
 		Environment:     os.Getenv("ENVIRONMENT"),
 	}
+}
+
+// envOr returns the environment value or a default when unset or empty.
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
 }
 
 func parseIPList(raw string) []string {

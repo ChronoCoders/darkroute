@@ -20,11 +20,47 @@ import (
 	"github.com/ChronoCoders/quiethop/authority/internal/config"
 	"github.com/ChronoCoders/quiethop/authority/internal/db"
 	"github.com/ChronoCoders/quiethop/authority/internal/handlers"
+	"github.com/ChronoCoders/quiethop/authority/internal/registry"
 	"github.com/ChronoCoders/quiethop/authority/internal/relay"
 )
 
+// runRegistryKeygen writes a new registry signing key and prints only the
+// public half, which the operator pins into clients. The seed is never printed
+// and never logged.
+func runRegistryKeygen(args []string) int {
+	var path string
+	switch {
+	case len(args) == 1:
+		path = args[0]
+	case len(args) == 0:
+		path = os.Getenv("REGISTRY_KEY_PATH")
+	default:
+		fmt.Fprintln(os.Stderr, "usage: authority registry-keygen [path]")
+		return 2
+	}
+	if path == "" {
+		fmt.Fprintln(os.Stderr, "registry-keygen needs a path argument or REGISTRY_KEY_PATH")
+		return 2
+	}
+	pubHex, err := registry.GenerateKeyFile(path)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "registry-keygen failed: %v\n", err)
+		return 1
+	}
+	fmt.Println(pubHex)
+	return 0
+}
+
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
+
+	// `authority registry-keygen [path]` writes the registry signing key and
+	// exits. It runs before config load because it needs none of it, and the
+	// serving path must never generate a key (ARCHITECTURE 4.4).
+	args := os.Args[1:]
+	if len(args) > 0 && args[0] == "registry-keygen" {
+		os.Exit(runRegistryKeygen(args[1:]))
+	}
 
 	cfg := config.Load()
 	if err := cfg.Validate(); err != nil {
@@ -46,6 +82,16 @@ func main() {
 		os.Exit(1)
 	}
 	defer database.Close()
+
+	// Load only, never generate. A key invented here would sign a registry no
+	// client has pinned, so every client would reject every document.
+	regSigner, err := registry.LoadSigner(cfg.RegistryKeyPath)
+	if err != nil {
+		slog.Error("registry signing key load failed", "err", err, "path", cfg.RegistryKeyPath)
+		os.Exit(1)
+	}
+	slog.Info("registry signing key ready",
+		"path", cfg.RegistryKeyPath, "key_id", regSigner.KeyID())
 
 	signer, err := blind.LoadOrGenerate(cfg.RSAKeyPath)
 	if err != nil {
