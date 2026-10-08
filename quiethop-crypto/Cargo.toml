@@ -10,7 +10,17 @@ snow = { workspace = true }
 # FrameReader owns a read half and fills it with read(), the cancel-safe
 # primitive, so this crate needs tokio's io traits. io-util only.
 tokio = { workspace = true }
+# The registry verifier and its state file live here so the client and the relay
+# verify with one implementation of the rules rather than two.
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+# key_id_for hashes a pinned key to its short id.
+sha2 = { workspace = true }
+ed25519-dalek = { workspace = true }
 
 [dev-dependencies]
 # The cancellation tests need a runtime and timers on top of the io traits.
 tokio = { workspace = true, features = ["io-util", "macros", "rt", "time"] }
+# The state file tests write into a scratch directory.
+tempfile = "3"

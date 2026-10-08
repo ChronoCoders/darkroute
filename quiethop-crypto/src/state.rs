@@ -1,9 +1,12 @@
-//! Persistent client state for registry rollback protection.
+//! Persistent registry state for rollback protection.
 //!
-//! The highest registry version this client has accepted, and the exact bytes
-//! of that document, must survive a restart. Without them a restarted client
-//! would accept an older registry, which is the rollback an attacker with a
-//! stale signed document would want (SECURITY_MODEL §5.3).
+//! Both the client and the relay verify the registry, so both need this and it
+//! lives beside the verifier rather than in either binary.
+//!
+//! The highest registry version this holder has accepted, and the exact bytes of
+//! that document, must survive a restart. Without them a restarted process would
+//! accept an older registry, which is the rollback an attacker with a stale
+//! signed document would want (SECURITY_MODEL §5.3).
 //!
 //! The document bytes are stored, not just the number, because the equivocation
 //! check compares bytes: two different documents carrying the same version is
@@ -12,7 +15,7 @@
 //!
 //! **Trust on first use.** With no stored state there is no baseline, so the
 //! first valid document is accepted and recorded. Rollback protection begins at
-//! that point. A client that has never fetched a registry cannot tell a current
+//! that point. A process that has never fetched a registry cannot tell a current
 //! one from an old one, and nothing in this design changes that.
 
 use std::io::Write;
@@ -20,10 +23,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::error::ClientError;
+use crate::registry::RegistryError;
 
 /// Mode for the state file. It holds no secret, but it governs which registry
-/// this client will accept, so another local user must not be able to rewrite
+/// this process will accept, so another local user must not be able to rewrite
 /// it and re-enable a rollback.
 #[cfg(unix)]
 const STATE_MODE: u32 = 0o600;
@@ -42,7 +45,7 @@ pub struct RegistryState {
 ///
 /// `QUIETHOP_STATE_DIR` wins, then `XDG_STATE_HOME/quiethop`, then
 /// `~/.local/state/quiethop`, which is the XDG default.
-pub fn state_dir() -> Result<PathBuf, ClientError> {
+pub fn state_dir() -> Result<PathBuf, RegistryError> {
     if let Ok(dir) = std::env::var("QUIETHOP_STATE_DIR") {
         if !dir.is_empty() {
             return Ok(PathBuf::from(dir));
@@ -53,8 +56,9 @@ pub fn state_dir() -> Result<PathBuf, ClientError> {
             return Ok(PathBuf::from(dir).join("quiethop"));
         }
     }
-    let home = std::env::var("HOME")
-        .map_err(|_| ClientError::State("no QUIETHOP_STATE_DIR, XDG_STATE_HOME or HOME".into()))?;
+    let home = std::env::var("HOME").map_err(|_| {
+        RegistryError::State("no QUIETHOP_STATE_DIR, XDG_STATE_HOME or HOME".into())
+    })?;
     Ok(PathBuf::from(home).join(".local/state/quiethop"))
 }
 
@@ -68,26 +72,26 @@ pub fn state_path(dir: &Path) -> PathBuf {
 /// exists but cannot be read or parsed is an error, never a silent reset: a
 /// corrupt file that reset the baseline would disable rollback protection at
 /// exactly the moment it matters.
-pub fn load(dir: &Path) -> Result<Option<RegistryState>, ClientError> {
+pub fn load(dir: &Path) -> Result<Option<RegistryState>, RegistryError> {
     let path = state_path(dir);
     let raw = match std::fs::read(&path) {
         Ok(r) => r,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => {
-            return Err(ClientError::State(format!(
+            return Err(RegistryError::State(format!(
                 "{} is not readable: {e}",
                 path.display()
             )))
         }
     };
     let state: RegistryState = serde_json::from_slice(&raw).map_err(|e| {
-        ClientError::State(format!(
+        RegistryError::State(format!(
             "{} is corrupt and will not be ignored: {e}",
             path.display()
         ))
     })?;
     if state.highest_version <= 0 {
-        return Err(ClientError::State(format!(
+        return Err(RegistryError::State(format!(
             "{} records a non-positive version",
             path.display()
         )));
@@ -101,14 +105,14 @@ pub fn load(dir: &Path) -> Result<Option<RegistryState>, ClientError> {
 /// A partial write would leave a version recorded without the bytes that
 /// version refers to, and the equivocation check would then compare against
 /// nothing.
-pub fn store(dir: &Path, state: &RegistryState) -> Result<(), ClientError> {
+pub fn store(dir: &Path, state: &RegistryState) -> Result<(), RegistryError> {
     std::fs::create_dir_all(dir)
-        .map_err(|e| ClientError::State(format!("cannot create {}: {e}", dir.display())))?;
+        .map_err(|e| RegistryError::State(format!("cannot create {}: {e}", dir.display())))?;
 
     let target = state_path(dir);
     let tmp = dir.join("registry.json.tmp");
     let body = serde_json::to_vec_pretty(state)
-        .map_err(|e| ClientError::State(format!("cannot encode state: {e}")))?;
+        .map_err(|e| RegistryError::State(format!("cannot encode state: {e}")))?;
 
     {
         let mut opts = std::fs::OpenOptions::new();
@@ -120,15 +124,15 @@ pub fn store(dir: &Path, state: &RegistryState) -> Result<(), ClientError> {
         }
         let mut f = opts
             .open(&tmp)
-            .map_err(|e| ClientError::State(format!("cannot open {}: {e}", tmp.display())))?;
+            .map_err(|e| RegistryError::State(format!("cannot open {}: {e}", tmp.display())))?;
         f.write_all(&body)
-            .map_err(|e| ClientError::State(format!("cannot write {}: {e}", tmp.display())))?;
+            .map_err(|e| RegistryError::State(format!("cannot write {}: {e}", tmp.display())))?;
         f.sync_all()
-            .map_err(|e| ClientError::State(format!("cannot sync {}: {e}", tmp.display())))?;
+            .map_err(|e| RegistryError::State(format!("cannot sync {}: {e}", tmp.display())))?;
     }
 
     std::fs::rename(&tmp, &target).map_err(|e| {
-        ClientError::State(format!(
+        RegistryError::State(format!(
             "cannot replace {} with {}: {e}",
             target.display(),
             tmp.display()
@@ -185,7 +189,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(state_path(dir.path()), b"{not json").unwrap();
         match load(dir.path()) {
-            Err(ClientError::State(m)) => assert!(m.contains("corrupt"), "message was {m}"),
+            Err(RegistryError::State(m)) => assert!(m.contains("corrupt"), "message was {m}"),
             other => panic!("corrupt state was tolerated: {other:?}"),
         }
     }
@@ -198,7 +202,7 @@ mod tests {
             ..sample()
         };
         std::fs::write(state_path(dir.path()), serde_json::to_vec(&bad).unwrap()).unwrap();
-        assert!(matches!(load(dir.path()), Err(ClientError::State(_))));
+        assert!(matches!(load(dir.path()), Err(RegistryError::State(_))));
     }
 
     #[test]

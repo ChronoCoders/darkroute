@@ -1512,8 +1512,6 @@ dependencies = [
 name = "quiethop-client-sdk"
 version = "0.1.0"
 dependencies = [
- "base64",
- "ed25519-dalek",
  "num-bigint-dig",
  "num-traits",
  "quiethop-crypto",
@@ -1524,9 +1522,7 @@ dependencies = [
  "rustls",
  "rustls-native-certs",
  "serde",
- "serde_json",
  "sha2 0.10.9",
- "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-rustls",
@@ -1538,7 +1534,13 @@ dependencies = [
 name = "quiethop-crypto"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "ed25519-dalek",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
  "snow",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
 ]

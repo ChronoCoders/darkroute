@@ -8,8 +8,6 @@ mod blind;
 mod circuits;
 mod dial;
 mod error;
-pub mod registry;
-pub mod state;
 mod tls;
 mod tokens;
 
@@ -17,8 +15,10 @@ pub use auth::Session;
 pub use circuits::{CircuitHop, CircuitRoute};
 pub use dial::CircuitStream;
 pub use error::ClientError;
-pub use registry::{Document, PinnedKey, RelayEntry, Verified};
-pub use state::RegistryState;
+pub use quiethop_crypto::registry;
+pub use quiethop_crypto::registry::{Document, PinnedKey, RegistryError, RelayEntry, Verified};
+pub use quiethop_crypto::state;
+pub use quiethop_crypto::state::RegistryState;
 
 use std::sync::Arc;
 

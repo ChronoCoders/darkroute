@@ -21,16 +21,7 @@ num-traits = { workspace = true }
 rand_core = { workspace = true }
 rand = { workspace = true }
 x25519-dalek = { workspace = true }
-# Registry signature verification. verify_strict rejects non-canonical and
-# small-order keys, which plain verify accepts.
-ed25519-dalek = "3.0.0"
-# 0.22 so it resolves to the 0.22.1 already in Cargo.lock.
-base64 = "0.22"
-serde_json = { workspace = true }
 url = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
-
-[dev-dependencies]
-tempfile = "3"

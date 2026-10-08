@@ -18,8 +18,24 @@ use base64::Engine as _;
 use ed25519_dalek::{Signature, VerifyingKey, SIGNATURE_LENGTH};
 use serde::Deserialize;
 
-use crate::error::ClientError;
 use crate::state::{self, RegistryState};
+
+/// Errors from registry verification and the state file behind it.
+///
+/// This lives beside the verifier rather than in either binary, because the
+/// client and the relay both verify with the same rules and must not drift
+/// into two implementations of them (ARCHITECTURE 5.2, SECURITY_MODEL 5.3).
+#[derive(Debug, thiserror::Error)]
+pub enum RegistryError {
+    #[error("registry: {0}")]
+    Registry(String),
+    #[error("registry equivocation: two different documents carry version {0}")]
+    Equivocation(i64),
+    #[error("malformed registry signing key: {0}")]
+    InvalidKey(String),
+    #[error("registry state: {0}")]
+    State(String),
+}
 
 /// Signature domain. Must match the authority's `registry.Domain`.
 pub const DOMAIN: &[u8] = b"quiethop/v1/registry";
@@ -80,18 +96,18 @@ pub struct PinnedKey {
 impl PinnedKey {
     /// Build from a 32-byte public key, deriving the key id the same way the
     /// authority does: the first 8 bytes of SHA-256 over the raw key.
-    pub fn from_bytes(raw: &[u8; 32]) -> Result<Self, ClientError> {
+    pub fn from_bytes(raw: &[u8; 32]) -> Result<Self, RegistryError> {
         let key = VerifyingKey::from_bytes(raw)
-            .map_err(|_| ClientError::InvalidPubkey("registry signing key".into()))?;
+            .map_err(|_| RegistryError::InvalidKey("registry signing key".into()))?;
         Ok(Self {
             key_id: key_id_for(raw),
             key,
         })
     }
 
-    pub fn from_hex(hex: &str) -> Result<Self, ClientError> {
+    pub fn from_hex(hex: &str) -> Result<Self, RegistryError> {
         let raw = decode_hex32(hex)
-            .ok_or_else(|| ClientError::InvalidPubkey("registry signing key hex".into()))?;
+            .ok_or_else(|| RegistryError::InvalidKey("registry signing key hex".into()))?;
         Self::from_bytes(&raw)
     }
 }
@@ -134,16 +150,19 @@ pub fn verify(
     threshold: usize,
     now_unix: i64,
     previous: Option<&RegistryState>,
-) -> Result<Verified, ClientError> {
+) -> Result<Verified, RegistryError> {
     if threshold == 0 {
-        return Err(ClientError::Registry("threshold must be at least 1".into()));
+        return Err(RegistryError::Registry(
+            "threshold must be at least 1".into(),
+        ));
     }
-    let envelope: Envelope = serde_json::from_slice(body)
-        .map_err(|e| ClientError::Registry(format!("response is not a registry envelope: {e}")))?;
+    let envelope: Envelope = serde_json::from_slice(body).map_err(|e| {
+        RegistryError::Registry(format!("response is not a registry envelope: {e}"))
+    })?;
 
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(envelope.document.as_bytes())
-        .map_err(|e| ClientError::Registry(format!("document is not base64: {e}")))?;
+        .map_err(|e| RegistryError::Registry(format!("document is not base64: {e}")))?;
 
     // Signatures first. Nothing inside the document is read until a threshold
     // of pinned keys has verified over these exact bytes.
@@ -152,7 +171,7 @@ pub fn verify(
     for entry in &envelope.signatures {
         let Some(pin) = pinned.iter().find(|p| p.key_id == entry.key_id) else {
             // Not a pinned key id. Silently skipped rather than fatal, so a
-            // future co-signer unknown to this client cannot break it.
+            // future co-signer unknown to this verifier cannot break it.
             continue;
         };
         let raw = match base64::engine::general_purpose::STANDARD.decode(entry.sig.as_bytes()) {
@@ -173,14 +192,14 @@ pub fn verify(
         }
     }
     if accepted.len() < threshold {
-        return Err(ClientError::Registry(format!(
+        return Err(RegistryError::Registry(format!(
             "{} of {threshold} required signatures from pinned keys verified",
             accepted.len()
         )));
     }
 
     let document: Document = serde_json::from_slice(&bytes)
-        .map_err(|e| ClientError::Registry(format!("verified document does not parse: {e}")))?;
+        .map_err(|e| RegistryError::Registry(format!("verified document does not parse: {e}")))?;
 
     check_validity(&document, now_unix)?;
     check_rollback(&document, &bytes, previous)?;
@@ -192,11 +211,11 @@ pub fn verify(
     })
 }
 
-fn check_validity(doc: &Document, now_unix: i64) -> Result<(), ClientError> {
+fn check_validity(doc: &Document, now_unix: i64) -> Result<(), RegistryError> {
     let after = parse_rfc3339(&doc.valid_after)?;
     let until = parse_rfc3339(&doc.valid_until)?;
     if until <= after {
-        return Err(ClientError::Registry(
+        return Err(RegistryError::Registry(
             "valid_until is not after valid_after".into(),
         ));
     }
@@ -205,27 +224,27 @@ fn check_validity(doc: &Document, now_unix: i64) -> Result<(), ClientError> {
     // thing on both sides, so a document cannot claim to be newer than its own
     // hour (docs/DECISIONS.md entry 16).
     if after % 3600 != 0 {
-        return Err(ClientError::Registry(format!(
+        return Err(RegistryError::Registry(format!(
             "valid_after {} is not on an exact hour",
             doc.valid_after
         )));
     }
     let expected = after / 3600;
     if doc.version != expected {
-        return Err(ClientError::Registry(format!(
+        return Err(RegistryError::Registry(format!(
             "version {} does not match valid_after {}, which is hour {expected}",
             doc.version, doc.valid_after
         )));
     }
     if now_unix + SKEW_ALLOWANCE_SECS < after {
-        return Err(ClientError::Registry(format!(
+        return Err(RegistryError::Registry(format!(
             "document is not yet valid: valid_after {} is more than {SKEW_ALLOWANCE_SECS}s ahead",
             doc.valid_after
         )));
     }
     // No grace period past valid_until.
     if now_unix >= until {
-        return Err(ClientError::Registry(format!(
+        return Err(RegistryError::Registry(format!(
             "document expired at {}",
             doc.valid_until
         )));
@@ -237,13 +256,13 @@ fn check_rollback(
     doc: &Document,
     bytes: &[u8],
     previous: Option<&RegistryState>,
-) -> Result<(), ClientError> {
+) -> Result<(), RegistryError> {
     let Some(prev) = previous else {
         // Trust on first use: no baseline exists, so this document becomes it.
         return Ok(());
     };
     if doc.version < prev.highest_version {
-        return Err(ClientError::Registry(format!(
+        return Err(RegistryError::Registry(format!(
             "rollback: version {} is below the highest seen {}",
             doc.version, prev.highest_version
         )));
@@ -251,18 +270,18 @@ fn check_rollback(
     if doc.version == prev.highest_version {
         let stored = base64::engine::general_purpose::STANDARD
             .decode(prev.document_b64.as_bytes())
-            .map_err(|e| ClientError::State(format!("stored document is not base64: {e}")))?;
+            .map_err(|e| RegistryError::State(format!("stored document is not base64: {e}")))?;
         if stored != bytes {
             // Two different documents under one version. Only the authority
             // can produce both, so this is local evidence of equivocation.
-            return Err(ClientError::RegistryEquivocation(doc.version));
+            return Err(RegistryError::Equivocation(doc.version));
         }
     }
     Ok(())
 }
 
 /// Record a verified document as the new baseline, if it advances the version.
-pub fn remember(dir: &Path, verified: &Verified) -> Result<(), ClientError> {
+pub fn remember(dir: &Path, verified: &Verified) -> Result<(), RegistryError> {
     let state = RegistryState {
         highest_version: verified.document.version,
         document_b64: base64::engine::general_purpose::STANDARD.encode(&verified.bytes),
@@ -279,8 +298,8 @@ pub fn remember(dir: &Path, verified: &Verified) -> Result<(), ClientError> {
 /// Deliberately narrow: the authority emits exactly this shape, so accepting
 /// numeric offsets or fractional seconds would widen what a client treats as a
 /// valid timestamp without any publisher producing it.
-fn parse_rfc3339(s: &str) -> Result<i64, ClientError> {
-    let bad = || ClientError::Registry(format!("timestamp {s:?} is not RFC 3339 UTC with Z"));
+fn parse_rfc3339(s: &str) -> Result<i64, RegistryError> {
+    let bad = || RegistryError::Registry(format!("timestamp {s:?} is not RFC 3339 UTC with Z"));
     let b = s.as_bytes();
     if b.len() != 20
         || b[4] != b'-'
@@ -292,7 +311,7 @@ fn parse_rfc3339(s: &str) -> Result<i64, ClientError> {
     {
         return Err(bad());
     }
-    let num = |from: usize, to: usize| -> Result<i64, ClientError> {
+    let num = |from: usize, to: usize| -> Result<i64, RegistryError> {
         s.get(from..to)
             .ok_or_else(bad)?
             .parse::<i64>()
@@ -444,7 +463,7 @@ mod tests {
         .into_bytes();
         assert!(matches!(
             verify(&body, &[pinned_of(&k)], 1, NOW, None),
-            Err(ClientError::Registry(_))
+            Err(RegistryError::Registry(_))
         ));
     }
 
@@ -458,7 +477,7 @@ mod tests {
         // Signed by `other`, but only `real` is pinned.
         assert!(matches!(
             verify(&envelope(&other, &doc), &[pinned_of(&real)], 1, NOW, None),
-            Err(ClientError::Registry(_))
+            Err(RegistryError::Registry(_))
         ));
     }
 
@@ -470,7 +489,7 @@ mod tests {
         let expired_at = parse_rfc3339("2026-10-07T20:00:00Z").unwrap();
         assert!(matches!(
             verify(&envelope(&k, &doc), &[pinned_of(&k)], 1, expired_at, None),
-            Err(ClientError::Registry(_))
+            Err(RegistryError::Registry(_))
         ));
         // Control: one second before it is still accepted.
         assert!(verify(
@@ -506,7 +525,7 @@ mod tests {
                 after - SKEW_ALLOWANCE_SECS - 1,
                 None
             ),
-            Err(ClientError::Registry(_))
+            Err(RegistryError::Registry(_))
         ));
     }
 
@@ -526,7 +545,7 @@ mod tests {
 
         let low = doc_bytes("2026-10-07T13:00:00Z", "2026-10-07T19:00:00Z");
         match verify(&envelope(&k, &low), &[pinned_of(&k)], 1, NOW, Some(&prev)) {
-            Err(ClientError::Registry(m)) => assert!(m.contains("rollback"), "message was {m}"),
+            Err(RegistryError::Registry(m)) => assert!(m.contains("rollback"), "message was {m}"),
             other => panic!("a rollback was accepted: {other:?}"),
         }
     }
@@ -553,7 +572,7 @@ mod tests {
             NOW,
             Some(&prev),
         ) {
-            Err(ClientError::RegistryEquivocation(v)) if v == sample_version() => {}
+            Err(RegistryError::Equivocation(v)) if v == sample_version() => {}
             other => panic!("equivocation was not reported: {other:?}"),
         }
     }
@@ -572,7 +591,7 @@ mod tests {
         for wrong in [sample_version() + 1, sample_version() - 1, 1, 0] {
             let doc = doc_bytes_versioned(wrong, "2026-10-07T14:00:00Z", "2026-10-07T20:00:00Z");
             match verify(&envelope(&k, &doc), &[pinned_of(&k)], 1, NOW, None) {
-                Err(ClientError::Registry(m)) => assert!(
+                Err(RegistryError::Registry(m)) => assert!(
                     m.contains("does not match valid_after"),
                     "version {wrong}: message was {m}"
                 ),
@@ -591,7 +610,7 @@ mod tests {
             "2026-10-07T20:30:00Z",
         );
         match verify(&envelope(&k, &doc), &[pinned_of(&k)], 1, NOW, None) {
-            Err(ClientError::Registry(m)) => {
+            Err(RegistryError::Registry(m)) => {
                 assert!(m.contains("not on an exact hour"), "message was {m}")
             }
             other => panic!("an off-hour valid_after was accepted: {other:?}"),
@@ -608,7 +627,7 @@ mod tests {
         // Control: threshold 1 passes with one signature.
         assert!(verify(&body, &[pinned_of(&k)], 1, NOW, None).is_ok());
         match verify(&body, &[pinned_of(&k)], 2, NOW, None) {
-            Err(ClientError::Registry(m)) => {
+            Err(RegistryError::Registry(m)) => {
                 assert!(m.contains("of 2 required"), "message was {m}")
             }
             other => panic!("threshold 2 was satisfied by one signature: {other:?}"),
@@ -634,7 +653,7 @@ mod tests {
         .into_bytes();
         assert!(matches!(
             verify(&body, &[pinned_of(&k)], 1, NOW, None),
-            Err(ClientError::Registry(_))
+            Err(RegistryError::Registry(_))
         ));
     }
 
@@ -654,7 +673,7 @@ mod tests {
         )
         .into_bytes();
         match verify(&body, &[pinned_of(&k)], 1, NOW, None) {
-            Err(ClientError::Registry(m)) => assert!(
+            Err(RegistryError::Registry(m)) => assert!(
                 m.contains("required signatures"),
                 "expected a signature failure before any parse, got {m}"
             ),
@@ -794,7 +813,7 @@ mod tests {
 /// rather than by being the same function.
 #[cfg(test)]
 mod date_tests {
-    use super::{parse_rfc3339, ClientError};
+    use super::{parse_rfc3339, RegistryError};
 
     const FIRST_YEAR: i64 = 1970;
     const LAST_YEAR: i64 = 2100;
@@ -905,7 +924,7 @@ mod date_tests {
             "2026-00-10T00:00:00Z", // no zeroth month
         ] {
             assert!(
-                matches!(parse_rfc3339(s), Err(ClientError::Registry(_))),
+                matches!(parse_rfc3339(s), Err(RegistryError::Registry(_))),
                 "{s} was accepted"
             );
         }
