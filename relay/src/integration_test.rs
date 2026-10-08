@@ -20,8 +20,7 @@
 //! cell and a wrong-size cell. All four must end with the relay closing the
 //! connection and sending nothing.
 
-use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -36,12 +35,14 @@ use tokio::sync::{mpsc, Notify};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::TlsConnector;
 
+use crate::registry::RegistryHandle;
 use quiethop_crypto::cell::{
     link_cell_len, parse_extend_backward, Cell, CellType, ConnectPayload, ExtendForward,
     CELL_PAYLOAD_LEN,
 };
 use quiethop_crypto::layer::{peel, seal_forward, seal_to_me, Peeled};
 use quiethop_crypto::noise::{Initiator, Transport, NOISE_MSG_LEN, STATIC_KEY_LEN};
+use quiethop_crypto::registry::{Document, RelayEntry, Verified};
 
 use crate::authority::AuthorityClient;
 use crate::config::{RelayConfig, Role};
@@ -114,8 +115,8 @@ fn default_override() -> RelayOverride {
 fn make_config(
     role: Role,
     over: &RelayOverride,
-    peers: HashMap<SocketAddr, String>,
     static_key_path: PathBuf,
+    registry_state_dir: PathBuf,
 ) -> Arc<RelayConfig> {
     Arc::new(RelayConfig {
         role,
@@ -135,14 +136,73 @@ fn make_config(
             None
         },
         allowed_exit_ports: over.allowed_exit_ports.clone(),
-        peer_allowlist: vec![IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))],
         relay_hostname: TEST_HOSTNAME.to_string(),
         acme_contact_email: "test@example.invalid".to_string(),
         acme_dir: PathBuf::from("/tmp/quiethop-relay-test-acme-unused"),
         acme_staging: true,
         static_key_path,
-        peer_hostnames: peers,
+        // The in-process harness publishes a document straight into the handle,
+        // so nothing here is fetched. Verification itself is covered by the
+        // quiethop-crypto registry and cache tests; what these tests exercise is
+        // what the relay does with a document it already holds.
+        registry_signing_pubkeys: Vec::new(),
+        registry_url: String::new(),
+        registry_state_dir,
     })
+}
+
+/// Build a verified document from explicit role, address and key triples.
+///
+/// The address is what callers must use in EXTEND, which is not always the
+/// relay's own listener: the adverse delivery test reaches each hop through a
+/// chunking proxy, so the published address is the proxy's. `extend_target`
+/// matches address and port exactly, which is the point of passing them in.
+///
+/// `bytes` and `key_ids` are empty because this never goes through signature
+/// verification: the relay reads the document it is given, and the signature
+/// path has its own tests in quiethop-crypto.
+fn document_from(
+    entries: &[(&str, SocketAddr, [u8; STATIC_KEY_LEN])],
+    valid_after: &str,
+    fresh_until: &str,
+    valid_until: &str,
+) -> Verified {
+    let relays = entries
+        .iter()
+        .map(|(role, addr, key)| RelayEntry {
+            id: format!("test-{role}"),
+            operator_id: format!("op-{role}"),
+            host_id: format!("host-{role}"),
+            role: (*role).to_string(),
+            ip: addr.ip().to_string(),
+            port: addr.port(),
+            tls_name: TEST_HOSTNAME.to_string(),
+            static_pubkey: key.iter().map(|b| format!("{b:02x}")).collect(),
+        })
+        .collect();
+    Verified {
+        document: Document {
+            version: parse_hour(valid_after),
+            valid_after: valid_after.to_string(),
+            fresh_until: fresh_until.to_string(),
+            valid_until: valid_until.to_string(),
+            relays,
+        },
+        bytes: Vec::new(),
+        key_ids: Vec::new(),
+    }
+}
+
+/// Hours since the epoch, which is what the document version must equal.
+fn parse_hour(rfc3339: &str) -> i64 {
+    let d = Document {
+        version: 0,
+        valid_after: rfc3339.to_string(),
+        fresh_until: rfc3339.to_string(),
+        valid_until: rfc3339.to_string(),
+        relays: Vec::new(),
+    };
+    d.valid_after_unix().expect("timestamp parses") / 3600
 }
 
 /// A spawned relay: where to reach it and the static public key a client must
@@ -154,11 +214,12 @@ struct SpawnedRelay {
 
 /// Spawn one relay. Its keypair is generated at runtime into `keydir`, so no
 /// key material is ever checked in or printed.
+#[allow(clippy::too_many_arguments)]
 async fn spawn_relay(
     role: Role,
     authority_priv: &RsaPrivateKey,
     over: &RelayOverride,
-    peers: HashMap<SocketAddr, String>,
+    registry: RegistryHandle,
     server_config: Arc<ServerConfig>,
     connector: Arc<TlsConnector>,
     keydir: &Path,
@@ -174,7 +235,7 @@ async fn spawn_relay(
         authority_priv,
     )));
     let replay = Arc::new(ReplayWindow::new(Duration::from_secs(86_400)));
-    let cfg = make_config(role, over, peers, key_path);
+    let cfg = make_config(role, over, key_path, keydir.join(format!("{role}-state")));
     let shutdown = Arc::new(Notify::new());
     tokio::spawn(super::accept_loop(
         listener,
@@ -186,6 +247,7 @@ async fn spawn_relay(
         replay,
         connector,
         Arc::new(kp),
+        registry,
     ));
     SpawnedRelay {
         addr,
@@ -193,11 +255,121 @@ async fn spawn_relay(
     }
 }
 
-/// The three-hop fleet plus the client's pinned keys.
+/// Seconds since the epoch, as the relay reads it.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Format Unix seconds as the RFC 3339 UTC string the registry carries.
+///
+/// The harness must build windows around the real clock, because the relay
+/// checks documents against it. A fixed window would pass only during the hours
+/// it happened to name.
+///
+/// Civil date from days, after Howard Hinnant's algorithm. Verified by round
+/// trip against the parser the registry itself uses, in
+/// `rfc3339_round_trips_through_the_registry_parser`.
+fn rfc3339_utc(unix: i64) -> String {
+    let days = unix.div_euclid(86_400);
+    let secs = unix.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m,
+        d,
+        secs / 3600,
+        (secs % 3600) / 60,
+        secs % 60
+    )
+}
+
+/// The formatter is only trustworthy if it round trips through the parser the
+/// registry itself uses, so this checks it against that parser rather than
+/// against a second copy of the same arithmetic.
+#[test]
+fn rfc3339_round_trips_through_the_registry_parser() {
+    // An hour boundary, a leap day, a century non-leap year, and an end of year.
+    for unix in [
+        0_i64,
+        1_791_468_000,
+        1_709_164_800,
+        4_102_444_800,
+        951_782_400,
+        2_147_483_647 - (2_147_483_647 % 3600),
+    ] {
+        let s = rfc3339_utc(unix);
+        let d = Document {
+            version: 0,
+            valid_after: s.clone(),
+            fresh_until: s.clone(),
+            valid_until: s.clone(),
+            relays: Vec::new(),
+        };
+        assert_eq!(
+            d.valid_after_unix()
+                .expect("the parser accepts what we format"),
+            unix,
+            "{s} did not round trip"
+        );
+    }
+}
+
+/// The publication window the harness uses: the current hour, fresh for an hour
+/// and valid for six, matching the authority's own windows.
+fn current_window() -> (String, String, String) {
+    let hour = now_unix().div_euclid(3600) * 3600;
+    (
+        rfc3339_utc(hour),
+        rfc3339_utc(hour + 3600),
+        rfc3339_utc(hour + 6 * 3600),
+    )
+}
+
+/// The three-hop fleet plus the registry handles that feed it.
+///
+/// The handles are kept so a test can republish, which is how the expired
+/// document case is exercised without waiting six hours.
 struct Fleet {
     guard: SpawnedRelay,
     middle: SpawnedRelay,
     exit: SpawnedRelay,
+    handles: Vec<RegistryHandle>,
+}
+
+impl Fleet {
+    /// Publish one document to every relay in the fleet.
+    fn publish(&self, doc: Verified) {
+        let doc = Arc::new(doc);
+        for h in &self.handles {
+            h.publish(doc.clone());
+        }
+    }
+
+    fn document(&self, valid_after: &str, fresh_until: &str, valid_until: &str) -> Verified {
+        document_from(
+            &[
+                ("guard", self.guard.addr, self.guard.static_pubkey),
+                ("middle", self.middle.addr, self.middle.static_pubkey),
+                ("exit", self.exit.addr, self.exit.static_pubkey),
+            ],
+            valid_after,
+            fresh_until,
+            valid_until,
+        )
+    }
 }
 
 async fn spawn_fleet(
@@ -207,48 +379,50 @@ async fn spawn_fleet(
     connector: Arc<TlsConnector>,
     keydir: &Path,
 ) -> Fleet {
-    // Exit first: the middle's peer map needs its address, and the guard's
-    // needs the middle's.
+    // Each relay gets its own handle, filled once every address is known. A
+    // relay reads the handle per connection, so publishing after spawn is in
+    // time and avoids binding listeners before the document can name them.
+    let handles: Vec<RegistryHandle> = (0..3).map(|_| RegistryHandle::new()).collect();
     let exit = spawn_relay(
         Role::Exit,
         auth_priv,
         over,
-        HashMap::new(),
+        handles[2].clone(),
         server_config.clone(),
         connector.clone(),
         keydir,
     )
     .await;
-    let middle_peers: HashMap<SocketAddr, String> =
-        std::iter::once((exit.addr, TEST_HOSTNAME.to_string())).collect();
     let middle = spawn_relay(
         Role::Middle,
         auth_priv,
         over,
-        middle_peers,
+        handles[1].clone(),
         server_config.clone(),
         connector.clone(),
         keydir,
     )
     .await;
-    let guard_peers: HashMap<SocketAddr, String> =
-        std::iter::once((middle.addr, TEST_HOSTNAME.to_string())).collect();
     let guard = spawn_relay(
         Role::Guard,
         auth_priv,
         over,
-        guard_peers,
+        handles[0].clone(),
         server_config,
         connector,
         keydir,
     )
     .await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    Fleet {
+    let fleet = Fleet {
         guard,
         middle,
         exit,
-    }
+        handles,
+    };
+    let (after, fresh, until) = current_window();
+    fleet.publish(fleet.document(&after, &fresh, &until));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    fleet
 }
 
 /// Mock client holding one Noise transport per hop.
@@ -271,9 +445,24 @@ impl MockClient {
         guard: &SpawnedRelay,
         auth_priv: &RsaPrivateKey,
     ) -> Self {
+        Self::connect_with_token(connector, guard, auth_priv, [0xA5; 32]).await
+    }
+
+    /// Connect with a caller-chosen token.
+    ///
+    /// A test that connects to one guard more than once needs a distinct token
+    /// per connection, because the guard's replay window refuses the second
+    /// presentation of the same one and closes the link. That refusal is
+    /// correct, and reusing a token would make it look like whatever the test
+    /// was actually trying to observe.
+    async fn connect_with_token(
+        connector: &TlsConnector,
+        guard: &SpawnedRelay,
+        auth_priv: &RsaPrivateKey,
+        m_raw: [u8; 32],
+    ) -> Self {
         let mut sock = tls_connect(connector, guard.addr).await;
         sock.write_all(&[super::PROTO_CLIENT]).await.expect("proto");
-        let m_raw: [u8; 32] = [0xA5; 32];
         let token = raw_sign(&m_raw, auth_priv);
         sock.write_all(&m_raw).await.expect("m_raw");
         sock.write_all(&token).await.expect("token");
@@ -395,6 +584,56 @@ impl MockClient {
             self.middle = Some(tx);
         } else {
             self.exit = Some(tx);
+        }
+    }
+
+    /// Attempt one EXTEND and report whether the hop served it.
+    ///
+    /// `extend_to` asserts success, which is right for the happy path and wrong
+    /// for the refusal cases: a refusing relay tears the link down, so the read
+    /// returns nothing rather than a cell.
+    async fn try_extend_to(
+        &mut self,
+        next_addr: SocketAddr,
+        next_key: [u8; STATIC_KEY_LEN],
+    ) -> bool {
+        let (init, msg1) = Initiator::start(&next_key).expect("nk start");
+        let extend = ExtendForward {
+            next_hop: next_addr,
+            noise_msg1: msg1,
+        };
+        let cell = Cell::new(CellType::Extend, extend.encode()).expect("extend cell");
+        let depth = self.hops();
+        let wire = self.seal_for_depth(&cell, depth);
+        if self.sock.write_all(&wire).await.is_err() || self.sock.flush().await.is_err() {
+            return false;
+        }
+        let Ok(Ok(wire)) = tokio::time::timeout(Duration::from_secs(10), self.read_frame()).await
+        else {
+            return false;
+        };
+        let Ok(peeled) = peel(&mut self.guard, &wire, CLIENT_LAYERS) else {
+            return false;
+        };
+        let Peeled::ToMe(back) = peeled else {
+            return false;
+        };
+        if back.cell_type != CellType::Extend {
+            return false;
+        }
+        let Ok(msg2) = parse_extend_backward(&back.payload) else {
+            return false;
+        };
+        match init.finish(&msg2) {
+            Ok(tx) => {
+                if self.middle.is_none() {
+                    self.middle = Some(tx);
+                } else {
+                    self.exit = Some(tx);
+                }
+                true
+            }
+            Err(_) => false,
         }
     }
 
@@ -803,16 +1042,33 @@ async fn run_one_circuit_per_link_test() {
     let connector = Arc::new(make_connector(&pki));
     let over = default_override();
 
+    let registry = RegistryHandle::new();
     let exit = spawn_relay(
         Role::Exit,
         &auth_priv,
         &over,
-        HashMap::new(),
+        registry.clone(),
         server_config,
         connector.clone(),
         keydir.path(),
     )
     .await;
+    // This test opens the relay link itself, so the registry must list a middle
+    // at the address it dials from, which is loopback.
+    let (after, fresh, until) = current_window();
+    registry.publish(Arc::new(document_from(
+        &[
+            (
+                "middle",
+                "127.0.0.1:1".parse().unwrap(),
+                [0u8; STATIC_KEY_LEN],
+            ),
+            ("exit", exit.addr, exit.static_pubkey),
+        ],
+        &after,
+        &fresh,
+        &until,
+    )));
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let frame_len = link_cell_len(1);
@@ -969,11 +1225,12 @@ async fn run_adverse_delivery_test() {
 
     // Each hop reaches the next through a chunking proxy, so all three links
     // deliver partial cells: client to guard, guard to middle, middle to exit.
+    let handles: Vec<RegistryHandle> = (0..3).map(|_| RegistryHandle::new()).collect();
     let exit = spawn_relay(
         Role::Exit,
         &auth_priv,
         &over,
-        HashMap::new(),
+        handles[2].clone(),
         server_config.clone(),
         connector.clone(),
         keydir.path(),
@@ -985,7 +1242,7 @@ async fn run_adverse_delivery_test() {
         Role::Middle,
         &auth_priv,
         &over,
-        std::iter::once((exit_via, TEST_HOSTNAME.to_string())).collect(),
+        handles[1].clone(),
         server_config.clone(),
         connector.clone(),
         keydir.path(),
@@ -997,13 +1254,32 @@ async fn run_adverse_delivery_test() {
         Role::Guard,
         &auth_priv,
         &over,
-        std::iter::once((middle_via, TEST_HOSTNAME.to_string())).collect(),
+        handles[0].clone(),
         server_config,
         connector.clone(),
         keydir.path(),
     )
     .await;
     let guard_via = spawn_chunking_proxy(guard.addr).await;
+
+    // Every hop is reached through its proxy, so those are the addresses EXTEND
+    // carries and therefore the addresses the registry must publish. The keys
+    // stay the relays' own, because the handshake is still pinned to them.
+    let (after, fresh, until) = current_window();
+    let doc = document_from(
+        &[
+            ("guard", guard_via, guard.static_pubkey),
+            ("middle", middle_via, middle.static_pubkey),
+            ("exit", exit_via, exit.static_pubkey),
+        ],
+        &after,
+        &fresh,
+        &until,
+    );
+    let doc = Arc::new(doc);
+    for h in &handles {
+        h.publish(doc.clone());
+    }
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Dial the guard through its proxy, still pinning the guard's real key.
@@ -1163,4 +1439,256 @@ async fn run_echo_server(listener: TcpListener) {
             }
         });
     }
+}
+
+/// A guard must refuse an EXTEND to an address the registry does not publish for
+/// the role directly downstream of it, and to a listed relay carrying the wrong
+/// role, and must serve one that matches (ARCHITECTURE 5.5).
+#[tokio::test]
+async fn extend_is_refused_unless_the_registry_publishes_the_next_hop() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        ensure_crypto_provider();
+        let keydir = tempfile::tempdir().expect("keydir");
+        let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let pki = make_pki();
+        let server_config = make_server_config(&pki);
+        let connector = Arc::new(make_connector(&pki));
+        let over = default_override();
+        let fleet = spawn_fleet(
+            &auth_priv,
+            &over,
+            server_config,
+            connector.clone(),
+            keydir.path(),
+        )
+        .await;
+        let (after, fresh, until) = current_window();
+
+        // Control: the published middle is served, so every refusal below is
+        // attributable to the registry change that caused it.
+        let mut ok =
+            MockClient::connect_with_token(&connector, &fleet.guard, &auth_priv, [0xB1; 32]).await;
+        assert!(
+            ok.try_extend_to(fleet.middle.addr, fleet.middle.static_pubkey)
+                .await,
+            "the registry publishes this middle, so the guard must serve it"
+        );
+        drop(ok);
+
+        // The exit is in the registry but is not the role downstream of a guard.
+        let mut wrong_role =
+            MockClient::connect_with_token(&connector, &fleet.guard, &auth_priv, [0xB2; 32]).await;
+        assert!(
+            !wrong_role
+                .try_extend_to(fleet.exit.addr, fleet.exit.static_pubkey)
+                .await,
+            "a guard must not extend straight to an exit"
+        );
+        drop(wrong_role);
+
+        // Republish with the middle at an address nothing listens on, leaving
+        // the real middle unlisted. Its own listener is untouched, so a relay
+        // that consulted anything other than the registry would still reach it.
+        let mut doc = fleet.document(&after, &fresh, &until);
+        let unlisted: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        for e in doc.document.relays.iter_mut() {
+            if e.role == "middle" {
+                e.ip = unlisted.ip().to_string();
+                e.port = unlisted.port();
+            }
+        }
+        fleet.publish(doc);
+
+        let mut refused =
+            MockClient::connect_with_token(&connector, &fleet.guard, &auth_priv, [0xB3; 32]).await;
+        assert!(
+            !refused
+                .try_extend_to(fleet.middle.addr, fleet.middle.static_pubkey)
+                .await,
+            "an address the registry does not publish must be refused"
+        );
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// A middle must accept a relay link only from an address the registry lists
+/// with the role directly upstream of it.
+#[tokio::test]
+async fn inbound_is_refused_from_an_unlisted_peer() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        ensure_crypto_provider();
+        let keydir = tempfile::tempdir().expect("keydir");
+        let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let pki = make_pki();
+        let server_config = make_server_config(&pki);
+        let connector = Arc::new(make_connector(&pki));
+        let over = default_override();
+        let fleet = spawn_fleet(
+            &auth_priv,
+            &over,
+            server_config,
+            connector.clone(),
+            keydir.path(),
+        )
+        .await;
+        let (after, fresh, until) = current_window();
+
+        // Control: the registry lists a guard on loopback, which is where this
+        // test dials from, so the middle serves the link.
+        assert!(
+            relay_link_is_served(&connector, &fleet.middle).await,
+            "a listed upstream address must be accepted"
+        );
+
+        // Move the guard off loopback. Nothing else changes, so the refusal
+        // below is attributable to the guard's published address alone.
+        let mut doc = fleet.document(&after, &fresh, &until);
+        for e in doc.document.relays.iter_mut() {
+            if e.role == "guard" {
+                e.ip = "198.51.100.7".to_string();
+            }
+        }
+        fleet.publish(doc);
+
+        assert!(
+            !relay_link_is_served(&connector, &fleet.middle).await,
+            "an address not listed for the upstream role must be refused"
+        );
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Open a relay link and report whether the hop completed its handshake.
+async fn relay_link_is_served(connector: &TlsConnector, target: &SpawnedRelay) -> bool {
+    let mut sock = tls_connect(connector, target.addr).await;
+    if sock.write_all(&[super::PROTO_RELAY]).await.is_err() {
+        return false;
+    }
+    let (init, msg1) = Initiator::start(&target.static_pubkey).expect("nk start");
+    if sock.write_all(&[super::CIRCUIT_START]).await.is_err()
+        || sock.write_all(&msg1).await.is_err()
+        || sock.flush().await.is_err()
+    {
+        return false;
+    }
+    let mut msg2 = [0u8; NOISE_MSG_LEN];
+    match tokio::time::timeout(Duration::from_secs(10), sock.read_exact(&mut msg2)).await {
+        Ok(Ok(_)) => init.finish(&msg2).is_ok(),
+        _ => false,
+    }
+}
+
+/// Outbound SNI comes from the registry entry's tls_name.
+///
+/// The test certificate is issued for TEST_HOSTNAME only, so publishing any
+/// other name makes the guard's outbound handshake to the middle fail. A relay
+/// that took the name from configuration or from its own RELAY_HOSTNAME would
+/// still connect and the refusal would not appear.
+#[tokio::test]
+async fn outbound_sni_comes_from_the_registry_tls_name() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        ensure_crypto_provider();
+        let keydir = tempfile::tempdir().expect("keydir");
+        let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let pki = make_pki();
+        let server_config = make_server_config(&pki);
+        let connector = Arc::new(make_connector(&pki));
+        let over = default_override();
+        let fleet = spawn_fleet(
+            &auth_priv,
+            &over,
+            server_config,
+            connector.clone(),
+            keydir.path(),
+        )
+        .await;
+        let (after, fresh, until) = current_window();
+
+        // Control: the published name matches the certificate.
+        let mut ok =
+            MockClient::connect_with_token(&connector, &fleet.guard, &auth_priv, [0xB4; 32]).await;
+        assert!(
+            ok.try_extend_to(fleet.middle.addr, fleet.middle.static_pubkey)
+                .await,
+            "the published tls_name matches the certificate, so the extend must work"
+        );
+        drop(ok);
+
+        let mut doc = fleet.document(&after, &fresh, &until);
+        for e in doc.document.relays.iter_mut() {
+            if e.role == "middle" {
+                e.tls_name = "not-the-certificate-name.invalid".to_string();
+            }
+        }
+        fleet.publish(doc);
+
+        let mut refused =
+            MockClient::connect_with_token(&connector, &fleet.guard, &auth_priv, [0xB5; 32]).await;
+        assert!(
+            !refused
+                .try_extend_to(fleet.middle.addr, fleet.middle.static_pubkey)
+                .await,
+            "a tls_name the certificate does not cover must fail the outbound handshake"
+        );
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// A document in hand stays in service until its valid_until and no longer.
+///
+/// This is the state a run of failed refreshes leaves behind: the relay keeps
+/// the last verified document and keeps serving from it, then refuses once it
+/// expires rather than widening the window (ARCHITECTURE 5.5).
+#[tokio::test]
+async fn circuits_are_refused_once_the_held_document_expires() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        ensure_crypto_provider();
+        let keydir = tempfile::tempdir().expect("keydir");
+        let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let pki = make_pki();
+        let server_config = make_server_config(&pki);
+        let connector = Arc::new(make_connector(&pki));
+        let over = default_override();
+        let fleet = spawn_fleet(
+            &auth_priv,
+            &over,
+            server_config,
+            connector.clone(),
+            keydir.path(),
+        )
+        .await;
+
+        // Control: inside the window, with no refresh having happened at all.
+        let mut ok =
+            MockClient::connect_with_token(&connector, &fleet.guard, &auth_priv, [0xB6; 32]).await;
+        assert!(
+            ok.try_extend_to(fleet.middle.addr, fleet.middle.static_pubkey)
+                .await,
+            "a document inside its window must be served"
+        );
+        drop(ok);
+
+        // The same document, published with a window that has already closed.
+        // Nothing else changes, so a relay that served it anyway would be
+        // ignoring valid_until rather than failing for another reason.
+        let hour = now_unix().div_euclid(3600) * 3600;
+        let expired_after = rfc3339_utc(hour - 12 * 3600);
+        let expired_fresh = rfc3339_utc(hour - 11 * 3600);
+        let expired_until = rfc3339_utc(hour - 6 * 3600);
+        fleet.publish(fleet.document(&expired_after, &expired_fresh, &expired_until));
+
+        let mut refused =
+            MockClient::connect_with_token(&connector, &fleet.guard, &auth_priv, [0xB7; 32]).await;
+        assert!(
+            !refused
+                .try_extend_to(fleet.middle.addr, fleet.middle.static_pubkey)
+                .await,
+            "an expired document must not be served, with no grace period"
+        );
+    })
+    .await
+    .expect("test timed out");
 }

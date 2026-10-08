@@ -1,8 +1,9 @@
-use std::collections::HashMap;
 use std::env;
 use std::fmt;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::PathBuf;
+
+use quiethop_crypto::registry::PinnedKey;
 
 use thiserror::Error;
 
@@ -66,11 +67,6 @@ pub struct RelayConfig {
     pub decodo_proxy_url: Option<String>,
     /// Required when role == Exit. Defaults to `[80, 443]` if unset.
     pub allowed_exit_ports: Vec<u16>,
-    /// IPs allowed to initiate relay-to-relay (protocol byte 0x02)
-    /// connections to this relay. Consulted only by middle and exit
-    /// roles, where inbound peer relays bypass the client token check.
-    /// Empty list = no peer relay is accepted (guard runs this way).
-    pub peer_allowlist: Vec<IpAddr>,
     /// Fully-qualified DNS name this relay answers on. Used as the
     /// rustls-acme cert subject (one cert per relay), as the redirect
     /// target on the port-80 redirector, and as the expected SNI
@@ -90,14 +86,16 @@ pub struct RelayConfig {
     /// mode 0600. Written by the `keygen` subcommand and never generated at
     /// startup (ARCHITECTURE §5.2 step 3).
     pub static_key_path: PathBuf,
-    /// Map from next-hop relay socket address to the hostname the
-    /// outbound TLS client must present as SNI and verify against the
-    /// peer's certificate. Required because the EXTEND wire payload
-    /// carries only a SocketAddr but TLS verification requires a
-    /// hostname. Empty for `guard` (guard never extends outward via
-    /// another relay-to-relay link in the current topology) but
-    /// validated for `middle`.
-    pub peer_hostnames: HashMap<SocketAddr, String>,
+    /// Pinned Ed25519 registry signing public keys.
+    ///
+    /// The registry's integrity rests on these rather than on the transport, so
+    /// a relay with none configured does not start (SECURITY_MODEL §10).
+    pub registry_signing_pubkeys: Vec<PinnedKey>,
+    /// Where the signed registry is fetched from.
+    pub registry_url: String,
+    /// Directory holding the highest registry version this relay has accepted
+    /// and the bytes of that document, for rollback protection across restarts.
+    pub registry_state_dir: PathBuf,
 }
 
 impl RelayConfig {
@@ -126,10 +124,6 @@ impl RelayConfig {
             None => vec![80, 443],
             Some(s) => parse_port_list(&s)?,
         };
-        let peer_allowlist = match get("RELAY_PEER_ALLOWLIST") {
-            None => Vec::new(),
-            Some(s) => parse_ip_list(&s)?,
-        };
         let relay_hostname = required(&get, "RELAY_HOSTNAME")?;
         let acme_contact_email = required(&get, "ACME_CONTACT_EMAIL")?;
         let acme_dir = match get("ACME_DIR") {
@@ -141,9 +135,12 @@ impl RelayConfig {
             Some(s) if !s.is_empty() => PathBuf::from(s),
             _ => PathBuf::from("/opt/quiethop/secrets/static.key"),
         };
-        let peer_hostnames = match get("PEER_HOSTNAMES") {
-            None => HashMap::new(),
-            Some(s) => parse_peer_hostnames(&s)?,
+        let registry_signing_pubkeys =
+            parse_pinned_keys(&required(&get, "REGISTRY_SIGNING_PUBKEY")?)?;
+        let registry_url = required(&get, "REGISTRY_URL")?;
+        let registry_state_dir = match get("REGISTRY_STATE_DIR") {
+            Some(s) if !s.is_empty() => PathBuf::from(s),
+            _ => PathBuf::from("/opt/quiethop/state"),
         };
 
         if role == Role::Exit {
@@ -192,13 +189,14 @@ impl RelayConfig {
             node_id,
             decodo_proxy_url,
             allowed_exit_ports,
-            peer_allowlist,
             relay_hostname,
             acme_contact_email,
             acme_dir,
             acme_staging,
             static_key_path,
-            peer_hostnames,
+            registry_signing_pubkeys,
+            registry_url,
+            registry_state_dir,
         })
     }
 }
@@ -222,46 +220,42 @@ fn parse_bool<F: Fn(&str) -> Option<String>>(
     }
 }
 
-fn parse_peer_hostnames(raw: &str) -> Result<HashMap<SocketAddr, String>, ConfigError> {
-    let mut out = HashMap::new();
-    for piece in raw.split(',') {
-        let t = piece.trim();
-        if t.is_empty() {
-            continue;
-        }
-        let (addr_str, host_str) = t.split_once('=').ok_or(ConfigError::Invalid {
-            var: "PEER_HOSTNAMES",
-            reason: format!("entry {t:?} missing '='"),
-        })?;
-        let addr = addr_str
-            .parse::<SocketAddr>()
-            .map_err(|e| ConfigError::Invalid {
-                var: "PEER_HOSTNAMES",
-                reason: format!("{addr_str:?} is not host:port: {e}"),
-            })?;
-        let host = host_str.trim();
-        if host.is_empty() {
-            return Err(ConfigError::Invalid {
-                var: "PEER_HOSTNAMES",
-                reason: format!("entry {t:?} has empty hostname"),
-            });
-        }
-        out.insert(addr, host.to_string());
-    }
-    Ok(out)
-}
-
-fn parse_ip_list(raw: &str) -> Result<Vec<IpAddr>, ConfigError> {
+/// The pinned registry signing keys, as inline hex or as a path to a file of
+/// hex, one key per line or comma separated.
+///
+/// Hex because `authority registry-keygen` prints hex, so the operator pins the
+/// string the tool handed them. A value of exactly the hex length of a key is
+/// read inline; anything else is treated as a path, so the two forms cannot be
+/// confused for one another (ARCHITECTURE 5.8).
+fn parse_pinned_keys(raw: &str) -> Result<Vec<PinnedKey>, ConfigError> {
+    const HEX_LEN: usize = 64;
+    let trimmed = raw.trim();
+    let body = if trimmed.len() == HEX_LEN && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        trimmed.to_string()
+    } else {
+        std::fs::read_to_string(trimmed).map_err(|e| ConfigError::Invalid {
+            var: "REGISTRY_SIGNING_PUBKEY",
+            reason: format!(
+                "{trimmed:?} is neither {HEX_LEN} hex characters nor a readable file: {e}"
+            ),
+        })?
+    };
     let mut out = Vec::new();
-    for piece in raw.split(',') {
+    for piece in body.split([',', '\n']) {
         let t = piece.trim();
         if t.is_empty() {
             continue;
         }
-        out.push(t.parse::<IpAddr>().map_err(|e| ConfigError::Invalid {
-            var: "RELAY_PEER_ALLOWLIST",
+        out.push(PinnedKey::from_hex(t).map_err(|e| ConfigError::Invalid {
+            var: "REGISTRY_SIGNING_PUBKEY",
             reason: e.to_string(),
         })?);
+    }
+    if out.is_empty() {
+        return Err(ConfigError::Invalid {
+            var: "REGISTRY_SIGNING_PUBKEY",
+            reason: "no key found in the value".to_string(),
+        });
     }
     Ok(out)
 }
@@ -358,6 +352,14 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// A valid Ed25519 public key, hex. This is the RFC 8032 section 7.1 TEST-1
+    /// public key, which this repository already carries in
+    /// testdata/ed25519_rfc8032.json. A published vector, never a secret, and a
+    /// real curve point, which matters because PinnedKey rejects anything that
+    /// is not one: 32 bytes of 0xAB, for instance, is not a valid key.
+    const TEST_REGISTRY_PUBKEY: &str =
+        "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a";
+
     fn base_env() -> HashMap<&'static str, &'static str> {
         let mut m = HashMap::new();
         m.insert("RELAY_ROLE", "guard");
@@ -371,6 +373,10 @@ mod tests {
         m.insert("NODE_ID", "relay-001");
         m.insert("RELAY_HOSTNAME", "node01.example");
         m.insert("ACME_CONTACT_EMAIL", "ops@example.com");
+        // A well formed but meaningless key. Ed25519 verifying keys are checked
+        // for validity on construction, so this must be a real point.
+        m.insert("REGISTRY_SIGNING_PUBKEY", TEST_REGISTRY_PUBKEY);
+        m.insert("REGISTRY_URL", "https://authority.example/api/v1/registry");
         m
     }
 
@@ -594,34 +600,58 @@ mod tests {
     }
 
     #[test]
-    fn peer_hostnames_parses_pairs() {
-        let mut env = base_env();
-        env.insert(
-            "PEER_HOSTNAMES",
-            "10.0.0.5:443=node02.example, 10.0.0.6:443=node03.example",
-        );
+    fn registry_pubkey_is_read_inline_as_hex() {
+        let env = base_env();
         let cfg = RelayConfig::from_source(lookup(&env)).expect("valid");
-        assert_eq!(cfg.peer_hostnames.len(), 2);
-        assert_eq!(
-            cfg.peer_hostnames
-                .get(&"10.0.0.5:443".parse::<SocketAddr>().unwrap())
-                .map(String::as_str),
-            Some("node02.example")
-        );
+        assert_eq!(cfg.registry_signing_pubkeys.len(), 1);
     }
 
     #[test]
-    fn peer_hostnames_rejects_missing_equals() {
+    fn registry_pubkey_is_read_from_a_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("registry.pub");
+        std::fs::write(&path, format!("{TEST_REGISTRY_PUBKEY}\n")).unwrap();
         let mut env = base_env();
-        env.insert("PEER_HOSTNAMES", "10.0.0.5:443");
-        let err = RelayConfig::from_source(lookup(&env)).unwrap_err();
-        assert!(matches!(
-            err,
-            ConfigError::Invalid {
-                var: "PEER_HOSTNAMES",
-                ..
-            }
-        ));
+        // Leaked because the fixture map holds &'static str. A test process that
+        // ends immediately after is the whole lifetime that matters.
+        let p: &'static str = Box::leak(path.to_string_lossy().into_owned().into_boxed_str());
+        env.insert("REGISTRY_SIGNING_PUBKEY", p);
+        let cfg = RelayConfig::from_source(lookup(&env)).expect("valid");
+        assert_eq!(cfg.registry_signing_pubkeys.len(), 1);
+    }
+
+    #[test]
+    fn registry_pubkey_rejects_garbage_and_a_missing_file() {
+        // 62 hex characters, two short of a key, so neither the inline form nor
+        // the path form can accept it.
+        const SHORT: &str = "ababababababababababababababababababababababababababababababab";
+        for bad in ["zz", "/nonexistent/registry.pub", SHORT] {
+            let mut env = base_env();
+            env.insert("REGISTRY_SIGNING_PUBKEY", bad);
+            let err = RelayConfig::from_source(lookup(&env)).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ConfigError::Invalid {
+                        var: "REGISTRY_SIGNING_PUBKEY",
+                        ..
+                    }
+                ),
+                "{bad:?} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_url_and_pubkey_are_required() {
+        for var in ["REGISTRY_SIGNING_PUBKEY", "REGISTRY_URL"] {
+            let mut env = base_env();
+            env.remove(var);
+            assert!(
+                RelayConfig::from_source(lookup(&env)).is_err(),
+                "{var} was not required"
+            );
+        }
     }
 
     #[test]

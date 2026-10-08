@@ -8,6 +8,7 @@ mod exit;
 mod heartbeat;
 mod metrics;
 mod port80;
+mod registry;
 mod static_key;
 mod tls;
 mod token;
@@ -38,7 +39,9 @@ use quiethop_crypto::wire::{
 
 use crate::authority::AuthorityClient;
 use crate::config::{RelayConfig, Role};
+use crate::registry::RegistryHandle;
 use crate::token::ReplayWindow;
+use quiethop_crypto::registry_cache::RegistryCache;
 
 const PRESENTATION_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(10);
@@ -115,10 +118,11 @@ async fn main() -> ExitCode {
         max_circuits = cfg.max_circuits,
         replay_window_ttl_seconds = cfg.replay_window_ttl,
         allowed_exit_ports = ?cfg.allowed_exit_ports,
-        peer_allowlist_size = cfg.peer_allowlist.len(),
         relay_hostname = %cfg.relay_hostname,
         acme_staging = cfg.acme_staging,
-        peer_hostnames_size = cfg.peer_hostnames.len(),
+        registry_url = %cfg.registry_url,
+        pinned_registry_keys = cfg.registry_signing_pubkeys.len(),
+        registry_state_dir = %cfg.registry_state_dir.display(),
         "config loaded"
     );
     if cfg.role == Role::Exit {
@@ -167,6 +171,68 @@ async fn main() -> ExitCode {
         }
     };
     info!("outbound tls connector ready (native root store)");
+
+    // The registry trust root, established before anything is bound. A relay
+    // that cannot verify the registry must not start (ARCHITECTURE 5.2 step 4,
+    // SECURITY_MODEL 10), so this returns rather than binding the listener.
+    let mut registry_cache = match RegistryCache::new(
+        cfg.registry_url.clone(),
+        cfg.registry_state_dir.clone(),
+        cfg.registry_signing_pubkeys.clone(),
+        1,
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            error!(error = %e, "registry cache could not be built");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(e) = registry_cache.prime(now_unix()).await {
+        error!(error = %e, "registry fetch or verification failed, refusing to start");
+        return ExitCode::from(1);
+    }
+    let registry = RegistryHandle::new();
+    match registry_cache.usable(now_unix()) {
+        Ok(v) => {
+            info!(
+                version = v.document.version,
+                relays = v.document.relays.len(),
+                "registry verified"
+            );
+            registry.publish(Arc::new(v.clone()));
+        }
+        Err(e) => {
+            error!(error = %e, "verified registry is not usable, refusing to start");
+            return ExitCode::from(1);
+        }
+    }
+    // Refreshed on its own schedule. A failed refresh keeps the last verified
+    // document in service until its valid_until, after which the handle still
+    // holds it but every consumer refuses, because the document is then outside
+    // its window. That is the fail-closed point (ARCHITECTURE 5.5).
+    {
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(REGISTRY_REFRESH_POLL);
+            loop {
+                tick.tick().await;
+                match registry_cache.refresh_if_stale(now_unix()).await {
+                    Ok(true) => match registry_cache.usable(now_unix()) {
+                        Ok(v) => {
+                            info!(version = v.document.version, "registry refreshed");
+                            registry.publish(Arc::new(v.clone()));
+                        }
+                        Err(e) => error!(error = %e, "refreshed registry is not usable"),
+                    },
+                    Ok(false) => {}
+                    Err(e) => error!(
+                        error = %e,
+                        "registry refresh failed, serving the last verified document until it expires"
+                    ),
+                }
+            }
+        });
+    }
 
     let relay_addr = format!("0.0.0.0:{}", cfg.relay_port);
     let relay_listener = match TcpListener::bind(&relay_addr).await {
@@ -225,6 +291,7 @@ async fn main() -> ExitCode {
         replay.clone(),
         outbound_connector.clone(),
         static_key.clone(),
+        registry.clone(),
     ));
     let metrics_handle = tokio::spawn(metrics_accept_loop(metrics_listener, shutdown.clone()));
     let port80_handle = tokio::spawn(port80::redirect_loop(
@@ -262,6 +329,18 @@ fn redact_proxy_url(raw: &str) -> String {
     }
 }
 
+/// How often the registry refresh task wakes. The document's own fresh window
+/// decides whether a fetch happens, so this only bounds how late one can be.
+const REGISTRY_REFRESH_POLL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Seconds since the Unix epoch.
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn accept_loop(
     listener: TcpListener,
@@ -273,6 +352,7 @@ async fn accept_loop(
     replay: Arc<ReplayWindow>,
     connector: Arc<TlsConnector>,
     static_key: Arc<StaticKeypair>,
+    registry: RegistryHandle,
 ) {
     loop {
         tokio::select! {
@@ -288,6 +368,7 @@ async fn accept_loop(
                         replay: replay.clone(),
                         connector: connector.clone(),
                         static_key: static_key.clone(),
+                        registry: registry.clone(),
                     };
                     let dc = default_config.clone();
                     let cc = challenge_config.clone();
@@ -338,6 +419,7 @@ struct ConnCtx {
     replay: Arc<ReplayWindow>,
     connector: Arc<TlsConnector>,
     static_key: Arc<StaticKeypair>,
+    registry: RegistryHandle,
 }
 
 /// Write a fresh static keypair and print only the public half.
@@ -474,7 +556,13 @@ async fn handle_relay_connection(
         SocketAddr::V4(a) => IpAddr::V4(*a.ip()),
         SocketAddr::V6(a) => IpAddr::V6(*a.ip()),
     };
-    if !ctx.cfg.peer_allowlist.contains(&peer_ip) {
+    // The upstream role for this relay, taken from the verified registry. An
+    // absent registry refuses, so a relay with none published serves nothing
+    // (ARCHITECTURE 5.5).
+    let Some(doc) = ctx.registry.usable(now_unix()) else {
+        return Err(HandleError::PeerNotAllowed);
+    };
+    if !registry::admits_inbound(&doc, ctx.cfg.role, peer_ip) {
         return Err(HandleError::PeerNotAllowed);
     }
 
@@ -641,7 +729,8 @@ async fn run_circuit_io(
                                 HandleError::IllegalCellForRole(CellType::Extend, role),
                             )?;
                             let nl =
-                                open_next_link(&extend, &ctx.cfg, &ctx.connector, out).await?;
+                                open_next_link(&extend, &ctx.cfg, &ctx.registry, &ctx.connector, out)
+                                        .await?;
                             let reply = Cell::new(
                                 CellType::Extend,
                                 cell::extend_backward_payload(&nl.noise_msg2),
@@ -772,14 +861,19 @@ struct NextLinkState {
 async fn open_next_link(
     extend: &ExtendForward,
     cfg: &RelayConfig,
+    registry: &RegistryHandle,
     connector: &TlsConnector,
     frame_len: usize,
 ) -> Result<NextLinkState, HandleError> {
-    let sni = cfg
-        .peer_hostnames
-        .get(&extend.next_hop)
+    // The next hop must be published for the role directly downstream of this
+    // one, at exactly this address and port, and its SNI is the name the
+    // registry carries for it. Nothing here comes from configuration.
+    let doc = registry
+        .usable(now_unix())
         .ok_or(HandleError::PeerHostnameMissing(extend.next_hop))?;
-    let mut stream = tls::dial_tls(connector, extend.next_hop, sni).await?;
+    let entry = registry::extend_target(&doc, cfg.role, extend.next_hop)
+        .ok_or(HandleError::PeerHostnameMissing(extend.next_hop))?;
+    let mut stream = tls::dial_tls(connector, extend.next_hop, &entry.tls_name).await?;
     stream.write_all(&[PROTO_RELAY]).await?;
     let (mut read, mut write) = tokio::io::split(stream);
     write.write_all(&[CIRCUIT_START]).await?;
