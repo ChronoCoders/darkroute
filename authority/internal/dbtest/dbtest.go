@@ -2,13 +2,19 @@
 // migrated template.
 //
 // It exists because two packages writing one database race in a way no test can own.
-// PickRandomActiveByRole selects from every active relay of a role by design, so the
-// handlers tests can pick a guard row seeded by the relay package; when that package's
-// cleanup deletes the row, the circuit_assignments insert fails
-// circuit_assignments_guard_id_fkey. Measured at four failures in fifty full runs
-// before this helper existed, and zero in fifty afterwards. Scoping assertions to rows
-// a test created cannot fix it, because the production code under test chooses rows the
-// test does not own.
+//
+// The case that produced it is gone: PickRandomActiveByRole selected from every active
+// relay of a role, so a handlers test could pick a guard row the relay package had
+// seeded, and when that package's cleanup deleted the row the circuit_assignments
+// insert failed on circuit_assignments_guard_id_fkey. Measured at four failures in
+// fifty full runs before this helper existed, and zero in fifty afterwards. Both the
+// function and the table were removed with route assignment.
+//
+// The shape survives the specific case. Publisher.activeRelays still reads every row
+// with status 'active', so the registry package builds documents from rows other
+// packages own and delete, and any future query over all active relays does the same.
+// Scoping assertions to rows a test created cannot fix that, because the production
+// code under test chooses rows the test does not own.
 //
 // One database per package binary, not per test. Tests inside a package still share
 // that database and still run sequentially, so their own checked cleanups stay

@@ -1,7 +1,7 @@
 "use client";
 
 import { motion } from "framer-motion";
-import { Activity, Clock, KeyRound, Network, ShieldCheck } from "lucide-react";
+import { Activity, Clock, KeyRound, ShieldCheck } from "lucide-react";
 
 import { PageHeader, StatusPill } from "@/components/app-shell";
 import { Skeleton } from "@/components/ui/skeleton";
@@ -142,13 +142,6 @@ export default function AccountPage() {
               icon={Activity}
               hint="This billing period"
               delay={0.05}
-            />
-            <MetricCard
-              label="Connections"
-              value={usage.data.circuits_assigned}
-              icon={Network}
-              hint="Requests this period"
-              delay={0.1}
             />
             <MetricCard
               label="Network size"

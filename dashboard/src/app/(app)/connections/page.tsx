@@ -5,26 +5,22 @@ import { Activity, Network } from "lucide-react";
 
 import { PageHeader } from "@/components/app-shell";
 import { Skeleton } from "@/components/ui/skeleton";
-import { CircuitDiagram } from "@/components/visuals/circuit-diagram";
 import { LivePulse } from "@/components/visuals/live-pulse";
 import { MeshDiagram } from "@/components/visuals/mesh-diagram";
 import { MetricCard } from "@/components/visuals/metric-card";
-import { Sparkline } from "@/components/visuals/sparkline";
-import { useAccount, useCircuits, useUsage } from "@/lib/queries";
+import { useAccount, useUsage } from "@/lib/queries";
 
 export default function ConnectionsPage() {
-  const circuits = useCircuits();
   const usage = useUsage();
   const account = useAccount();
   const status = account.data?.subscription.status;
   const canRoute = status === "active";
-  const stamps = circuits.data?.recent.map((c) => c.created_at) ?? [];
 
   return (
     <>
       <PageHeader
         title="Connections"
-        description="Recent connection requests through the network. Each connection routes through multiple distinct network points for privacy."
+        description="Your app builds its own route through several separate network points. Nothing about those routes is stored here."
       />
 
       <section className="grid grid-cols-1 gap-4 lg:grid-cols-3">
@@ -36,14 +32,6 @@ export default function ConnectionsPage() {
           </>
         ) : (
           <>
-            <MetricCard
-              label="Requests this period"
-              value={usage.data.circuits_assigned}
-              hint="Counted on request"
-              icon={Network}
-              accessory={<Sparkline points={stamps} />}
-              emphasis="primary"
-            />
             <MetricCard
               label="Inbound · Transit pool"
               value={
@@ -78,10 +66,10 @@ export default function ConnectionsPage() {
           <div className="flex items-center justify-between border-b border-white/[0.04] px-6 py-4">
             <div>
               <p className="text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-500">
-                Recent requests
+                Connections
               </p>
               <p className="mt-1 text-xs text-zinc-500">
-                Multi-layer connections returned by the network
+                Private by design
               </p>
             </div>
             {canRoute && (
@@ -91,39 +79,13 @@ export default function ConnectionsPage() {
               </span>
             )}
           </div>
-          {circuits.isLoading ? (
-            <div className="space-y-3 p-6">
-              <Skeleton className="h-12" />
-              <Skeleton className="h-12" />
-              <Skeleton className="h-12" />
-            </div>
-          ) : circuits.data && circuits.data.recent.length > 0 ? (
-            <ol>
-              {circuits.data.recent.map((c, i) => (
-                <CircuitDiagram
-                  key={c.id}
-                  id={c.id}
-                  guardId={c.guard_id}
-                  middleId={c.middle_id}
-                  exitId={c.exit_id}
-                  createdAt={c.created_at}
-                  delay={Math.min(i * 0.03, 0.4)}
-                />
-              ))}
-            </ol>
-          ) : (
-            <div className="px-6 py-16 text-center">
-              <Network className="mx-auto h-6 w-6 text-zinc-600" />
-              <p className="mt-3 text-sm font-medium text-zinc-200">
-                No connections yet
-              </p>
-              <p className="mt-1 text-xs text-zinc-500">
-                {canRoute
-                  ? "Connections appear here as soon as your client requests one."
-                  : "Connections unlock after your account is activated."}
-              </p>
-            </div>
-          )}
+          <div className="px-6 py-16 text-center">
+            <Network className="mx-auto h-6 w-6 text-zinc-600" />
+            <p className="mt-3 text-sm text-zinc-300">
+              QuietHop keeps no record of your connections. Your app chooses its
+              own route, and we never see which one.
+            </p>
+          </div>
         </motion.div>
 
         <motion.div

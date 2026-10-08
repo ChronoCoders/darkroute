@@ -84,7 +84,6 @@ type relayRoleCounts struct {
 type usageResponse struct {
 	TokensIssued       int64           `json:"tokens_issued"`
 	BandwidthUsed      int64           `json:"bandwidth_used"`
-	CircuitsAssigned   int64           `json:"circuits_assigned"`
 	ActiveRelays       relayRoleCounts `json:"active_relays"`
 	CurrentPeriodStart string          `json:"current_period_start"`
 	CurrentPeriodEnd   string          `json:"current_period_end"`
@@ -105,16 +104,6 @@ func (h *AccountHandler) HandleGetUsage(w http.ResponseWriter, r *http.Request) 
 		 WHERE subscriber_id = $1
 		 ORDER BY created_at DESC LIMIT 1`, subID,
 	).Scan(&tokensIssued, &bandwidth, &periodStart, &periodEnd); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
-		return
-	}
-
-	var circuits int64
-	if err := h.pool.QueryRow(r.Context(),
-		`SELECT COUNT(*) FROM circuit_assignments
-		 WHERE subscriber_id = $1 AND created_at >= $2`,
-		subID, periodStart,
-	).Scan(&circuits); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal"})
 		return
 	}
@@ -154,7 +143,6 @@ func (h *AccountHandler) HandleGetUsage(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, usageResponse{
 		TokensIssued:       tokensIssued,
 		BandwidthUsed:      bandwidth,
-		CircuitsAssigned:   circuits,
 		ActiveRelays:       counts,
 		CurrentPeriodStart: periodStart.UTC().Format(time.RFC3339),
 		CurrentPeriodEnd:   periodEnd.UTC().Format(time.RFC3339),

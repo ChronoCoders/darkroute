@@ -40,7 +40,6 @@ export interface RelayRoleCounts {
 export interface UsageResponse {
   tokens_issued: number;
   bandwidth_used: number;
-  circuits_assigned: number;
   active_relays: RelayRoleCounts;
   current_period_start: string;
   current_period_end: string;
@@ -54,18 +53,6 @@ export interface TokenIssuance {
 export interface TokenListResponse {
   tokens_issued: number;
   recent: TokenIssuance[];
-}
-
-export interface CircuitListItem {
-  id: string;
-  guard_id: string;
-  middle_id: string;
-  exit_id: string;
-  created_at: string;
-}
-
-export interface CircuitListResponse {
-  recent: CircuitListItem[];
 }
 
 export interface AdminSubscriber {

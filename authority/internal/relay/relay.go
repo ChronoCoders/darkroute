@@ -200,44 +200,6 @@ func GetActiveRelays(ctx context.Context, pool *pgxpool.Pool) ([]Relay, error) {
 		 ORDER BY created_at`)
 }
 
-// PickRandomActiveByRole returns one active relay with the requested role,
-// chosen uniformly at random from the eligible pool. Any relay whose ID is
-// in excludeIDs is filtered out, so the circuit-route handler can require
-// three distinct physical nodes across guard/middle/exit. This is mandatory
-// per SECURITY_MODEL §9: the same host serving both guard and exit would
-// collapse the unlinkability between client IP (guard's view) and
-// destination (exit's view).
-//
-// Returns pgx.ErrNoRows when no active relay of the requested role exists
-// outside the excluded set; callers map that to a 503.
-func PickRandomActiveByRole(ctx context.Context, pool *pgxpool.Pool, role string, excludeIDs ...string) (*Relay, error) {
-	if !validRole(role) {
-		return nil, ErrInvalidRole
-	}
-	// pgx serializes nil slices as SQL NULL; `ANY(NULL)` evaluates to NULL
-	// and the WHERE clause drops the row, so a no-exclusions call would
-	// never match. Force the empty-array case so the picker can pick on
-	// the first hop of a circuit.
-	if excludeIDs == nil {
-		excludeIDs = []string{}
-	}
-	r := &Relay{}
-	row := pool.QueryRow(ctx,
-		`SELECT `+relayColumns+`
-		 FROM relay_nodes
-		 WHERE role = $1
-		   AND status = 'active'
-		   AND NOT (id = ANY($2::uuid[]))
-		 ORDER BY random()
-		 LIMIT 1`,
-		role, excludeIDs,
-	)
-	if err := scanRelay(row, r); err != nil {
-		return nil, err
-	}
-	return r, nil
-}
-
 func SweepInactiveRelays(ctx context.Context, pool *pgxpool.Pool, ttl time.Duration) (int64, error) {
 	seconds := int64(ttl.Seconds())
 	if seconds < 1 {

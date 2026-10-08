@@ -56,20 +56,9 @@ func cleanupRow(t *testing.T, pool *pgxpool.Pool, sql, id string) {
 }
 
 const (
-	deleteRelayByID                   = `DELETE FROM relay_nodes WHERE id = $1`
-	deleteSubscriberByID              = `DELETE FROM subscribers WHERE id = $1`
-	deleteAssignmentsReferencingRelay = `DELETE FROM circuit_assignments
-		 WHERE guard_id = $1 OR middle_id = $1 OR exit_id = $1`
+	deleteRelayByID      = `DELETE FROM relay_nodes WHERE id = $1`
+	deleteSubscriberByID = `DELETE FROM subscribers WHERE id = $1`
 )
-
-// seedSubscriberWithActiveSubscription creates the subscriber and the active
-// subscription that the circuit route handler requires before it reaches any relay
-// selection. Every dependent table cascades from subscribers, so one delete is
-// enough to undo all of it.
-func seedSubscriberWithActiveSubscription(t *testing.T, pool *pgxpool.Pool, tag string) string {
-	t.Helper()
-	return seedSubscriberWithSubscription(t, pool, tag, "active")
-}
 
 // The status is a parameter because the onboarding gate turns on it: a new subscriber
 // sits at pending_review until an admin approves, and that path needs covering as much
@@ -94,20 +83,16 @@ func seedSubscriberWithSubscription(t *testing.T, pool *pgxpool.Pool, tag, statu
 	return subID
 }
 
-// cleanupRelay removes a relay the test created, together with any circuit
-// assignment that references it. A successful route persists an assignment row
-// pointing at all three relays, and three foreign keys then block the relay
-// deletes. Clearing the references inside this one cleanup keeps it independent of
-// the order the seeds were registered in; a separately registered cleanup only
-// works if it happens to be registered after every relay, which is a trap.
+// cleanupRelay removes a relay the test created.
+//
+// It used to clear circuit_assignments rows first, because a successful route
+// persisted one referencing all three relays and three foreign keys then blocked
+// the deletes. Migration 009 dropped that table with route assignment, so the
+// references no longer exist and the delete stands on its own.
 func cleanupRelay(t *testing.T, pool *pgxpool.Pool, id string) {
 	t.Helper()
 	t.Cleanup(func() {
 		ctx := context.Background()
-		if _, err := pool.Exec(ctx, deleteAssignmentsReferencingRelay, id); err != nil {
-			t.Errorf("cleanup assignments referencing relay %s: %v", id, err)
-			return
-		}
 		tag, err := pool.Exec(ctx, deleteRelayByID, id)
 		if err != nil {
 			t.Errorf("cleanup relay %s: %v", id, err)
@@ -117,58 +102,6 @@ func cleanupRelay(t *testing.T, pool *pgxpool.Pool, id string) {
 			t.Errorf("cleanup relay %s removed %d rows, want 1", id, tag.RowsAffected())
 		}
 	})
-}
-
-func seedActiveRelay(t *testing.T, pool *pgxpool.Pool, role, tag string) string {
-	t.Helper()
-	var id string
-	if err := pool.QueryRow(context.Background(),
-		`INSERT INTO relay_nodes (id, api_key_hash, tls_name, region, role, status, last_heartbeat, ip, port, static_pubkey, operator_id, host_id)
-		 VALUES (gen_random_uuid(), $1, $2, 'us-east', $3, 'active', NOW(), '10.0.0.50', 9001, $4, 'op-seed', 'host-seed-' || $3)
-		 RETURNING id`,
-		"test-hash-"+tag+"-"+role+"-"+time.Now().Format("150405.000000"),
-		"node.test", role, testStaticPubkey(),
-	).Scan(&id); err != nil {
-		t.Fatalf("seed %s relay: %v", role, err)
-	}
-	cleanupRelay(t, pool, id)
-	return id
-}
-
-// countActiveRelays is used as an explicit precondition. These tests assert a 503
-// that depends on no eligible relay existing for one role, which is a statement
-// about the whole table, so the precondition is checked rather than assumed. If it
-// fails, the message names cross-package contamination instead of leaving a
-// mysterious 200.
-func countActiveRelays(t *testing.T, pool *pgxpool.Pool, role string) int {
-	t.Helper()
-	var n int
-	if err := pool.QueryRow(context.Background(),
-		`SELECT count(*) FROM relay_nodes WHERE role = $1 AND status = 'active'`, role,
-	).Scan(&n); err != nil {
-		t.Fatalf("count active %s relays: %v", role, err)
-	}
-	return n
-}
-
-func requireNoActiveRelays(t *testing.T, pool *pgxpool.Pool, role string) {
-	t.Helper()
-	if n := countActiveRelays(t, pool, role); n != 0 {
-		t.Fatalf("precondition: %d active %s relays already exist, so this test cannot "+
-			"observe the no-eligible-relay path. Another package or a previous run left "+
-			"rows behind.", n, role)
-	}
-}
-
-// testStaticPubkey returns a fixed 32-byte value for the static_pubkey column.
-// It is public key material, so a constant is safe here; no private key is
-// generated, written or logged by any test in this package.
-func testStaticPubkey() []byte {
-	key := make([]byte, 32)
-	for i := range key {
-		key[i] = byte(i + 1)
-	}
-	return key
 }
 
 func reqCtx() context.Context {

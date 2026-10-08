@@ -612,7 +612,7 @@ ck_npm_audit() {
 # The tables the database backed tests read and write, enumerated from those tests
 # rather than from whatever the database happens to contain, so a migration that
 # stops creating one of them fails here instead of inside a test.
-CK_TEST_DB_TABLES='subscribers sessions subscriptions relay_nodes circuit_assignments token_issuance_events'
+CK_TEST_DB_TABLES='subscribers sessions subscriptions relay_nodes registry_documents token_issuance_events'
 
 ck_test_db() {
 	ck_require psql python3 || return 1

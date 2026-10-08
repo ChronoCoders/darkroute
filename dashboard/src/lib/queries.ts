@@ -11,7 +11,6 @@ import { apiGet, apiPost } from "./api";
 import type {
   AccountResponse,
   AdminSubscribersResponse,
-  CircuitListResponse,
   LoginResponse,
   TokenListResponse,
   UsageResponse,
@@ -21,7 +20,6 @@ export const queryKeys = {
   account: ["account"] as const,
   usage: ["usage"] as const,
   tokens: ["tokens"] as const,
-  circuits: ["circuits"] as const,
   adminSubscribers: ["admin", "subscribers"] as const,
 } as const;
 
@@ -48,14 +46,6 @@ export function useTokens() {
   return useQuery<TokenListResponse>({
     queryKey: queryKeys.tokens,
     queryFn: () => apiGet<TokenListResponse>("/api/v1/tokens"),
-    staleTime: 30_000,
-  });
-}
-
-export function useCircuits() {
-  return useQuery<CircuitListResponse>({
-    queryKey: queryKeys.circuits,
-    queryFn: () => apiGet<CircuitListResponse>("/api/v1/circuits"),
     staleTime: 30_000,
   });
 }

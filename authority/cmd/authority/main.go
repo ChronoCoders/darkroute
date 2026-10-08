@@ -104,40 +104,19 @@ func main() {
 	ah := handlers.NewAuthHandler(database.Pool, jm)
 	rh := handlers.NewRelayHandler(database.Pool, cfg.RelayAPIKeySalt, cfg.AllowedRelayIPs)
 	th := handlers.NewTokenHandler(database.Pool, signer)
-	ch := handlers.NewCircuitHandler(database.Pool)
 	acc := handlers.NewAccountHandler(database.Pool)
 	adm := handlers.NewAdminHandler(database.Pool)
 	reg := handlers.NewRegistryHandler(registry.NewPublisher(database.Pool, regSigner))
 
-	r := chi.NewRouter()
-	r.Get("/health", handlers.Health(database.Pool))
-
-	r.Group(func(r chi.Router) {
-		r.Use(handlers.RequestID, handlers.Logger)
-		r.Get("/api/v1/authority/pubkey", th.HandlePubkey)
-		// Public and unauthenticated: integrity comes from the signature,
-		// and a session here would reveal who is about to build a circuit.
-		r.Get("/api/v1/registry", reg.HandleRegistry)
-		r.Post("/api/v1/auth/register", ah.Register)
-		r.Post("/api/v1/auth/login", ah.Login)
-		r.Post("/api/v1/relay/heartbeat", rh.HandleRelayHeartbeat)
-		r.Group(func(r chi.Router) {
-			r.Use(handlers.Authenticate(jm, database.Pool))
-			r.Post("/api/v1/auth/logout", ah.Logout)
-			r.Post("/api/v1/tokens/issue", th.HandleIssue)
-			r.Get("/api/v1/tokens", th.HandleListTokens)
-			r.Get("/api/v1/circuits/route", ch.HandleRoute)
-			r.Get("/api/v1/circuits", ch.HandleListCircuits)
-			r.Get("/api/v1/account", acc.HandleGetAccount)
-			r.Get("/api/v1/usage", acc.HandleGetUsage)
-			r.Group(func(r chi.Router) {
-				r.Use(handlers.RequireRole("admin"))
-				r.Post("/api/v1/admin/relays/provision", rh.HandleProvisionRelay)
-				r.Get("/api/v1/admin/relays", rh.HandleListRelays)
-				r.Get("/api/v1/admin/subscribers", adm.HandleListSubscribers)
-				r.Post("/api/v1/admin/subscribers/{id}/approve", adm.HandleApproveSubscriber)
-			})
-		})
+	r := routes(routeDeps{
+		pool:     database.Pool,
+		jm:       jm,
+		auth:     ah,
+		relay:    rh,
+		tokens:   th,
+		account:  acc,
+		admin:    adm,
+		registry: reg,
 	})
 
 	var bgWG sync.WaitGroup
@@ -221,4 +200,54 @@ func runRelayHealthSweep(ctx context.Context, wg *sync.WaitGroup, pool *pgxpool.
 			}
 		}
 	}
+}
+
+// routeDeps collects what the route table needs, so routes stays one list of
+// paths rather than a function with eight parameters.
+type routeDeps struct {
+	pool     *pgxpool.Pool
+	jm       *auth.JWTManager
+	auth     *handlers.AuthHandler
+	relay    *handlers.RelayHandler
+	tokens   *handlers.TokenHandler
+	account  *handlers.AccountHandler
+	admin    *handlers.AdminHandler
+	registry *handlers.RegistryHandler
+}
+
+// routes builds the whole API surface, and is the API surface map.
+//
+// Extracted from main so a test can walk the real route table. A test that
+// rebuilt this list would prove only that the copy matches itself, which is how
+// a route can be removed from the map and left registered in production.
+func routes(d routeDeps) chi.Router {
+	r := chi.NewRouter()
+	r.Get("/health", handlers.Health(d.pool))
+
+	r.Group(func(r chi.Router) {
+		r.Use(handlers.RequestID, handlers.Logger)
+		r.Get("/api/v1/authority/pubkey", d.tokens.HandlePubkey)
+		// Public and unauthenticated: integrity comes from the signature,
+		// and a session here would reveal who is about to build a circuit.
+		r.Get("/api/v1/registry", d.registry.HandleRegistry)
+		r.Post("/api/v1/auth/register", d.auth.Register)
+		r.Post("/api/v1/auth/login", d.auth.Login)
+		r.Post("/api/v1/relay/heartbeat", d.relay.HandleRelayHeartbeat)
+		r.Group(func(r chi.Router) {
+			r.Use(handlers.Authenticate(d.jm, d.pool))
+			r.Post("/api/v1/auth/logout", d.auth.Logout)
+			r.Post("/api/v1/tokens/issue", d.tokens.HandleIssue)
+			r.Get("/api/v1/tokens", d.tokens.HandleListTokens)
+			r.Get("/api/v1/account", d.account.HandleGetAccount)
+			r.Get("/api/v1/usage", d.account.HandleGetUsage)
+			r.Group(func(r chi.Router) {
+				r.Use(handlers.RequireRole("admin"))
+				r.Post("/api/v1/admin/relays/provision", d.relay.HandleProvisionRelay)
+				r.Get("/api/v1/admin/relays", d.relay.HandleListRelays)
+				r.Get("/api/v1/admin/subscribers", d.admin.HandleListSubscribers)
+				r.Post("/api/v1/admin/subscribers/{id}/approve", d.admin.HandleApproveSubscriber)
+			})
+		})
+	})
+	return r
 }

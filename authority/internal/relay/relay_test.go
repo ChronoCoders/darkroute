@@ -190,62 +190,6 @@ func TestSweepFloorsSubSecondTTL(t *testing.T) {
 // do not assert that the pick comes from this test's own rows: the picker ranges
 // over every active guard in the database, so such an assertion would fail whenever
 // another package seeds one during the same run, with nothing broken in the code.
-func TestPickRandomActiveByRoleExcludesIDs(t *testing.T) {
-	pool := testPool(t)
-	ctx := context.Background()
-
-	seedActiveGuard := func(tag string) string {
-		var id string
-		if err := pool.QueryRow(ctx,
-			`INSERT INTO relay_nodes (id, api_key_hash, tls_name, region, role, status, last_heartbeat, ip, port, static_pubkey, operator_id, host_id)
-			 VALUES (gen_random_uuid(), $1, 'exclude.test', 'us-east', 'guard', 'active', NOW(), '10.0.0.99', 9001, decode(repeat('ab', 32), 'hex'), 'op-ex', 'host-ex-' || $1)
-			 RETURNING id`,
-			"test-hash-exclude-"+tag+"-"+time.Now().Format("150405.000000"),
-		).Scan(&id); err != nil {
-			t.Fatalf("seed guard %s: %v", tag, err)
-		}
-		cleanupRow(t, pool, deleteRelayByID, id)
-		return id
-	}
-
-	g1 := seedActiveGuard("a")
-	g2 := seedActiveGuard("b")
-
-	assertEligible := func(r *Relay, excluded ...string) {
-		t.Helper()
-		if r.Role != "guard" {
-			t.Errorf("picked role %q, want guard", r.Role)
-		}
-		if r.Status != "active" {
-			t.Errorf("picked status %q, want active", r.Status)
-		}
-		for _, x := range excluded {
-			if r.ID == x {
-				t.Errorf("picked %q, which was excluded", r.ID)
-			}
-		}
-	}
-
-	r, err := PickRandomActiveByRole(ctx, pool, "guard")
-	if err != nil {
-		t.Fatalf("unexpected error with no exclusions: %v", err)
-	}
-	assertEligible(r)
-
-	r, err = PickRandomActiveByRole(ctx, pool, "guard", g1)
-	if err != nil {
-		t.Fatalf("unexpected error excluding g1: %v", err)
-	}
-	assertEligible(r, g1)
-
-	// Excluding both seeded guards is satisfied either by an error, when nothing
-	// else active remains, or by some other eligible guard. Both are correct. What
-	// must never happen is an excluded id coming back.
-	r, err = PickRandomActiveByRole(ctx, pool, "guard", g1, g2)
-	if err == nil {
-		assertEligible(r, g1, g2)
-	}
-}
 
 func TestProvisionRejectsInvalidRole(t *testing.T) {
 	// No DB needed: the role check happens before any query.

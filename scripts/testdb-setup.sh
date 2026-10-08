@@ -132,7 +132,7 @@ echo "applying the embedded migrations"
 # Enumerated from the tables the gated tests read and write, not from whatever the
 # database happens to contain, so a migration that stops creating one of them is a
 # failure here rather than a confusing failure inside a test.
-REQUIRED='subscribers sessions subscriptions relay_nodes circuit_assignments token_issuance_events'
+REQUIRED='subscribers sessions subscriptions relay_nodes registry_documents token_issuance_events'
 missing=''
 for t in $REQUIRED; do
 	have=$(psql "$URL" -tAc "select 1 from information_schema.tables where table_schema = 'public' and table_name = '$t'" 2>/dev/null)

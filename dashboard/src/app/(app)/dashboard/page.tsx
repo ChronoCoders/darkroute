@@ -5,29 +5,25 @@ import {
   Activity,
   ArrowUpRight,
   KeyRound,
-  Network,
   ShieldCheck,
 } from "lucide-react";
 import Link from "next/link";
 
 import { PageHeader } from "@/components/app-shell";
 import { Skeleton } from "@/components/ui/skeleton";
-import { CircuitDiagram } from "@/components/visuals/circuit-diagram";
 import { LivePulse } from "@/components/visuals/live-pulse";
 import { MeshDiagram } from "@/components/visuals/mesh-diagram";
 import { MetricCard } from "@/components/visuals/metric-card";
 import { Sparkline } from "@/components/visuals/sparkline";
 import { formatBytes, timeSince } from "@/lib/format";
-import { useAccount, useCircuits, useTokens, useUsage } from "@/lib/queries";
+import { useAccount, useTokens, useUsage } from "@/lib/queries";
 
 export default function DashboardPage() {
   const account = useAccount();
   const usage = useUsage();
   const tokens = useTokens();
-  const circuits = useCircuits();
 
   const tokenStamps = tokens.data?.recent.map((t) => t.issued_at) ?? [];
-  const circuitStamps = circuits.data?.recent.map((c) => c.created_at) ?? [];
 
   return (
     <>
@@ -80,7 +76,7 @@ export default function DashboardPage() {
         </motion.div>
 
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:col-span-6">
-          {usage.isLoading || !usage.data || tokens.isLoading || circuits.isLoading ? (
+          {usage.isLoading || !usage.data || tokens.isLoading ? (
             <>
               <Skeleton className="h-48" />
               <Skeleton className="h-48" />
@@ -96,14 +92,6 @@ export default function DashboardPage() {
                 icon={KeyRound}
                 accessory={<Sparkline points={tokenStamps} />}
                 delay={0.05}
-              />
-              <MetricCard
-                label="Connection requests"
-                value={usage.data.circuits_assigned}
-                hint="This billing period"
-                icon={Network}
-                accessory={<Sparkline points={circuitStamps} />}
-                delay={0.1}
               />
               <MetricCard
                 label="Data transferred"
@@ -135,10 +123,10 @@ export default function DashboardPage() {
           <div className="flex items-center justify-between border-b border-white/[0.04] px-6 py-4">
             <div>
               <p className="text-[11px] font-medium uppercase tracking-[0.14em] text-zinc-500">
-                Recent connections
+                Connections
               </p>
               <p className="mt-1 text-xs text-zinc-500">
-                Last 5 connection requests
+                Private by design
               </p>
             </div>
             <Link
@@ -148,36 +136,11 @@ export default function DashboardPage() {
               All connections <ArrowUpRight className="h-3 w-3" />
             </Link>
           </div>
-          {circuits.isLoading ? (
-            <div className="space-y-3 p-6">
-              <Skeleton className="h-8" />
-              <Skeleton className="h-8" />
-              <Skeleton className="h-8" />
-            </div>
-          ) : circuits.data && circuits.data.recent.length > 0 ? (
-            <ol>
-              {circuits.data.recent.slice(0, 5).map((c, i) => (
-                <CircuitDiagram
-                  key={c.id}
-                  id={c.id}
-                  guardId={c.guard_id}
-                  middleId={c.middle_id}
-                  exitId={c.exit_id}
-                  createdAt={c.created_at}
-                  delay={i * 0.04}
-                />
-              ))}
-            </ol>
-          ) : (
-            <EmptyState
-              title="No connections yet"
-              body={
-                account.data?.subscription.status === "active"
-                  ? "Connections appear here as soon as your client requests one."
-                  : "Connections unlock after your account is activated."
-              }
-            />
-          )}
+          <div className="px-6 py-12 text-center">
+            <p className="text-sm text-zinc-300">
+              QuietHop keeps no record of your connections.
+            </p>
+          </div>
         </motion.div>
 
         <motion.div
