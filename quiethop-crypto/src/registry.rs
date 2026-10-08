@@ -12,11 +12,14 @@
 //! unambiguous against a longer label starting with it.
 
 use std::collections::BTreeSet;
+use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 
 use base64::Engine as _;
 use ed25519_dalek::{Signature, VerifyingKey, SIGNATURE_LENGTH};
 use serde::Deserialize;
+
+use crate::noise::STATIC_KEY_LEN;
 
 use crate::state::{self, RegistryState};
 
@@ -130,6 +133,45 @@ fn signed_message(document: &[u8]) -> Vec<u8> {
     msg.push(0x00);
     msg.extend_from_slice(document);
     msg
+}
+
+impl RelayEntry {
+    /// The socket address to dial.
+    ///
+    /// Parsed as a literal and never resolved: SECURITY_MODEL §5.3 forbids
+    /// resolving a name anywhere in path construction, because a resolver that
+    /// saw those lookups would learn the path.
+    pub fn addr(&self) -> Result<SocketAddr, RegistryError> {
+        let ip: IpAddr = self
+            .ip
+            .parse()
+            .map_err(|_| RegistryError::Registry("registry entry holds no IP literal".into()))?;
+        if self.port == 0 {
+            return Err(RegistryError::Registry("registry entry has port 0".into()));
+        }
+        Ok(SocketAddr::new(ip, self.port))
+    }
+
+    /// The X25519 static public key the NK handshake is pinned to.
+    pub fn static_key(&self) -> Result<[u8; STATIC_KEY_LEN], RegistryError> {
+        let raw = decode_hex(&self.static_pubkey)
+            .ok_or_else(|| RegistryError::Registry("static_pubkey is not hex".into()))?;
+        raw.try_into()
+            .map_err(|_| RegistryError::Registry("static_pubkey is not 32 bytes".into()))
+    }
+}
+
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(s.len() / 2);
+    for pair in s.as_bytes().chunks(2) {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
 }
 
 impl Document {
@@ -310,11 +352,12 @@ fn check_rollback(
 }
 
 /// Record a verified document as the new baseline, if it advances the version.
-pub fn remember(dir: &Path, verified: &Verified) -> Result<(), RegistryError> {
+pub fn remember(dir: &Path, verified: &Verified, envelope: &[u8]) -> Result<(), RegistryError> {
     let state = RegistryState {
         highest_version: verified.document.version,
         document_b64: base64::engine::general_purpose::STANDARD.encode(&verified.bytes),
         key_ids: verified.key_ids.clone(),
+        envelope_b64: Some(base64::engine::general_purpose::STANDARD.encode(envelope)),
     };
     match state::load(dir)? {
         Some(prev) if prev.highest_version >= state.highest_version => Ok(()),
@@ -568,6 +611,7 @@ mod tests {
             highest_version: sample_version(),
             document_b64: B64.encode(&high),
             key_ids: vec![pinned_of(&k).key_id],
+            envelope_b64: None,
         };
         // Control: the same version with the same bytes is accepted.
         assert!(verify(&envelope(&k, &high), &[pinned_of(&k)], 1, NOW, Some(&prev)).is_ok());
@@ -593,6 +637,7 @@ mod tests {
             highest_version: sample_version(),
             document_b64: B64.encode(&first),
             key_ids: vec![pinned_of(&k).key_id],
+            envelope_b64: None,
         };
         match verify(
             &envelope(&k, &second),
@@ -749,6 +794,71 @@ mod tests {
     }
 
     /// The Rust half of the cross-language check: a document signed by the Go
+    fn sample_entry(ip: &str, port: u16, key: &str) -> RelayEntry {
+        RelayEntry {
+            id: "r1".into(),
+            operator_id: "op".into(),
+            host_id: "h".into(),
+            role: "guard".into(),
+            ip: ip.into(),
+            port,
+            tls_name: "r1.example".into(),
+            static_pubkey: key.into(),
+        }
+    }
+
+    #[test]
+    fn addr_parses_v4_and_v6_literals() {
+        assert_eq!(
+            sample_entry("10.0.0.1", 443, "").addr().unwrap(),
+            "10.0.0.1:443".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            sample_entry("2001:db8::1", 443, "").addr().unwrap(),
+            "[2001:db8::1]:443".parse::<std::net::SocketAddr>().unwrap()
+        );
+    }
+
+    /// The guarantee is that a name is never resolved. An entry whose ip field
+    /// holds one must fail rather than fall back to DNS (SECURITY_MODEL 5.3).
+    #[test]
+    fn addr_refuses_a_hostname() {
+        for name in ["node01.example", "localhost", ""] {
+            assert!(
+                sample_entry(name, 443, "").addr().is_err(),
+                "{name:?} was accepted as an address"
+            );
+        }
+    }
+
+    #[test]
+    fn addr_refuses_port_zero() {
+        assert!(sample_entry("10.0.0.1", 0, "").addr().is_err());
+    }
+
+    #[test]
+    fn static_key_decodes_exactly_32_bytes() {
+        let key = "ab".repeat(STATIC_KEY_LEN);
+        assert_eq!(
+            sample_entry("10.0.0.1", 443, &key).static_key().unwrap(),
+            [0xABu8; STATIC_KEY_LEN]
+        );
+    }
+
+    #[test]
+    fn static_key_rejects_wrong_length_and_bad_hex() {
+        for bad in [
+            "ab".repeat(STATIC_KEY_LEN - 1),
+            "zz".repeat(STATIC_KEY_LEN),
+            "abc".to_string(),
+        ] {
+            assert!(
+                sample_entry("10.0.0.1", 443, &bad).static_key().is_err(),
+                "{bad} was accepted"
+            );
+        }
+    }
+
     /// authority must verify here. The vector is read from the shared testdata
     /// file that the Go suite also verifies.
     #[test]

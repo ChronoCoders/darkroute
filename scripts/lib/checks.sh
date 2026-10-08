@@ -428,7 +428,7 @@ CK_RESOLVER_PATTERN='to_socket_addrs|ToSocketAddrs|lookup_host'
 CK_FIXED_SEED_PATTERN='seed_from_u64|from_seed'
 
 ck_path_files() {
-	printf '%s\n' client/src/path.rs client/src/dial.rs client/src/circuits.rs
+	printf '%s\n' client/src/path.rs client/src/dial.rs
 }
 
 # Everything above the test module. A seeded generator is correct in a test and

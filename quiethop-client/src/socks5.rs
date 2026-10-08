@@ -101,7 +101,7 @@ pub async fn serve(
     let circuit_result = async {
         let mut c = client.lock().await;
         let (m_raw, token) = c.issue_token().await?;
-        let route = c.get_circuit().await?;
+        let route = c.build_path(crate::now_unix())?;
         c.dial(&dest_host, dest_port, &m_raw, &token, &route).await
     }
     .await;

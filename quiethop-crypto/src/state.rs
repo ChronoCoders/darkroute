@@ -39,6 +39,15 @@ pub struct RegistryState {
     pub document_b64: String,
     /// Key ids whose signatures were accepted for that document.
     pub key_ids: Vec<String>,
+    /// The whole signed envelope as received, base64.
+    ///
+    /// Kept so a restart inside the document's fresh window can re-verify from
+    /// disk instead of fetching again. The document bytes alone are not enough,
+    /// because re-verification needs the signatures, and re-verifying rather
+    /// than trusting the file means a tampered state file is caught by the same
+    /// code path as a tampered response.
+    #[serde(default)]
+    pub envelope_b64: Option<String>,
 }
 
 /// Where the state file lives.
@@ -150,6 +159,7 @@ mod tests {
             highest_version: 42,
             document_b64: "eyJ2ZXJzaW9uIjo0Mn0=".to_string(),
             key_ids: vec!["219ec80850bdf73c".to_string()],
+            envelope_b64: Some("eyJkb2N1bWVudCI6IiJ9".to_string()),
         }
     }
 
@@ -205,6 +215,24 @@ mod tests {
         assert!(matches!(load(dir.path()), Err(RegistryError::State(_))));
     }
 
+    /// The envelope cache is an addition, so a file written without it must
+    /// still load rather than being treated as corrupt. A corrupt file is a hard
+    /// error, and a missing optional field must not reach that path.
+    #[test]
+    fn a_state_file_without_the_envelope_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            state_path(dir.path()),
+            br#"{"highest_version":7,"document_b64":"e30=","key_ids":["abc"]}"#,
+        )
+        .unwrap();
+        let got = load(dir.path())
+            .unwrap()
+            .expect("a file without the field loads");
+        assert_eq!(got.highest_version, 7);
+        assert_eq!(got.envelope_b64, None, "the absent field reads as absent");
+    }
+
     #[test]
     fn store_replaces_an_existing_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -213,6 +241,7 @@ mod tests {
             highest_version: 43,
             document_b64: "eyJ2ZXJzaW9uIjo0M30=".to_string(),
             key_ids: vec!["aaaaaaaaaaaaaaaa".to_string()],
+            envelope_b64: None,
         };
         store(dir.path(), &newer).unwrap();
         assert_eq!(load(dir.path()).unwrap(), Some(newer));

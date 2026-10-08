@@ -23,9 +23,10 @@ use quiethop_crypto::layer::{peel, seal_forward, seal_to_me, FrameReader, Peeled
 use quiethop_crypto::noise::{Initiator, Transport, NOISE_MSG_LEN};
 use quiethop_crypto::wire::PROTO_CLIENT;
 
-use crate::circuits::{CircuitHop, CircuitRoute};
 use crate::error::ClientError;
+use crate::path::SelectedPath;
 use crate::tls;
+use quiethop_crypto::registry::RelayEntry;
 
 /// The client-guard link carries one layer per hop.
 const CLIENT_LAYERS: usize = 3;
@@ -74,14 +75,14 @@ impl Layers {
 
 pub async fn dial(
     connector: &TlsConnector,
-    route: &CircuitRoute,
+    route: &SelectedPath,
     m_raw: &[u8; 32],
     token: &[u8],
     dest_host: &str,
     dest_port: u16,
 ) -> Result<CircuitStream, ClientError> {
     let guard_addr = route.guard.addr()?;
-    let guard_key = route.guard.pubkey()?;
+    let guard_key = route.guard.static_key()?;
 
     let mut tls = tls::dial(connector, guard_addr, &route.guard.tls_name).await?;
 
@@ -133,9 +134,9 @@ async fn extend_hop(
     tls: &mut TlsStream<TcpStream>,
     guard: &mut Transport,
     middle: Option<&mut Transport>,
-    next: &CircuitHop,
+    next: &RelayEntry,
 ) -> Result<Transport, ClientError> {
-    let (init, msg1) = Initiator::start(&next.pubkey()?)?;
+    let (init, msg1) = Initiator::start(&next.static_key()?)?;
     let extend = ExtendForward {
         next_hop: next.addr()?,
         noise_msg1: msg1,

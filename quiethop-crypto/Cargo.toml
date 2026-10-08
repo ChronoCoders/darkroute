@@ -17,6 +17,9 @@ serde_json = { workspace = true }
 base64 = { workspace = true }
 # key_id_for hashes a pinned key to its short id.
 sha2 = { workspace = true }
+# The fetch and refresh policy lives with the verifier so the client and the
+# relay cannot drift into two versions of it.
+reqwest = { workspace = true }
 ed25519-dalek = { workspace = true }
 
 [dev-dependencies]
@@ -24,3 +27,5 @@ ed25519-dalek = { workspace = true }
 tokio = { workspace = true, features = ["io-util", "macros", "rt", "time"] }
 # The state file tests write into a scratch directory.
 tempfile = "3"
+# The cache tests sign envelopes with a throwaway key generated in the test.
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
