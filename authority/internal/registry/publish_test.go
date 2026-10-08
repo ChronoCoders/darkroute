@@ -228,6 +228,73 @@ func TestCheckConstraintsRejectOffHourAndMismatchedVersion(t *testing.T) {
 	}
 }
 
+// The hour constraint must not depend on the session TimeZone.
+//
+// date_trunc on a timestamptz truncates in the session zone, so under a zone
+// with a half-hour offset such as Asia/Kolkata a valid UTC-hour valid_after
+// truncates to a different instant and the check rejects it, stopping
+// publication outright. Testing on the epoch makes the constraint the same in
+// every zone.
+func TestHourConstraintIsIndependentOfSessionTimeZone(t *testing.T) {
+	pool := testPool(t)
+	clearDocuments(t, pool)
+	hour := time.Date(2026, 10, 7, 14, 0, 0, 0, time.UTC)
+	offHour := hour.Add(30 * time.Minute)
+
+	// Half-hour and quarter-hour offsets are the cases that separate an epoch
+	// test from a date_trunc one; UTC is the baseline that passes either way.
+	for _, zone := range []string{"UTC", "Asia/Kolkata", "Australia/Eucla", "America/St_Johns"} {
+		if err := insertInZone(t, pool, zone, hour); err != nil {
+			t.Errorf("%s: a valid UTC-hour row was rejected: %v", zone, err)
+		}
+		// Control: the constraint must still reject an off-hour row, so a pass
+		// above cannot come from a check that accepts everything.
+		if err := insertInZone(t, pool, zone, offHour); err == nil {
+			t.Errorf("%s: an off-hour row was accepted", zone)
+		}
+	}
+}
+
+// insertInZone attempts one row with the session zone set to zone, and reports
+// the insert error or nil.
+//
+// Everything happens inside a transaction that is always rolled back. SET LOCAL
+// reverts with the transaction, which matters because pgxpool returns a
+// connection to the pool with its session state intact: a plain SET would leave
+// the zone set for whichever later test acquires that same backend. The
+// rollback also discards the row, so a failing assertion cannot leave one
+// behind.
+func insertInZone(t *testing.T, pool *pgxpool.Pool, zone string, validAfter time.Time) error {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("%s: begin: %v", zone, err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	// set_config with is_local true is SET LOCAL in function form, which SET is
+	// not: SET is a utility statement and takes no bind parameter.
+	if _, err := tx.Exec(ctx, "SELECT set_config('TimeZone', $1, true)", zone); err != nil {
+		t.Fatalf("%s: set zone: %v", zone, err)
+	}
+	// Read it back, so a zone the server silently ignored cannot make this test
+	// pass while only ever exercising UTC.
+	var got string
+	if err := tx.QueryRow(ctx, "SHOW TimeZone").Scan(&got); err != nil {
+		t.Fatalf("%s: read zone: %v", zone, err)
+	}
+	if got != zone {
+		t.Fatalf("asked for zone %s, session reports %s", zone, got)
+	}
+
+	_, err = tx.Exec(ctx,
+		`INSERT INTO registry_documents (version, valid_after, document, signatures)
+		 VALUES ($1, $2, $3, '[]'::jsonb)`,
+		VersionFor(validAfter), validAfter, []byte("{}"))
+	return err
+}
+
 func storedVersion(t *testing.T, pool *pgxpool.Pool, hour time.Time) int64 {
 	t.Helper()
 	var v int64

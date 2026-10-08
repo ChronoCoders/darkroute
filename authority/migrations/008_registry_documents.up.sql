@@ -29,8 +29,13 @@ ALTER TABLE registry_documents
     ADD CONSTRAINT registry_documents_document_nonempty CHECK (octet_length(document) > 0),
     -- Publication is hourly, so an off-hour valid_after is a bug in the
     -- publisher rather than a value to store.
+    --
+    -- Tested on the epoch, not with date_trunc. date_trunc on a timestamptz
+    -- truncates in the session TimeZone, so under a zone with a half-hour
+    -- offset a perfectly valid UTC-hour value fails the check and publication
+    -- stops. The epoch is the same number in every zone.
     ADD CONSTRAINT registry_documents_valid_after_on_hour
-        CHECK (valid_after = date_trunc('hour', valid_after)),
+        CHECK (extract(epoch from valid_after)::bigint % 3600 = 0),
     -- The database holds the publisher to the derivation, so a future change
     -- that reintroduced a counter would fail here rather than ship.
     ADD CONSTRAINT registry_documents_version_is_hour
