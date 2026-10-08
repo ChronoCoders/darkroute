@@ -1,0 +1,686 @@
+//! Signed relay registry: fetch, verify, then parse.
+//!
+//! Order matters and is the point of this module. The response carries the
+//! document base64-encoded, and nothing inside it is read until a threshold of
+//! signatures from pinned keys has verified over the exact bytes. A document
+//! that fails verification is never parsed, so a malformed or hostile document
+//! cannot reach the JSON decoder.
+//!
+//! The signed message is `"quiethop/v1/registry" || 0x00 || document_bytes`.
+//! The label is bound so a signature cannot be replayed from any other context
+//! that signs raw bytes with the same key, and the `0x00` makes the prefix
+//! unambiguous against a longer label starting with it.
+
+use std::collections::BTreeSet;
+use std::path::Path;
+
+use base64::Engine as _;
+use ed25519_dalek::{Signature, VerifyingKey, SIGNATURE_LENGTH};
+use serde::Deserialize;
+
+use crate::error::ClientError;
+use crate::state::{self, RegistryState};
+
+/// Signature domain. Must match the authority's `registry.Domain`.
+pub const DOMAIN: &[u8] = b"quiethop/v1/registry";
+
+/// Clock-skew allowance on `valid_after` only.
+///
+/// 60 seconds against a 6 hour validity window is 1.7%, enough to absorb an
+/// unsynchronised client clock without meaningfully widening the window. It is
+/// deliberately not applied to `valid_until`: leniency at the start costs
+/// nothing, while leniency at the end would extend the time an attacker has to
+/// replay a document whose relay set has been retired.
+pub const SKEW_ALLOWANCE_SECS: i64 = 60;
+
+/// How many pinned keys must sign. One for now; the format already carries a
+/// list so operator co-signing needs no wire change.
+pub const DEFAULT_THRESHOLD: usize = 1;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelayEntry {
+    pub id: String,
+    pub operator_id: String,
+    pub host_id: String,
+    pub role: String,
+    pub ip: String,
+    pub port: u16,
+    pub tls_name: String,
+    pub static_pubkey: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Document {
+    pub version: i64,
+    pub valid_after: String,
+    pub fresh_until: String,
+    pub valid_until: String,
+    pub relays: Vec<RelayEntry>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SignatureEntry {
+    key_id: String,
+    sig: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct Envelope {
+    document: String,
+    signatures: Vec<SignatureEntry>,
+}
+
+/// A pinned registry signing key.
+#[derive(Debug, Clone)]
+pub struct PinnedKey {
+    pub key_id: String,
+    pub key: VerifyingKey,
+}
+
+impl PinnedKey {
+    /// Build from a 32-byte public key, deriving the key id the same way the
+    /// authority does: the first 8 bytes of SHA-256 over the raw key.
+    pub fn from_bytes(raw: &[u8; 32]) -> Result<Self, ClientError> {
+        let key = VerifyingKey::from_bytes(raw)
+            .map_err(|_| ClientError::InvalidPubkey("registry signing key".into()))?;
+        Ok(Self {
+            key_id: key_id_for(raw),
+            key,
+        })
+    }
+
+    pub fn from_hex(hex: &str) -> Result<Self, ClientError> {
+        let raw = decode_hex32(hex)
+            .ok_or_else(|| ClientError::InvalidPubkey("registry signing key hex".into()))?;
+        Self::from_bytes(&raw)
+    }
+}
+
+pub fn key_id_for(raw: &[u8; 32]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(raw);
+    let mut out = String::with_capacity(16);
+    for b in &digest[..8] {
+        out.push(nibble(b >> 4));
+        out.push(nibble(b & 0x0f));
+    }
+    out
+}
+
+/// The exact bytes a registry signature covers.
+fn signed_message(document: &[u8]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(DOMAIN.len() + 1 + document.len());
+    msg.extend_from_slice(DOMAIN);
+    msg.push(0x00);
+    msg.extend_from_slice(document);
+    msg
+}
+
+/// A document that passed every check, with the bytes it was verified over.
+#[derive(Debug, Clone)]
+pub struct Verified {
+    pub document: Document,
+    pub bytes: Vec<u8>,
+    pub key_ids: Vec<String>,
+}
+
+/// Verify an envelope and return the parsed document.
+///
+/// `now_unix` is the current time in seconds. `previous` is the stored state,
+/// or `None` on first use.
+pub fn verify(
+    body: &[u8],
+    pinned: &[PinnedKey],
+    threshold: usize,
+    now_unix: i64,
+    previous: Option<&RegistryState>,
+) -> Result<Verified, ClientError> {
+    if threshold == 0 {
+        return Err(ClientError::Registry("threshold must be at least 1".into()));
+    }
+    let envelope: Envelope = serde_json::from_slice(body)
+        .map_err(|e| ClientError::Registry(format!("response is not a registry envelope: {e}")))?;
+
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(envelope.document.as_bytes())
+        .map_err(|e| ClientError::Registry(format!("document is not base64: {e}")))?;
+
+    // Signatures first. Nothing inside the document is read until a threshold
+    // of pinned keys has verified over these exact bytes.
+    let msg = signed_message(&bytes);
+    let mut accepted: BTreeSet<String> = BTreeSet::new();
+    for entry in &envelope.signatures {
+        let Some(pin) = pinned.iter().find(|p| p.key_id == entry.key_id) else {
+            // Not a pinned key id. Silently skipped rather than fatal, so a
+            // future co-signer unknown to this client cannot break it.
+            continue;
+        };
+        let raw = match base64::engine::general_purpose::STANDARD.decode(entry.sig.as_bytes()) {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        let Ok(fixed) = <[u8; SIGNATURE_LENGTH]>::try_from(raw.as_slice()) else {
+            continue;
+        };
+        // verify_strict, not verify: it rejects non-canonical and small-order
+        // keys that plain verify accepts.
+        if pin
+            .key
+            .verify_strict(&msg, &Signature::from_bytes(&fixed))
+            .is_ok()
+        {
+            accepted.insert(pin.key_id.clone());
+        }
+    }
+    if accepted.len() < threshold {
+        return Err(ClientError::Registry(format!(
+            "{} of {threshold} required signatures from pinned keys verified",
+            accepted.len()
+        )));
+    }
+
+    let document: Document = serde_json::from_slice(&bytes)
+        .map_err(|e| ClientError::Registry(format!("verified document does not parse: {e}")))?;
+
+    check_validity(&document, now_unix)?;
+    check_rollback(&document, &bytes, previous)?;
+
+    Ok(Verified {
+        document,
+        bytes,
+        key_ids: accepted.into_iter().collect(),
+    })
+}
+
+fn check_validity(doc: &Document, now_unix: i64) -> Result<(), ClientError> {
+    let after = parse_rfc3339(&doc.valid_after)?;
+    let until = parse_rfc3339(&doc.valid_until)?;
+    if until <= after {
+        return Err(ClientError::Registry(
+            "valid_until is not after valid_after".into(),
+        ));
+    }
+    if now_unix + SKEW_ALLOWANCE_SECS < after {
+        return Err(ClientError::Registry(format!(
+            "document is not yet valid: valid_after {} is more than {SKEW_ALLOWANCE_SECS}s ahead",
+            doc.valid_after
+        )));
+    }
+    // No grace period past valid_until.
+    if now_unix >= until {
+        return Err(ClientError::Registry(format!(
+            "document expired at {}",
+            doc.valid_until
+        )));
+    }
+    Ok(())
+}
+
+fn check_rollback(
+    doc: &Document,
+    bytes: &[u8],
+    previous: Option<&RegistryState>,
+) -> Result<(), ClientError> {
+    let Some(prev) = previous else {
+        // Trust on first use: no baseline exists, so this document becomes it.
+        return Ok(());
+    };
+    if doc.version < prev.highest_version {
+        return Err(ClientError::Registry(format!(
+            "rollback: version {} is below the highest seen {}",
+            doc.version, prev.highest_version
+        )));
+    }
+    if doc.version == prev.highest_version {
+        let stored = base64::engine::general_purpose::STANDARD
+            .decode(prev.document_b64.as_bytes())
+            .map_err(|e| ClientError::State(format!("stored document is not base64: {e}")))?;
+        if stored != bytes {
+            // Two different documents under one version. Only the authority
+            // can produce both, so this is local evidence of equivocation.
+            return Err(ClientError::RegistryEquivocation(doc.version));
+        }
+    }
+    Ok(())
+}
+
+/// Record a verified document as the new baseline, if it advances the version.
+pub fn remember(dir: &Path, verified: &Verified) -> Result<(), ClientError> {
+    let state = RegistryState {
+        highest_version: verified.document.version,
+        document_b64: base64::engine::general_purpose::STANDARD.encode(&verified.bytes),
+        key_ids: verified.key_ids.clone(),
+    };
+    match state::load(dir)? {
+        Some(prev) if prev.highest_version >= state.highest_version => Ok(()),
+        _ => state::store(dir, &state),
+    }
+}
+
+/// Parse RFC 3339 UTC with a Z suffix into a unix timestamp.
+///
+/// Deliberately narrow: the authority emits exactly this shape, so accepting
+/// numeric offsets or fractional seconds would widen what a client treats as a
+/// valid timestamp without any publisher producing it.
+fn parse_rfc3339(s: &str) -> Result<i64, ClientError> {
+    let bad = || ClientError::Registry(format!("timestamp {s:?} is not RFC 3339 UTC with Z"));
+    let b = s.as_bytes();
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
+        return Err(bad());
+    }
+    let num = |from: usize, to: usize| -> Result<i64, ClientError> {
+        s.get(from..to)
+            .ok_or_else(bad)?
+            .parse::<i64>()
+            .map_err(|_| bad())
+    };
+    let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
+    let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return Err(bad());
+    }
+    Ok(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + sec)
+}
+
+/// Days since 1970-01-01 from a civil date, after Howard Hinnant's algorithm.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn nibble(v: u8) -> char {
+    char::from_digit(u32::from(v), 16).unwrap_or('0')
+}
+
+fn decode_hex32(s: &str) -> Option<[u8; 32]> {
+    if s.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    let b = s.as_bytes();
+    for (i, pair) in b.chunks(2).enumerate() {
+        let hi = (pair[0] as char).to_digit(16)?;
+        let lo = (pair[1] as char).to_digit(16)?;
+        out[i] = (hi * 16 + lo) as u8;
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Signer, SigningKey};
+
+    const B64: base64::engine::general_purpose::GeneralPurpose =
+        base64::engine::general_purpose::STANDARD;
+
+    /// 2026-10-07T14:30:00Z, inside the sample document's validity.
+    const NOW: i64 = 1_791_383_400;
+
+    fn signing_key(seed: u8) -> SigningKey {
+        SigningKey::from_bytes(&[seed; 32])
+    }
+
+    fn pinned_of(k: &SigningKey) -> PinnedKey {
+        PinnedKey::from_bytes(&k.verifying_key().to_bytes()).unwrap()
+    }
+
+    fn doc_bytes(version: i64, valid_after: &str, valid_until: &str) -> Vec<u8> {
+        format!(
+            r#"{{"version":{version},"valid_after":"{valid_after}","fresh_until":"{valid_after}","valid_until":"{valid_until}","relays":[]}}"#
+        )
+        .into_bytes()
+    }
+
+    fn sample_doc() -> Vec<u8> {
+        doc_bytes(10, "2026-10-07T14:00:00Z", "2026-10-07T20:00:00Z")
+    }
+
+    fn envelope(k: &SigningKey, document: &[u8]) -> Vec<u8> {
+        let sig = k.sign(&signed_message(document));
+        let pin = pinned_of(k);
+        format!(
+            r#"{{"document":"{}","signatures":[{{"key_id":"{}","sig":"{}"}}]}}"#,
+            B64.encode(document),
+            pin.key_id,
+            B64.encode(sig.to_bytes())
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_valid_document_verifies() {
+        let k = signing_key(1);
+        let doc = sample_doc();
+        let v = verify(&envelope(&k, &doc), &[pinned_of(&k)], 1, NOW, None).unwrap();
+        assert_eq!(v.document.version, 10);
+        assert_eq!(v.bytes, doc, "the verified bytes must be the signed bytes");
+        assert_eq!(v.key_ids, vec![pinned_of(&k).key_id]);
+    }
+
+    #[test]
+    fn one_flipped_byte_fails() {
+        let k = signing_key(2);
+        let doc = sample_doc();
+        let good = envelope(&k, &doc);
+        // Control: unmodified verifies.
+        assert!(verify(&good, &[pinned_of(&k)], 1, NOW, None).is_ok());
+
+        let mut flipped = doc.clone();
+        flipped[10] ^= 0x01;
+        // Re-wrap the flipped document with the original signature.
+        let sig = k.sign(&signed_message(&doc));
+        let body = format!(
+            r#"{{"document":"{}","signatures":[{{"key_id":"{}","sig":"{}"}}]}}"#,
+            B64.encode(&flipped),
+            pinned_of(&k).key_id,
+            B64.encode(sig.to_bytes())
+        )
+        .into_bytes();
+        assert!(matches!(
+            verify(&body, &[pinned_of(&k)], 1, NOW, None),
+            Err(ClientError::Registry(_))
+        ));
+    }
+
+    #[test]
+    fn a_signature_from_a_non_pinned_key_fails() {
+        let real = signing_key(3);
+        let other = signing_key(4);
+        let doc = sample_doc();
+        // Control: the pinned key verifies its own signature.
+        assert!(verify(&envelope(&real, &doc), &[pinned_of(&real)], 1, NOW, None).is_ok());
+        // Signed by `other`, but only `real` is pinned.
+        assert!(matches!(
+            verify(&envelope(&other, &doc), &[pinned_of(&real)], 1, NOW, None),
+            Err(ClientError::Registry(_))
+        ));
+    }
+
+    #[test]
+    fn an_expired_document_fails_with_no_grace_period() {
+        let k = signing_key(5);
+        let doc = sample_doc();
+        // One second past valid_until, 2026-10-07T20:00:00Z.
+        let expired_at = parse_rfc3339("2026-10-07T20:00:00Z").unwrap();
+        assert!(matches!(
+            verify(&envelope(&k, &doc), &[pinned_of(&k)], 1, expired_at, None),
+            Err(ClientError::Registry(_))
+        ));
+        // Control: one second before it is still accepted.
+        assert!(verify(
+            &envelope(&k, &doc),
+            &[pinned_of(&k)],
+            1,
+            expired_at - 1,
+            None
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_not_yet_valid_document_fails_outside_the_skew_allowance() {
+        let k = signing_key(6);
+        let doc = sample_doc();
+        let after = parse_rfc3339("2026-10-07T14:00:00Z").unwrap();
+        // Inside the allowance: accepted.
+        assert!(verify(
+            &envelope(&k, &doc),
+            &[pinned_of(&k)],
+            1,
+            after - SKEW_ALLOWANCE_SECS,
+            None
+        )
+        .is_ok());
+        // One second beyond it: rejected.
+        assert!(matches!(
+            verify(
+                &envelope(&k, &doc),
+                &[pinned_of(&k)],
+                1,
+                after - SKEW_ALLOWANCE_SECS - 1,
+                None
+            ),
+            Err(ClientError::Registry(_))
+        ));
+    }
+
+    #[test]
+    fn a_lower_version_after_a_higher_one_is_a_rollback() {
+        let k = signing_key(7);
+        let high = doc_bytes(20, "2026-10-07T14:00:00Z", "2026-10-07T20:00:00Z");
+        let prev = RegistryState {
+            highest_version: 20,
+            document_b64: B64.encode(&high),
+            key_ids: vec![pinned_of(&k).key_id],
+        };
+        // Control: the same version with the same bytes is accepted.
+        assert!(verify(&envelope(&k, &high), &[pinned_of(&k)], 1, NOW, Some(&prev)).is_ok());
+
+        let low = doc_bytes(19, "2026-10-07T14:00:00Z", "2026-10-07T20:00:00Z");
+        match verify(&envelope(&k, &low), &[pinned_of(&k)], 1, NOW, Some(&prev)) {
+            Err(ClientError::Registry(m)) => assert!(m.contains("rollback"), "message was {m}"),
+            other => panic!("a rollback was accepted: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_same_version_with_different_bytes_is_equivocation() {
+        let k = signing_key(8);
+        let first = doc_bytes(30, "2026-10-07T14:00:00Z", "2026-10-07T20:00:00Z");
+        // Same version, different relay list.
+        let second = br#"{"version":30,"valid_after":"2026-10-07T14:00:00Z","fresh_until":"2026-10-07T15:00:00Z","valid_until":"2026-10-07T20:00:00Z","relays":[{"id":"x","operator_id":"o","host_id":"h","role":"guard","ip":"203.0.113.1","port":443,"tls_name":"n","static_pubkey":"00"}]}"#.to_vec();
+        let prev = RegistryState {
+            highest_version: 30,
+            document_b64: B64.encode(&first),
+            key_ids: vec![pinned_of(&k).key_id],
+        };
+        match verify(
+            &envelope(&k, &second),
+            &[pinned_of(&k)],
+            1,
+            NOW,
+            Some(&prev),
+        ) {
+            Err(ClientError::RegistryEquivocation(30)) => {}
+            other => panic!("equivocation was not reported: {other:?}"),
+        }
+    }
+
+    /// The threshold must be read, not assumed. Raising it to 2 with one
+    /// signature must fail even though that signature is valid.
+    #[test]
+    fn the_threshold_is_enforced() {
+        let k = signing_key(9);
+        let doc = sample_doc();
+        let body = envelope(&k, &doc);
+        // Control: threshold 1 passes with one signature.
+        assert!(verify(&body, &[pinned_of(&k)], 1, NOW, None).is_ok());
+        match verify(&body, &[pinned_of(&k)], 2, NOW, None) {
+            Err(ClientError::Registry(m)) => {
+                assert!(m.contains("of 2 required"), "message was {m}")
+            }
+            other => panic!("threshold 2 was satisfied by one signature: {other:?}"),
+        }
+    }
+
+    /// Domain separation: a signature over the bare document bytes must not
+    /// verify as a registry signature.
+    #[test]
+    fn a_signature_over_the_bare_document_does_not_verify() {
+        let k = signing_key(10);
+        let doc = sample_doc();
+        // Control: the domain-separated envelope verifies.
+        assert!(verify(&envelope(&k, &doc), &[pinned_of(&k)], 1, NOW, None).is_ok());
+
+        let bare = k.sign(&doc);
+        let body = format!(
+            r#"{{"document":"{}","signatures":[{{"key_id":"{}","sig":"{}"}}]}}"#,
+            B64.encode(&doc),
+            pinned_of(&k).key_id,
+            B64.encode(bare.to_bytes())
+        )
+        .into_bytes();
+        assert!(matches!(
+            verify(&body, &[pinned_of(&k)], 1, NOW, None),
+            Err(ClientError::Registry(_))
+        ));
+    }
+
+    #[test]
+    fn a_document_is_not_parsed_before_it_verifies() {
+        // The document is not valid JSON at all. A verifier that parsed first
+        // would report a parse error; one that verifies first reports a
+        // signature failure.
+        let k = signing_key(11);
+        let junk = b"not json at all".to_vec();
+        let other = signing_key(12);
+        let body = format!(
+            r#"{{"document":"{}","signatures":[{{"key_id":"{}","sig":"{}"}}]}}"#,
+            B64.encode(&junk),
+            pinned_of(&other).key_id,
+            B64.encode(other.sign(&signed_message(&junk)).to_bytes())
+        )
+        .into_bytes();
+        match verify(&body, &[pinned_of(&k)], 1, NOW, None) {
+            Err(ClientError::Registry(m)) => assert!(
+                m.contains("required signatures"),
+                "expected a signature failure before any parse, got {m}"
+            ),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn key_id_matches_the_authority_derivation() {
+        // sha256 over the raw 32 byte key, first 8 bytes, hex.
+        let k = signing_key(13);
+        let raw = k.verifying_key().to_bytes();
+        use sha2::{Digest, Sha256};
+        let want: String = Sha256::digest(raw)[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(key_id_for(&raw), want);
+    }
+
+    #[test]
+    fn timestamps_must_be_rfc3339_utc_with_z() {
+        assert!(parse_rfc3339("2026-10-07T14:00:00Z").is_ok());
+        for bad in [
+            "2026-10-07T14:00:00+01:00",
+            "2026-10-07 14:00:00Z",
+            "2026-10-07T14:00:00.5Z",
+            "2026-13-07T14:00:00Z",
+            "2026-10-07T24:00:00Z",
+            "",
+        ] {
+            assert!(parse_rfc3339(bad).is_err(), "{bad:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn civil_date_conversion_matches_known_epochs() {
+        assert_eq!(parse_rfc3339("1970-01-01T00:00:00Z").unwrap(), 0);
+        assert_eq!(parse_rfc3339("2000-01-01T00:00:00Z").unwrap(), 946_684_800);
+        assert_eq!(
+            parse_rfc3339("2026-10-07T14:00:00Z").unwrap(),
+            1_791_381_600
+        );
+    }
+
+    /// The Rust half of the cross-language check: a document signed by the Go
+    /// authority must verify here. The vector is read from the shared testdata
+    /// file that the Go suite also verifies.
+    #[test]
+    fn the_committed_go_vector_verifies() {
+        let raw = std::fs::read("../testdata/registry_vector.json").expect("read vector");
+        let v: serde_json::Value = serde_json::from_slice(&raw).expect("parse vector");
+        assert_eq!(v["domain"].as_str().unwrap().as_bytes(), DOMAIN);
+
+        let pub_hex = v["public_key"].as_str().unwrap();
+        let pin = PinnedKey::from_hex(pub_hex).expect("pinned key");
+        assert_eq!(pin.key_id, v["key_id"].as_str().unwrap());
+
+        let document = B64
+            .decode(v["document_b64"].as_str().unwrap())
+            .expect("document base64");
+        let sig = B64
+            .decode(v["signature_b64"].as_str().unwrap())
+            .expect("signature base64");
+        let fixed = <[u8; SIGNATURE_LENGTH]>::try_from(sig.as_slice()).expect("64 byte signature");
+        pin.key
+            .verify_strict(&signed_message(&document), &Signature::from_bytes(&fixed))
+            .expect("the Go-signed vector must verify in Rust");
+
+        // Control: the same signature must fail over altered bytes.
+        let mut altered = document.clone();
+        altered[0] ^= 0x01;
+        assert!(pin
+            .key
+            .verify_strict(&signed_message(&altered), &Signature::from_bytes(&fixed))
+            .is_err());
+    }
+
+    /// RFC 8032 section 7.1 vectors, public key, message and signature only.
+    /// These exercise the primitive, so they use verify_strict directly rather
+    /// than the registry wrapper, which adds domain separation.
+    #[test]
+    fn rfc8032_vectors_verify() {
+        let raw = std::fs::read("../testdata/ed25519_rfc8032.json").expect("read vectors");
+        let v: serde_json::Value = serde_json::from_slice(&raw).expect("parse vectors");
+        let vectors = v["vectors"].as_array().expect("vectors array");
+        assert!(
+            !vectors.is_empty(),
+            "no vectors loaded, so this test would pass vacuously"
+        );
+        for vec in vectors {
+            let name = vec["name"].as_str().unwrap();
+            let key = PinnedKey::from_hex(vec["public_key"].as_str().unwrap())
+                .unwrap_or_else(|e| panic!("{name}: public key: {e}"));
+            let msg = hex_to_bytes(vec["message"].as_str().unwrap()).expect("message hex");
+            let sig = hex_to_bytes(vec["signature"].as_str().unwrap()).expect("signature hex");
+            let fixed = <[u8; SIGNATURE_LENGTH]>::try_from(sig.as_slice()).expect("64 bytes");
+            key.key
+                .verify_strict(&msg, &Signature::from_bytes(&fixed))
+                .unwrap_or_else(|e| panic!("{name} did not verify: {e}"));
+
+            // Control: a corrupted signature must fail, so a verifier that
+            // accepted everything could not pass this test.
+            let mut bad = fixed;
+            bad[0] ^= 0x01;
+            assert!(
+                key.key
+                    .verify_strict(&msg, &Signature::from_bytes(&bad))
+                    .is_err(),
+                "{name} verified with a corrupted signature"
+            );
+        }
+    }
+
+    fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {
+        if !s.len().is_multiple_of(2) {
+            return None;
+        }
+        let b = s.as_bytes();
+        let mut out = Vec::with_capacity(s.len() / 2);
+        for pair in b.chunks(2) {
+            let hi = (pair[0] as char).to_digit(16)?;
+            let lo = (pair[1] as char).to_digit(16)?;
+            out.push((hi * 16 + lo) as u8);
+        }
+        Some(out)
+    }
+}

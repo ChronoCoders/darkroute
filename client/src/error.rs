@@ -28,6 +28,12 @@ pub enum ClientError {
     InvalidEndpoint(String, String),
     #[error("crypto: {0}")]
     Noise(#[from] quiethop_crypto::noise::NoiseError),
+    #[error("registry: {0}")]
+    Registry(String),
+    #[error("registry equivocation: two different documents carry version {0}")]
+    RegistryEquivocation(i64),
+    #[error("client state: {0}")]
+    State(String),
     #[error("layer: {0}")]
     Layer(#[from] quiethop_crypto::layer::LayerError),
     #[error("cell: {0}")]
