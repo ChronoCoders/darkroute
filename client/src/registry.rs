@@ -283,10 +283,33 @@ fn parse_rfc3339(s: &str) -> Result<i64, ClientError> {
     };
     let (y, mo, d) = (num(0, 4)?, num(5, 7)?, num(8, 10)?);
     let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+    if !(1..=12).contains(&mo) || h > 23 || mi > 59 || sec > 60 {
+        return Err(bad());
+    }
+    // The day must exist in that month of that year. Bounding it at 31 would
+    // accept 2026-02-29 and 2026-04-31, and days_from_civil would silently
+    // roll them into the following month rather than report anything.
+    if d < 1 || d > days_in_month(y, mo) {
         return Err(bad());
     }
     Ok(days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + sec)
+}
+
+/// Whether a year is a leap year in the proleptic Gregorian calendar: every
+/// fourth year, except centuries, except every fourth century.
+fn is_leap_year(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+/// Days in a month. `m` must already be in 1..=12.
+fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(y) => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 /// Days since 1970-01-01 from a civil date, after Howard Hinnant's algorithm.
@@ -682,5 +705,170 @@ mod tests {
             out.push((hi * 16 + lo) as u8);
         }
         Some(out)
+    }
+}
+
+/// Exhaustive check of the hand-written date conversion.
+///
+/// `parse_rfc3339` and `days_from_civil` are arithmetic written by hand, so
+/// spot checks prove little. These tests walk every day in range against a
+/// reference built the other way round: a counter that starts at the epoch and
+/// adds one day at a time, tracking month lengths and leap years explicitly.
+/// It shares no code with production, so the two have to agree by being right
+/// rather than by being the same function.
+#[cfg(test)]
+mod date_tests {
+    use super::{parse_rfc3339, ClientError};
+
+    const FIRST_YEAR: i64 = 1970;
+    const LAST_YEAR: i64 = 2100;
+
+    /// Reference leap rule, written independently of `is_leap_year`.
+    fn ref_is_leap(y: i64) -> bool {
+        if y % 400 == 0 {
+            return true;
+        }
+        if y % 100 == 0 {
+            return false;
+        }
+        y % 4 == 0
+    }
+
+    /// Reference month lengths, written independently of `days_in_month`.
+    fn ref_month_len(y: i64, m: i64) -> i64 {
+        const LENGTHS: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+        let base = LENGTHS[(m - 1) as usize];
+        if m == 2 && ref_is_leap(y) {
+            base + 1
+        } else {
+            base
+        }
+    }
+
+    /// Every (year, month, day, unix-midnight) in range, counted forward from
+    /// the epoch one day at a time.
+    fn reference_days() -> Vec<(i64, i64, i64, i64)> {
+        let mut out = Vec::with_capacity(48_000);
+        let mut secs: i64 = 0;
+        for y in FIRST_YEAR..=LAST_YEAR {
+            for m in 1..=12 {
+                for d in 1..=ref_month_len(y, m) {
+                    out.push((y, m, d, secs));
+                    secs += 86_400;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn reference_counter_is_internally_consistent() {
+        // Guard the reference itself before trusting it as an oracle.
+        let days = reference_days();
+        assert_eq!(
+            days.first().unwrap(),
+            &(1970, 1, 1, 0),
+            "epoch must be day zero"
+        );
+        assert_eq!(
+            days.last().unwrap().0,
+            LAST_YEAR,
+            "the walk must reach the last year"
+        );
+        assert_eq!(days.last().unwrap().1, 12);
+        assert_eq!(days.last().unwrap().2, 31);
+        // Consecutive entries are exactly one day apart, with no gap or repeat.
+        for pair in days.windows(2) {
+            assert_eq!(
+                pair[1].3 - pair[0].3,
+                86_400,
+                "gap between {:?} and {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // 1970 to 2100 inclusive holds 32 leap years in the Gregorian calendar,
+        // counted here rather than asserted from memory.
+        let leaps = (FIRST_YEAR..=LAST_YEAR).filter(|y| ref_is_leap(*y)).count();
+        assert_eq!(days.len() as i64, 365 * 131 + leaps as i64);
+        assert!(
+            !ref_is_leap(2100),
+            "2100 is a century that is not a leap year"
+        );
+        assert!(ref_is_leap(2000), "2000 is divisible by 400");
+    }
+
+    #[test]
+    fn every_day_round_trips_at_midnight_and_last_second() {
+        let days = reference_days();
+        assert!(days.len() > 47_000, "only {} days generated", days.len());
+
+        for (y, m, d, midnight) in days {
+            let at_midnight = format!("{y:04}-{m:02}-{d:02}T00:00:00Z");
+            match parse_rfc3339(&at_midnight) {
+                Ok(got) => assert_eq!(got, midnight, "{at_midnight} parsed to the wrong instant"),
+                Err(e) => panic!("{at_midnight} was rejected: {e}"),
+            }
+
+            let at_end = format!("{y:04}-{m:02}-{d:02}T23:59:59Z");
+            let want = midnight + 23 * 3600 + 59 * 60 + 59;
+            match parse_rfc3339(&at_end) {
+                Ok(got) => assert_eq!(got, want, "{at_end} parsed to the wrong instant"),
+                Err(e) => panic!("{at_end} was rejected: {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn impossible_dates_are_rejected() {
+        for s in [
+            "2026-02-29T00:00:00Z", // 2026 is not a leap year
+            "2100-02-29T00:00:00Z", // century, not a leap year
+            "2026-04-31T00:00:00Z", // April has 30 days
+            "2026-13-01T00:00:00Z", // no thirteenth month
+            "2026-00-10T00:00:00Z", // no zeroth month
+        ] {
+            assert!(
+                matches!(parse_rfc3339(s), Err(ClientError::Registry(_))),
+                "{s} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn real_leap_days_are_accepted() {
+        for s in ["2000-02-29T00:00:00Z", "2024-02-29T00:00:00Z"] {
+            assert!(parse_rfc3339(s).is_ok(), "{s} was rejected");
+        }
+    }
+
+    #[test]
+    fn day_zero_and_month_zero_are_rejected_in_every_month() {
+        for m in 1..=12 {
+            let s = format!("2026-{m:02}-00T00:00:00Z");
+            assert!(parse_rfc3339(&s).is_err(), "{s} was accepted");
+        }
+    }
+
+    #[test]
+    fn one_past_the_end_of_every_month_is_rejected() {
+        // The complement of the round-trip test: the first day that does not
+        // exist in each month. The years cover a leap year, a common year, a
+        // century that is not a leap year and a century that is, so the whole
+        // leap rule is exercised rather than only its common case.
+        for y in [2024, 2026, 2100, 2000] {
+            for m in 1..=12 {
+                let past = ref_month_len(y, m) + 1;
+                if past > 31 {
+                    continue; // cannot be expressed in two digits as a real day
+                }
+                let s = format!("{y:04}-{m:02}-{past:02}T00:00:00Z");
+                assert!(
+                    parse_rfc3339(&s).is_err(),
+                    "{s} was accepted but {m:02} has {} days",
+                    ref_month_len(y, m)
+                );
+            }
+        }
     }
 }
