@@ -413,6 +413,97 @@ ck_attr_roots() {
 # The control runs against copies in a scratch directory, never the working tree,
 # and it proves the checker rejects a root with either attribute removed as well
 # as accepting one that is intact.
+# Path construction must never resolve a name and must never seed its generator.
+#
+# SECURITY_MODEL 5.3 puts it plainly: no hostname is resolved anywhere in path
+# construction, because a resolver that saw those lookups would learn the path.
+# The client works from the address literals the registry publishes. Asserting
+# that a parser rejects a hostname tests the rule; this tests that no code on
+# the path calls a resolver in the first place, which is the separate half.
+#
+# The generator half is here for the same reason. Selection must be uniform over
+# valid paths, and a fixed seed in production would make every client pick the
+# same path while every statistical test still passed.
+CK_RESOLVER_PATTERN='to_socket_addrs|ToSocketAddrs|lookup_host'
+CK_FIXED_SEED_PATTERN='seed_from_u64|from_seed'
+
+ck_path_files() {
+	printf '%s\n' client/src/path.rs client/src/dial.rs client/src/circuits.rs
+}
+
+# Everything above the test module. A seeded generator is correct in a test and
+# wrong in production, so the two halves are not interchangeable.
+ck_non_test_part() {
+	awk '/^#\[cfg\(test\)\]/{exit} {print}' "$1"
+}
+
+ck_path_file_clean() {
+	local f="$1" rc=0 hits
+	hits=$(ck_non_test_part "$f" | grep -nE "$CK_RESOLVER_PATTERN")
+	if [ -n "$hits" ]; then
+		echo "name resolution in $f:" >&2
+		printf '%s\n' "$hits" | sed 's/^/    /' >&2
+		rc=1
+	fi
+	hits=$(ck_non_test_part "$f" | grep -nE "$CK_FIXED_SEED_PATTERN")
+	if [ -n "$hits" ]; then
+		echo "a seeded generator outside tests in $f:" >&2
+		printf '%s\n' "$hits" | sed 's/^/    /' >&2
+		rc=1
+	fi
+	return $rc
+}
+
+ck_path_self_test() {
+	local tmp rc=0 f
+	f=$(ck_path_files | head -1)
+	tmp=$(mktemp -d) || return 1
+	cp "$CK_ROOT/$f" "$tmp/intact.rs"
+	ck_path_file_clean "$tmp/intact.rs" >/dev/null 2>&1 || {
+		echo "control failed: the intact file was rejected" >&2; rc=1; }
+
+	# A planted resolver call must be caught.
+	{ echo 'fn planted(a: &str) { let _ = a.to_socket_addrs(); }'; cat "$tmp/intact.rs"; } > "$tmp/resolver.rs"
+	if ck_path_file_clean "$tmp/resolver.rs" >/dev/null 2>&1; then
+		echo "control failed: a planted to_socket_addrs call was accepted" >&2; rc=1
+	fi
+
+	# A planted fixed seed must be caught.
+	{ echo 'fn planted() { let _ = StdRng::seed_from_u64(7); }'; cat "$tmp/intact.rs"; } > "$tmp/seed.rs"
+	if ck_path_file_clean "$tmp/seed.rs" >/dev/null 2>&1; then
+		echo "control failed: a planted fixed seed was accepted" >&2; rc=1
+	fi
+
+	# A seed below the test marker must be allowed, or the check would ban the
+	# uniformity test it exists alongside.
+	printf 'fn ok() {}\n#[cfg(test)]\nmod t { fn s() { let _ = StdRng::seed_from_u64(7); } }\n' > "$tmp/testonly.rs"
+	ck_path_file_clean "$tmp/testonly.rs" >/dev/null 2>&1 || {
+		echo "control failed: a seed inside the test module was rejected" >&2; rc=1; }
+
+	rm -rf "$tmp"
+	[ $rc -eq 0 ] || return 1
+	echo "the check accepts intact path code, catches a planted resolver call and a planted fixed seed, and allows a seed inside tests"
+}
+
+ck_path_no_resolution() {
+	local rc=0 f n=0
+	while IFS= read -r f; do
+		[ -z "$f" ] && continue
+		if [ ! -r "$CK_ROOT/$f" ]; then
+			echo "path file missing, so this check proved nothing: $f" >&2
+			return 1
+		fi
+		n=$((n + 1))
+		ck_path_file_clean "$CK_ROOT/$f" || rc=1
+	done < <(ck_path_files)
+	if [ "$n" -eq 0 ]; then
+		echo "no path files were checked, so this check proved nothing" >&2
+		return 1
+	fi
+	echo "$n path files resolve no name and seed no generator outside tests"
+	return $rc
+}
+
 ck_attr_self_test() {
 	local tmp first rc=0
 	first=$(ck_crate_roots | head -1)

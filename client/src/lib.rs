@@ -8,6 +8,7 @@ mod blind;
 mod circuits;
 mod dial;
 mod error;
+pub mod path;
 mod tls;
 mod tokens;
 
@@ -15,6 +16,7 @@ pub use auth::Session;
 pub use circuits::{CircuitHop, CircuitRoute};
 pub use dial::CircuitStream;
 pub use error::ClientError;
+pub use path::{NoPathReason, PathRules, SelectedPath};
 pub use quiethop_crypto::registry;
 pub use quiethop_crypto::registry::{Document, PinnedKey, RegistryError, RelayEntry, Verified};
 pub use quiethop_crypto::state;

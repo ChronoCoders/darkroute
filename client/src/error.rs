@@ -30,6 +30,8 @@ pub enum ClientError {
     Noise(#[from] quiethop_crypto::noise::NoiseError),
     #[error(transparent)]
     Registry(#[from] quiethop_crypto::registry::RegistryError),
+    #[error("no path available: {0}")]
+    NoPath(crate::path::NoPathReason),
     #[error("layer: {0}")]
     Layer(#[from] quiethop_crypto::layer::LayerError),
     #[error("cell: {0}")]

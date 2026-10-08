@@ -132,6 +132,35 @@ fn signed_message(document: &[u8]) -> Vec<u8> {
     msg
 }
 
+impl Document {
+    /// `valid_after` as Unix seconds.
+    pub fn valid_after_unix(&self) -> Result<i64, RegistryError> {
+        parse_rfc3339(&self.valid_after)
+    }
+
+    /// `fresh_until` as Unix seconds. Past it the document is still usable and a
+    /// newer one is expected to exist, which is when a refetch is due.
+    pub fn fresh_until_unix(&self) -> Result<i64, RegistryError> {
+        parse_rfc3339(&self.fresh_until)
+    }
+
+    /// `valid_until` as Unix seconds. There is no grace period past it.
+    pub fn valid_until_unix(&self) -> Result<i64, RegistryError> {
+        parse_rfc3339(&self.valid_until)
+    }
+
+    /// Whether the document may be used at `now_unix`.
+    ///
+    /// Verification already checked this, but time moves on afterwards: a
+    /// document verified inside its window expires while it is cached, so every
+    /// use re-checks rather than trusting the check made at fetch time.
+    pub fn is_usable_at(&self, now_unix: i64) -> Result<bool, RegistryError> {
+        let after = self.valid_after_unix()?;
+        let until = self.valid_until_unix()?;
+        Ok(now_unix + SKEW_ALLOWANCE_SECS >= after && now_unix < until)
+    }
+}
+
 /// A document that passed every check, with the bytes it was verified over.
 #[derive(Debug, Clone)]
 pub struct Verified {

@@ -35,6 +35,8 @@ ck_step "control: the naming patterns match their literals"       ck_naming_self
 ck_step "no tooling name in tracked content, paths or identity"   ck_naming_tracked
 ck_step "control: the crate root attribute check rejects a strip" ck_attr_self_test
 ck_step "every crate root carries deny(warnings) and forbid(unsafe_code)" ck_attr_roots
+ck_step "control: the path check catches a planted lookup and seed"  ck_path_self_test
+ck_step "path code resolves no name and seeds no generator"      ck_path_no_resolution
 ck_step "control: the accepted advisory file parses"              ck_accepted_file_self_test
 ck_step "the rust and go toolchains are pinned"                   ck_toolchain_pins
 ck_step "the git hooks are installed and executable"              ck_hooks_installed
