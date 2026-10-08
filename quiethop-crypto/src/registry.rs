@@ -135,17 +135,46 @@ fn signed_message(document: &[u8]) -> Vec<u8> {
     msg
 }
 
+/// Reduce an address to one spelling before it is compared.
+///
+/// An IPv4-mapped IPv6 address such as `::ffff:10.1.0.1` names the same host as
+/// `10.1.0.1`. Compared as written, the two read as different families, which
+/// skips the IPv4 prefix rule in SECURITY_MODEL §5.3 and lets through a path
+/// that rule exists to forbid. It also makes a relay refuse a peer the registry
+/// does list, under the other spelling.
+///
+/// Every comparison on both sides goes through here, so the client and the relay
+/// cannot drift into two notions of when two addresses are the same.
+/// `to_canonical` leaves a genuine IPv6 address untouched.
+pub fn canonical_ip(ip: IpAddr) -> IpAddr {
+    ip.to_canonical()
+}
+
+/// [`canonical_ip`] for a socket address, keeping the port.
+pub fn canonical_addr(addr: SocketAddr) -> SocketAddr {
+    SocketAddr::new(canonical_ip(addr.ip()), addr.port())
+}
+
 impl RelayEntry {
-    /// The socket address to dial.
+    /// The entry's address, canonical.
+    ///
+    /// This and [`RelayEntry::addr`] are the only ways an entry's address enters
+    /// a comparison, which is what keeps the reduction in one place.
+    pub fn ip_addr(&self) -> Result<IpAddr, RegistryError> {
+        let ip: IpAddr = self
+            .ip
+            .parse()
+            .map_err(|_| RegistryError::Registry("registry entry holds no IP literal".into()))?;
+        Ok(canonical_ip(ip))
+    }
+
+    /// The socket address to dial, canonical.
     ///
     /// Parsed as a literal and never resolved: SECURITY_MODEL §5.3 forbids
     /// resolving a name anywhere in path construction, because a resolver that
     /// saw those lookups would learn the path.
     pub fn addr(&self) -> Result<SocketAddr, RegistryError> {
-        let ip: IpAddr = self
-            .ip
-            .parse()
-            .map_err(|_| RegistryError::Registry("registry entry holds no IP literal".into()))?;
+        let ip = self.ip_addr()?;
         if self.port == 0 {
             return Err(RegistryError::Registry("registry entry has port 0".into()));
         }
@@ -829,6 +858,49 @@ mod tests {
                 "{name:?} was accepted as an address"
             );
         }
+    }
+
+    #[test]
+    fn canonical_form_reduces_a_mapped_address_and_leaves_others_alone() {
+        let mapped: std::net::IpAddr = "::ffff:10.1.0.1".parse().unwrap();
+        let plain: std::net::IpAddr = "10.1.0.1".parse().unwrap();
+        let real_v6: std::net::IpAddr = "2001:db8::1".parse().unwrap();
+
+        assert_eq!(
+            canonical_ip(mapped),
+            plain,
+            "a mapped address reduces to IPv4"
+        );
+        assert_eq!(canonical_ip(plain), plain, "plain IPv4 is unchanged");
+        assert_eq!(
+            canonical_ip(real_v6),
+            real_v6,
+            "a genuine IPv6 is unchanged"
+        );
+        assert_ne!(mapped, plain, "the two spellings differ before reduction");
+    }
+
+    #[test]
+    fn an_entry_address_is_canonical_in_both_spellings() {
+        let want: std::net::IpAddr = "10.1.0.1".parse().unwrap();
+        for spelling in ["10.1.0.1", "::ffff:10.1.0.1"] {
+            let e = sample_entry(spelling, 443, &"ab".repeat(STATIC_KEY_LEN));
+            assert_eq!(e.ip_addr().unwrap(), want, "{spelling} did not reduce");
+            assert_eq!(
+                e.addr().unwrap(),
+                "10.1.0.1:443".parse::<std::net::SocketAddr>().unwrap(),
+                "{spelling} did not reduce in addr()"
+            );
+        }
+    }
+
+    #[test]
+    fn canonical_addr_keeps_the_port() {
+        let a: std::net::SocketAddr = "[::ffff:10.1.0.1]:8443".parse().unwrap();
+        assert_eq!(
+            canonical_addr(a),
+            "10.1.0.1:8443".parse::<std::net::SocketAddr>().unwrap()
+        );
     }
 
     #[test]

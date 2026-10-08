@@ -14,7 +14,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
 
-use quiethop_crypto::registry::{RelayEntry, Verified};
+use quiethop_crypto::registry::{canonical_addr, canonical_ip, RelayEntry, Verified};
 
 use crate::config::Role;
 
@@ -91,10 +91,14 @@ pub fn admits_inbound(doc: &Verified, role: Role, peer: IpAddr) -> bool {
     let Some(want) = upstream_role(role) else {
         return false;
     };
+    // Both sides canonical. A dual-stack listener reports an IPv4 peer as
+    // ::ffff:a.b.c.d, and a registry entry may carry either spelling, so
+    // comparing as written refuses a peer the registry does list.
+    let peer = canonical_ip(peer);
     doc.document
         .relays
         .iter()
-        .any(|e| e.role == want && e.ip.parse::<IpAddr>().is_ok_and(|ip| ip == peer))
+        .any(|e| e.role == want && e.ip_addr().is_ok_and(|ip| ip == peer))
 }
 
 /// The registry entry for an EXTEND target, or `None` when it is not a
@@ -104,6 +108,10 @@ pub fn admits_inbound(doc: &Verified, role: Role, peer: IpAddr) -> bool {
 /// reached on a port the authority did not publish for it.
 pub fn extend_target(doc: &Verified, role: Role, next: SocketAddr) -> Option<&RelayEntry> {
     let want = downstream_role(role)?;
+    // RelayEntry::addr is canonical and the EXTEND cell already decodes a mapped
+    // address to IPv4, but the caller's value is reduced here too so the match
+    // does not depend on where it came from.
+    let next = canonical_addr(next);
     doc.document
         .relays
         .iter()
@@ -204,6 +212,80 @@ mod tests {
         assert!(extend_target(&d, Role::Guard, "198.51.100.9:443".parse().unwrap()).is_none());
         // An exit extends to nothing.
         assert!(extend_target(&d, Role::Exit, middle).is_none());
+    }
+
+    /// A dual-stack listener reports an IPv4 peer as ::ffff:a.b.c.d. That peer
+    /// must be admitted when the registry lists a.b.c.d for the upstream role,
+    /// and the reverse spelling must work too, because either side may carry
+    /// either form.
+    #[test]
+    fn a_mapped_peer_matches_a_plain_registry_entry() {
+        let d = verified();
+        let mapped: IpAddr = "::ffff:10.1.0.1".parse().unwrap();
+        assert!(
+            admits_inbound(&d, Role::Middle, mapped),
+            "a mapped form of the listed guard address must be admitted"
+        );
+
+        // Control: a mapped address that is not listed is still refused, so the
+        // reduction has not turned the check into an accept-everything.
+        let unlisted: IpAddr = "::ffff:198.51.100.7".parse().unwrap();
+        assert!(!admits_inbound(&d, Role::Middle, unlisted));
+    }
+
+    #[test]
+    fn a_plain_peer_matches_a_mapped_registry_entry() {
+        let mut d = verified();
+        for e in d.document.relays.iter_mut() {
+            if e.role == "guard" {
+                e.ip = "::ffff:10.1.0.1".to_string();
+            }
+        }
+        let plain: IpAddr = "10.1.0.1".parse().unwrap();
+        assert!(
+            admits_inbound(&d, Role::Middle, plain),
+            "a plain peer must match a mapped entry"
+        );
+        // Control: the role still has to be the upstream one.
+        assert!(!admits_inbound(&d, Role::Exit, plain));
+    }
+
+    /// An EXTEND naming [::ffff:a.b.c.d]:port must match the registry entry
+    /// a.b.c.d:port, with the port still compared exactly.
+    #[test]
+    fn a_mapped_extend_target_matches_a_plain_entry() {
+        let d = verified();
+        let mapped: SocketAddr = "[::ffff:10.2.0.1]:443".parse().unwrap();
+        assert_eq!(
+            extend_target(&d, Role::Guard, mapped).map(|e| e.id.as_str()),
+            Some("m"),
+            "the mapped spelling of the listed middle must match"
+        );
+
+        // Control: the port is still exact, so the reduction has not loosened
+        // the address match into a host-only match.
+        let wrong_port: SocketAddr = "[::ffff:10.2.0.1]:8443".parse().unwrap();
+        assert!(extend_target(&d, Role::Guard, wrong_port).is_none());
+
+        // Control: the role is still checked.
+        let exit_mapped: SocketAddr = "[::ffff:10.3.0.1]:443".parse().unwrap();
+        assert!(extend_target(&d, Role::Guard, exit_mapped).is_none());
+    }
+
+    #[test]
+    fn a_plain_extend_target_matches_a_mapped_entry() {
+        let mut d = verified();
+        for e in d.document.relays.iter_mut() {
+            if e.role == "middle" {
+                e.ip = "::ffff:10.2.0.1".to_string();
+            }
+        }
+        let plain: SocketAddr = "10.2.0.1:443".parse().unwrap();
+        assert_eq!(
+            extend_target(&d, Role::Guard, plain).map(|e| e.id.as_str()),
+            Some("m")
+        );
+        assert!(extend_target(&d, Role::Guard, "10.2.0.1:8443".parse().unwrap()).is_none());
     }
 
     /// 2026-10-08T14:00:00Z, inside the window the fixture declares.

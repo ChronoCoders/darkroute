@@ -196,7 +196,11 @@ fn candidates(doc: &Document) -> Result<Vec<Candidate<'_>>, ClientError> {
         }
         // Parsed as a literal and never resolved. An entry holding a name fails
         // here rather than reaching a resolver (SECURITY_MODEL §5.3).
-        let Ok(ip) = entry.ip.parse::<IpAddr>() else {
+        //
+        // Canonical, so ::ffff:10.1.0.1 and 10.1.0.1 compare as the one host
+        // they are. Comparing them as written would read as two families and
+        // skip rule c's IPv4 prefix test entirely.
+        let Ok(ip) = entry.ip_addr() else {
             return Err(no_path(NoPathReason::InvalidRegistryEntry));
         };
         out.push(Candidate { entry, ip });
@@ -258,6 +262,11 @@ fn triple_is_valid(g: &Candidate, m: &Candidate, e: &Candidate, rules: PathRules
 ///
 /// The prefix lengths follow Tor's universal path constraints. A v4 and a v6
 /// address share no prefix, so the rule applies within a family only.
+///
+/// Both arguments are already canonical, because `candidates` reduces every
+/// entry as it parses it. That matters: an IPv4-mapped address left as written
+/// would take the IPv6 arm here and compare a /32 of the mapped prefix, which
+/// matches nothing and silently skips the IPv4 rule.
 fn same_prefix(a: IpAddr, b: IpAddr) -> bool {
     match (a, b) {
         (IpAddr::V4(a), IpAddr::V4(b)) => a.octets()[..2] == b.octets()[..2],
@@ -444,6 +453,51 @@ mod tests {
             pick(r, PathRules::default()).is_ok(),
             "2001:db8/32 and 2001:db9/32 differ"
         );
+    }
+
+    /// An IPv4-mapped IPv6 address is the same host as its IPv4 form, so rule c
+    /// must apply to it. Compared as written the two read as different families
+    /// and the IPv4 prefix test is skipped, which is a bypass of the rule rather
+    /// than a cosmetic difference.
+    #[test]
+    fn a_mapped_address_is_compared_as_ipv4_for_the_slash_16_rule() {
+        let mut r = clean();
+        r[0].ip = "::ffff:10.1.0.1".to_string();
+        r[2].ip = "10.1.0.2".to_string();
+        assert_eq!(
+            reason(pick(r, PathRules::default()).unwrap_err()),
+            NoPathReason::DiversityUnsatisfiable,
+            "::ffff:10.1.0.1 and 10.1.0.2 share a /16 once reduced"
+        );
+    }
+
+    /// Control for the case above. The same mapped spelling must still yield a
+    /// path when the other address is genuinely in a different /16, so the
+    /// rejection there comes from the prefix rule and not from the spelling.
+    #[test]
+    fn a_mapped_address_in_a_different_slash_16_is_accepted() {
+        let mut r = clean();
+        r[0].ip = "::ffff:10.1.0.1".to_string();
+        // 10.9 rather than 10.2, because the middle in the baseline is 10.2.0.1
+        // and reusing it would fail on the middle-to-exit pair instead.
+        r[2].ip = "10.9.0.1".to_string();
+        assert!(pick(r, PathRules::default()).is_ok());
+    }
+
+    /// The reduction must not collapse addresses that are genuinely different,
+    /// so a real IPv6 pair keeps its own /32 rule.
+    #[test]
+    fn reduction_does_not_disturb_genuine_ipv6_comparison() {
+        let mut r = clean();
+        r[0].ip = "2001:db8::1".to_string();
+        r[1].ip = "2001:db8:ffff::1".to_string();
+        r[2].ip = "2001:dba::1".to_string();
+        assert_eq!(
+            reason(pick(r.clone(), PathRules::default()).unwrap_err()),
+            NoPathReason::DiversityUnsatisfiable
+        );
+        r[1].ip = "2001:db9::1".to_string();
+        assert!(pick(r, PathRules::default()).is_ok());
     }
 
     /// A v4 and a v6 address share no prefix, so the mask must not be compared

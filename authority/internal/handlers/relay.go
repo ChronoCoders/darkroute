@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -25,10 +26,28 @@ func NewRelayHandler(pool *pgxpool.Pool, salt string, allowedIPs []string) *Rela
 	for _, ip := range allowedIPs {
 		trimmed := strings.TrimSpace(ip)
 		if trimmed != "" {
-			set[trimmed] = struct{}{}
+			// Canonical, because the lookup in HandleRelayHeartbeat is a string
+			// key: an allowlist entry spelled ::ffff:203.0.113.5 would never
+			// match a peer reported as 203.0.113.5, or the reverse.
+			set[canonicalIP(trimmed)] = struct{}{}
 		}
 	}
 	return &RelayHandler{pool: pool, salt: salt, allowedIPs: set}
+}
+
+// canonicalIP reduces an address to one spelling, so a string comparison on it
+// means what it looks like it means.
+//
+// An IPv4-mapped IPv6 address such as ::ffff:203.0.113.5 names the same host as
+// 203.0.113.5, and a dual-stack listener may report either form. A value that is
+// not an address at all is returned unchanged, which leaves the caller's
+// comparison failing rather than turning a malformed value into a match.
+func canonicalIP(host string) string {
+	addr, err := netip.ParseAddr(host)
+	if err != nil {
+		return host
+	}
+	return addr.Unmap().String()
 }
 
 // peerIP returns the real caller IP. Cloudflare Tunnel terminates on
@@ -40,9 +59,13 @@ func peerIP(r *http.Request) string {
 	if err != nil {
 		host = r.RemoteAddr
 	}
+	// Reduced before the loopback test, so ::ffff:127.0.0.1 is recognised as the
+	// loopback address it is. This widens nothing: the two literals are still
+	// the only peers whose CF-Connecting-IP header is trusted.
+	host = canonicalIP(host)
 	if host == "127.0.0.1" || host == "::1" {
 		if cf := r.Header.Get("CF-Connecting-IP"); cf != "" {
-			return cf
+			return canonicalIP(strings.TrimSpace(cf))
 		}
 	}
 	return host

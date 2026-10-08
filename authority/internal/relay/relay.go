@@ -103,9 +103,16 @@ func ProvisionRelay(ctx context.Context, pool *pgxpool.Pool, salt, tlsName, regi
 	if err := ValidateStaticKey(staticPubkey); err != nil {
 		return "", "", err
 	}
-	if _, err := netip.ParseAddr(ip); err != nil {
+	// Stored unmapped, so the registry carries one spelling of each address.
+	// ::ffff:203.0.113.10 names the same host as 203.0.113.10, and two spellings
+	// in the registry read as two families to every reader, which skips the
+	// IPv4 prefix rule in SECURITY_MODEL 5.3. Migration 010 holds the column to
+	// this with a CHECK.
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
 		return "", "", ErrInvalidAddress
 	}
+	ip = addr.Unmap().String()
 	if port < 1 || port > 65535 {
 		return "", "", ErrInvalidAddress
 	}

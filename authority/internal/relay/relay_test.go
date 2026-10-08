@@ -332,3 +332,96 @@ func TestProvisionStoresOperatorAndHostIdentifiers(t *testing.T) {
 		t.Errorf("stored operator_id=%q host_id=%q, want op-zeta/host-omega", op, host)
 	}
 }
+
+// Provisioning stores the unmapped form, so the signed registry carries one
+// spelling of each address (SECURITY_MODEL 5.3).
+func TestProvisionUnmapsAnIPv4MappedAddress(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	id, _, err := ProvisionRelay(ctx, pool, "test-salt-unmap-00000", "unmap.test", "us-east",
+		"guard", "::ffff:203.0.113.10", 9001, testPubkey(), "op-unmap", "host-unmap")
+	if err != nil {
+		t.Fatalf("ProvisionRelay: %v", err)
+	}
+	cleanupRow(t, pool, deleteRelayByID, id)
+
+	var stored string
+	var family int
+	if err := pool.QueryRow(ctx,
+		`SELECT host(ip), family(ip) FROM relay_nodes WHERE id = $1`, id).Scan(&stored, &family); err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if stored != "203.0.113.10" {
+		t.Errorf("stored %q, want 203.0.113.10", stored)
+	}
+	if family != 4 {
+		t.Errorf("stored family %d, want 4", family)
+	}
+}
+
+// Control for the case above: a plain IPv4 and a genuine IPv6 are stored as
+// given, so the unmapping does not rewrite addresses that were already correct.
+func TestProvisionLeavesUnmappedAddressesAlone(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+	cases := []struct {
+		name, in, want string
+		family         int
+	}{
+		{"plain v4", "203.0.113.11", "203.0.113.11", 4},
+		{"genuine v6", "2001:db8::1", "2001:db8::1", 6},
+	}
+	for i, c := range cases {
+		id, _, err := ProvisionRelay(ctx, pool, "test-salt-plain-0000"+string(rune('a'+i)),
+			"plain.test", "us-east", "guard", c.in, 9001, testPubkey(),
+			"op-plain", "host-plain")
+		if err != nil {
+			t.Fatalf("%s: ProvisionRelay: %v", c.name, err)
+		}
+		cleanupRow(t, pool, deleteRelayByID, id)
+
+		var stored string
+		var family int
+		if err := pool.QueryRow(ctx,
+			`SELECT host(ip), family(ip) FROM relay_nodes WHERE id = $1`, id).Scan(&stored, &family); err != nil {
+			t.Fatalf("%s: read back: %v", c.name, err)
+		}
+		if stored != c.want || family != c.family {
+			t.Errorf("%s: stored %q family %d, want %q family %d", c.name, stored, family, c.want, c.family)
+		}
+	}
+}
+
+// The database holds the column to the unmapped form, so an insert path that
+// forgot to unmap fails here rather than putting two spellings into a registry.
+func TestMigrationRejectsAMappedAddressDirectly(t *testing.T) {
+	pool := testPool(t)
+	ctx := context.Background()
+
+	_, err := pool.Exec(ctx,
+		`INSERT INTO relay_nodes (id, api_key_hash, tls_name, region, role, status, ip, port, static_pubkey, operator_id, host_id)
+		 VALUES (gen_random_uuid(), 'hash-mapped-direct', 'mapped.test', 'us-east', 'guard', 'inactive',
+		         '::ffff:203.0.113.12', 9001, decode(repeat('ab', 32), 'hex'), 'op-m', 'host-m')`)
+	if err == nil {
+		t.Fatal("a mapped address was accepted by the database")
+	}
+	if !strings.Contains(err.Error(), "relay_nodes_ip_not_mapped") {
+		t.Errorf("rejected for the wrong reason: %v", err)
+	}
+
+	// Control: the same insert with each unmapped spelling succeeds, so the
+	// constraint rejects the mapped form specifically and not the statement.
+	for _, ip := range []string{"203.0.113.13", "2001:db8::2"} {
+		var id string
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO relay_nodes (id, api_key_hash, tls_name, region, role, status, ip, port, static_pubkey, operator_id, host_id)
+			 VALUES (gen_random_uuid(), $1, 'ok.test', 'us-east', 'guard', 'inactive',
+			         $2, 9001, decode(repeat('ab', 32), 'hex'), 'op-ok', 'host-ok')
+			 RETURNING id`,
+			"hash-ok-"+ip, ip,
+		).Scan(&id); err != nil {
+			t.Fatalf("%s was rejected: %v", ip, err)
+		}
+		cleanupRow(t, pool, deleteRelayByID, id)
+	}
+}

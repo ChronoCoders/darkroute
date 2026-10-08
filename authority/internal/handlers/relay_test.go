@@ -151,3 +151,57 @@ func TestHeartbeatHTTPRejectsMismatchedStaticKey(t *testing.T) {
 		t.Errorf("a rejected heartbeat marked the relay %q, want it left inactive", got)
 	}
 }
+
+// peerIP reduces an address to one spelling, because both the heartbeat
+// allowlist and the login rate limiter key on the string it returns.
+func TestPeerIPCanonicalisesAMappedAddress(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/relay/heartbeat", nil)
+	req.RemoteAddr = "[::ffff:203.0.113.5]:55000"
+	if got := peerIP(req); got != "203.0.113.5" {
+		t.Errorf("peerIP = %q, want 203.0.113.5", got)
+	}
+
+	// Control: a genuine IPv6 peer is returned unchanged.
+	req.RemoteAddr = "[2001:db8::1]:55000"
+	if got := peerIP(req); got != "2001:db8::1" {
+		t.Errorf("peerIP = %q, want 2001:db8::1", got)
+	}
+}
+
+// A mapped loopback peer is loopback, so its CF-Connecting-IP is trusted, and
+// the header value is itself reduced before it reaches an allowlist lookup.
+func TestPeerIPTrustsAMappedLoopbackAndReducesTheHeader(t *testing.T) {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/relay/heartbeat", nil)
+	req.RemoteAddr = "[::ffff:127.0.0.1]:55000"
+	req.Header.Set("CF-Connecting-IP", "::ffff:203.0.113.7")
+	if got := peerIP(req); got != "203.0.113.7" {
+		t.Errorf("peerIP = %q, want 203.0.113.7", got)
+	}
+
+	// Control: a peer that is not loopback in any spelling is not trusted with
+	// the header, so reducing the peer has not widened what is trusted.
+	req.RemoteAddr = "[::ffff:203.0.113.5]:55000"
+	req.Header.Set("CF-Connecting-IP", "198.51.100.9")
+	if got := peerIP(req); got != "203.0.113.5" {
+		t.Errorf("peerIP = %q, want the peer 203.0.113.5, not the header", got)
+	}
+}
+
+// The allowlist is stored canonical, so a mapped entry admits the plain peer it
+// names and the reverse.
+func TestHeartbeatAllowlistMatchesAcrossSpellings(t *testing.T) {
+	for _, c := range []struct{ allow, peer string }{
+		{"::ffff:203.0.113.5", "[203.0.113.5]:55000"},
+		{"203.0.113.5", "[::ffff:203.0.113.5]:55000"},
+	} {
+		h := NewRelayHandler(nil, "salt", []string{c.allow})
+		if _, ok := h.allowedIPs[canonicalIP("203.0.113.5")]; !ok {
+			t.Fatalf("allowlist %q did not store the canonical form", c.allow)
+		}
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/relay/heartbeat", nil)
+		req.RemoteAddr = c.peer
+		if _, ok := h.allowedIPs[peerIP(req)]; !ok {
+			t.Errorf("allow %q did not admit peer %q", c.allow, c.peer)
+		}
+	}
+}
