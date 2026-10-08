@@ -107,6 +107,7 @@ func main() {
 	ch := handlers.NewCircuitHandler(database.Pool)
 	acc := handlers.NewAccountHandler(database.Pool)
 	adm := handlers.NewAdminHandler(database.Pool)
+	reg := handlers.NewRegistryHandler(registry.NewPublisher(database.Pool, regSigner))
 
 	r := chi.NewRouter()
 	r.Get("/health", handlers.Health(database.Pool))
@@ -114,6 +115,9 @@ func main() {
 	r.Group(func(r chi.Router) {
 		r.Use(handlers.RequestID, handlers.Logger)
 		r.Get("/api/v1/authority/pubkey", th.HandlePubkey)
+		// Public and unauthenticated: integrity comes from the signature,
+		// and a session here would reveal who is about to build a circuit.
+		r.Get("/api/v1/registry", reg.HandleRegistry)
 		r.Post("/api/v1/auth/register", ah.Register)
 		r.Post("/api/v1/auth/login", ah.Login)
 		r.Post("/api/v1/relay/heartbeat", rh.HandleRelayHeartbeat)
