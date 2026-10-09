@@ -17,6 +17,8 @@ serde_json = { workspace = true }
 base64 = { workspace = true }
 # key_id_for hashes a pinned key to its short id.
 sha2 = { workspace = true }
+# Circuit ids are drawn at random among unused values.
+rand = { workspace = true }
 # The fetch and refresh policy lives with the verifier so the client and the
 # relay cannot drift into two versions of it.
 reqwest = { workspace = true }

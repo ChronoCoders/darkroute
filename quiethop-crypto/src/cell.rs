@@ -63,6 +63,11 @@ pub enum CellType {
     Data = 0x04,
     CloseRequest = 0x05,
     CloseAck = 0x06,
+    /// Circuit-level flow control acknowledgement. A cell type rather than a
+    /// link command, so it travels inside the innermost layer between the
+    /// client and the exit and a relay that forwards it learns nothing about
+    /// the circuit's flow-control cadence (SECURITY_MODEL 6.4).
+    Sendme = 0x07,
 }
 
 impl TryFrom<u8> for CellType {
@@ -74,6 +79,7 @@ impl TryFrom<u8> for CellType {
             0x04 => Ok(CellType::Data),
             0x05 => Ok(CellType::CloseRequest),
             0x06 => Ok(CellType::CloseAck),
+            0x07 => Ok(CellType::Sendme),
             other => Err(CellError::UnknownType(other)),
         }
     }
