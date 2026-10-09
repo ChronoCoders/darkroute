@@ -44,7 +44,9 @@ use quiethop_crypto::cell::{
 use quiethop_crypto::circid::{CircId, LinkRole};
 use quiethop_crypto::layer::{peel, seal_forward, seal_to_me, Peeled};
 use quiethop_crypto::link::{self as link_frame, DestroyReason};
-use quiethop_crypto::noise::{Initiator, Transport, NOISE_MSG_LEN, STATIC_KEY_LEN};
+use quiethop_crypto::noise::{
+    generate_static_keypair, respond, Initiator, Transport, NOISE_MSG_LEN, STATIC_KEY_LEN,
+};
 use quiethop_crypto::registry::{Document, RelayEntry, Verified};
 
 use crate::authority::AuthorityClient;
@@ -993,6 +995,206 @@ async fn a_create_for_an_open_circuit_is_ignored_and_the_circuit_survives() {
                 .try_extend_to(fleet.middle.addr, fleet.middle.static_pubkey)
                 .await,
             "the colliding CREATE ended the circuit it named"
+        );
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// A stand-in middle that completes the link and then reports the next frame
+/// it is sent, verbatim.
+///
+/// It is a real Noise responder, so the client's handshake through the guard
+/// genuinely completes and the guard really holds a next link. What it does not
+/// do is act on anything after that: it hands the bytes to the test instead,
+/// which is the only way to read a byte the relay wrote to another relay.
+struct RecordingMiddle {
+    addr: SocketAddr,
+    static_pubkey: [u8; STATIC_KEY_LEN],
+    frames: mpsc::UnboundedReceiver<Vec<u8>>,
+}
+
+impl RecordingMiddle {
+    const LAYERS: usize = CLIENT_LAYERS - 1;
+
+    async fn spawn(server_config: Arc<ServerConfig>) -> Self {
+        let keypair = generate_static_keypair().expect("keygen");
+        let static_pubkey = keypair.public;
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (tx, frames) = mpsc::unbounded_channel();
+        let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                let tx = tx.clone();
+                let private = keypair.private().to_owned();
+                tokio::spawn(async move {
+                    let Ok(mut sock) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let mut proto = [0u8; 1];
+                    if sock.read_exact(&mut proto).await.is_err() || proto[0] != super::PROTO_RELAY
+                    {
+                        return;
+                    }
+                    let frame_len = link_frame::link_frame_len(Self::LAYERS);
+
+                    // CREATE from the guard, carrying the client's message 1.
+                    let mut buf = vec![0u8; frame_len];
+                    if sock.read_exact(&mut buf).await.is_err() {
+                        return;
+                    }
+                    let Ok(create) = link_frame::decode(&buf, Self::LAYERS, LinkRole::Initiator)
+                    else {
+                        return;
+                    };
+                    let Ok(msg1_bytes) =
+                        link_frame::payload(create.body, link_frame::CREATE_RELAY_BODY_LEN)
+                    else {
+                        return;
+                    };
+                    let mut msg1 = [0u8; NOISE_MSG_LEN];
+                    msg1.copy_from_slice(msg1_bytes);
+                    let Ok((_transport, msg2)) = respond(&private, &msg1) else {
+                        return;
+                    };
+                    let Ok(created) = link_frame::encode(
+                        Self::LAYERS,
+                        create.circ_id,
+                        link_frame::LinkCommand::Created,
+                        &msg2,
+                    ) else {
+                        return;
+                    };
+                    if sock.write_all(&created).await.is_err() || sock.flush().await.is_err() {
+                        return;
+                    }
+
+                    // Everything after the handshake goes to the test as it is.
+                    loop {
+                        let mut buf = vec![0u8; frame_len];
+                        if sock.read_exact(&mut buf).await.is_err() {
+                            return;
+                        }
+                        if tx.send(buf).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        Self {
+            addr,
+            static_pubkey,
+            frames,
+        }
+    }
+
+    async fn next_frame(&mut self) -> Vec<u8> {
+        tokio::time::timeout(Duration::from_secs(10), self.frames.recv())
+            .await
+            .expect("the guard forwarded nothing to the next hop")
+            .expect("the recording middle stopped")
+    }
+}
+
+/// A DESTROY forwarded to the next hop carries DESTROYED, never the reason
+/// that arrived.
+///
+/// tor-spec: "Reasons in DESTROY cell SHOULD NOT be propagated downward or
+/// upward, due to potential side channel risk", and "An OR receiving a DESTROY
+/// command should use the DESTROYED reason for its next cell." The reason a
+/// peer chose is a channel, so the only reason that may leave this relay for
+/// its own next hop is the constant one.
+///
+/// The received reason cannot reach the forwarding path at all, because
+/// ToCircuit::Destroyed carries no reason and the byte is never read. What this
+/// test holds is the other half: that the constant written is 0x06 and not some
+/// other variant.
+#[tokio::test]
+async fn a_forwarded_destroy_carries_destroyed_and_not_the_reason_received() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        ensure_crypto_provider();
+        let keydir = tempfile::tempdir().expect("keydir");
+        let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let pki = make_pki();
+        let server_config = make_server_config(&pki);
+        let connector = Arc::new(make_connector(&pki));
+        let over = default_override();
+        let fleet = spawn_fleet(
+            &auth_priv,
+            &over,
+            server_config.clone(),
+            connector.clone(),
+            keydir.path(),
+        )
+        .await;
+
+        // Publish the recorder as the middle, at its own address and with its
+        // own static key. The guard will only extend to the address and key the
+        // registry carries, so this is how the recorder gets the connection.
+        let mut middle = RecordingMiddle::spawn(server_config).await;
+        let (after, fresh, until) = current_window();
+        fleet.publish(document_from(
+            &[
+                ("guard", fleet.guard.addr, fleet.guard.static_pubkey),
+                ("middle", middle.addr, middle.static_pubkey),
+                ("exit", fleet.exit.addr, fleet.exit.static_pubkey),
+            ],
+            &after,
+            &fresh,
+            &until,
+        ));
+
+        let mut client =
+            MockClient::connect_with_token(&connector, &fleet.guard, &auth_priv, [0xE1; 32]).await;
+        assert!(
+            client
+                .try_extend_to(middle.addr, middle.static_pubkey)
+                .await,
+            "the recorder is published as the middle, so the extend must complete"
+        );
+
+        // A DESTROY from the client naming a reason of its own choosing.
+        let sent = DestroyReason::Protocol;
+        assert_ne!(sent as u8, DestroyReason::Destroyed as u8);
+        let destroy = link_frame::encode(
+            CLIENT_LAYERS,
+            client.circ_id,
+            link_frame::LinkCommand::Destroy,
+            &[sent as u8],
+        )
+        .expect("encode destroy");
+        client
+            .sock
+            .write_all(&destroy)
+            .await
+            .expect("write destroy");
+        client.sock.flush().await.expect("flush");
+
+        let wire = middle.next_frame().await;
+        let fwd = link_frame::decode(&wire, RecordingMiddle::LAYERS, LinkRole::Initiator)
+            .expect("decode forwarded frame");
+        assert_eq!(
+            fwd.command,
+            link_frame::LinkCommand::Destroy,
+            "the guard forwarded something other than DESTROY"
+        );
+        let body = link_frame::payload(fwd.body, link_frame::DESTROY_BODY_LEN)
+            .expect("forwarded destroy body");
+        assert_eq!(
+            body[0],
+            DestroyReason::Destroyed as u8,
+            "the forwarded reason was {:#04x}, not DESTROYED (0x06)",
+            body[0]
+        );
+        assert_ne!(
+            body[0], sent as u8,
+            "the reason the client chose crossed the relay, which is the side channel \
+             tor-spec forbids"
         );
     })
     .await

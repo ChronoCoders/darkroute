@@ -243,6 +243,21 @@ impl LinkTable {
     ///
     /// Returns whether a circuit was there, so a DESTROY for an id not open can
     /// be counted as such rather than silently succeeding.
+    /// Release every circuit on the link at once, quarantining each id.
+    ///
+    /// What a link loss does, done deliberately. Each id goes to quarantine on
+    /// the same terms as a single destroy, because a peer that reconnects can
+    /// reach for an id this side has just let go (DECISIONS 22).
+    ///
+    /// Returns how many circuits were released.
+    pub fn destroy_all(&mut self, now: Instant) -> usize {
+        let ids: Vec<CircId> = self.circuits.keys().copied().collect();
+        for id in &ids {
+            self.destroy(*id, now);
+        }
+        ids.len()
+    }
+
     pub fn destroy(&mut self, id: CircId, now: Instant) -> bool {
         let existed = self.circuits.remove(&id).is_some();
         self.rotation.retain(|r| *r != id);

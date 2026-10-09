@@ -19,6 +19,7 @@ mod integration_test;
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -455,6 +456,8 @@ fn run_keygen(path_arg: Option<&str>) -> ExitCode {
 
 #[derive(Debug, thiserror::Error)]
 enum HandleError {
+    #[error("the link control queue filled, so the link was closed")]
+    ControlQueueFull,
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("read timeout")]
@@ -606,6 +609,10 @@ struct LinkShared {
     /// live in per-circuit queues so one busy circuit cannot push the others
     /// behind it in a shared FIFO.
     wake: Notify,
+    /// Raised to end the link. A circuit task cannot close the socket itself,
+    /// so it asks the reader to, and the reader owns the teardown.
+    close: Notify,
+    closing: AtomicBool,
 }
 
 /// What the link reader sends a circuit task.
@@ -627,7 +634,31 @@ impl LinkShared {
                 control: VecDeque::new(),
             }),
             wake: Notify::new(),
+            close: Notify::new(),
+            closing: AtomicBool::new(false),
         }
+    }
+
+    /// Ask the link to end. Idempotent, and safe from any circuit task.
+    ///
+    /// Both notifications matter: the reader is what tears the link down, and
+    /// the writer is woken so it stops waiting on a queue nothing will fill.
+    fn request_close(&self) {
+        self.closing.store(true, Ordering::Relaxed);
+        self.close.notify_one();
+        self.wake.notify_one();
+    }
+
+    fn closing(&self) -> bool {
+        self.closing.load(Ordering::Relaxed)
+    }
+
+    /// Release every circuit on the link, as a link loss does. Returns how
+    /// many were released.
+    fn release_all(&self) -> usize {
+        let mut st = self.lock();
+        st.senders.clear();
+        st.table.destroy_all(Instant::now())
     }
 
     /// A poisoned lock means a holder panicked. The state is a plain map, so
@@ -723,10 +754,19 @@ async fn run_link(
     // that loses the race.
     let mut inbound = layer::FrameReader::new(r, frame_len);
     let outcome = loop {
-        let wire = match tokio::time::timeout(CELL_READ_TIMEOUT, inbound.next_frame()).await {
-            Ok(Ok(b)) => b,
-            Ok(Err(e)) => break Err(HandleError::Io(e)),
-            Err(_) => break Err(HandleError::Timeout),
+        if shared.closing() {
+            break Err(HandleError::ControlQueueFull);
+        }
+        // Cancel safe on the read branch: FrameReader keeps any partial frame
+        // when the close branch wins, so nothing is read half way and lost.
+        let wire = tokio::select! {
+            biased;
+            _ = shared.close.notified() => break Err(HandleError::ControlQueueFull),
+            read = tokio::time::timeout(CELL_READ_TIMEOUT, inbound.next_frame()) => match read {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => break Err(HandleError::Io(e)),
+                Err(_) => break Err(HandleError::Timeout),
+            },
         };
         if let Err(e) = dispatch_frame(&shared, &wire, layers, peer, role, &ctx).await {
             break Err(e);
@@ -735,11 +775,11 @@ async fn run_link(
 
     // The link is going. Every circuit on it fails, and each task forwards
     // DESTROY on its own downstream link as it winds up (SECURITY_MODEL 6.3).
-    {
-        let mut st = shared.lock();
-        st.senders.clear();
-    }
+    let released = shared.release_all();
     writer.abort();
+    if released > 0 {
+        info!(peer = %peer, role = %role, released, "link closed, circuits released");
+    }
     outcome
 }
 
@@ -969,7 +1009,17 @@ fn send_destroy(shared: &Arc<LinkShared>, id: CircId, layers: usize, reason: Des
         &[reason as u8],
     ) {
         if !shared.push_control(frame) {
+            // The peer has not read MAX_CONTROL_QUEUE control frames, so the
+            // link is already dead. Dropping this DESTROY would leave the peer
+            // believing every circuit it names is alive. Closing the link
+            // releases them all on both sides and the peer sees a link loss
+            // (DECISIONS 23).
             metrics::record_frame_dropped(metrics::DropReason::ControlQueueFull);
+            warn!(
+                circ_id = id.raw(),
+                "the link control queue filled, so the link is being closed"
+            );
+            shared.request_close();
         }
     }
 }
@@ -1460,12 +1510,25 @@ mod tests {
         assert_eq!(shared.lock().control.len(), link::MAX_CONTROL_QUEUE);
     }
 
-    /// A refused DESTROY is lost, so it has to be counted. A full control
-    /// queue means the peer stopped reading, and the 65th DESTROY would reach
-    /// it no better than the 64 already waiting, but nothing may disappear
-    /// without a number moving.
+    /// At the bound the link carries on. Nothing has gone wrong yet: 64
+    /// control frames queued is a peer that is behind, not a peer that is gone.
     #[test]
-    fn a_refused_destroy_is_counted() {
+    fn the_control_queue_at_its_bound_does_not_close_the_link() {
+        let shared = Arc::new(LinkShared::new(LinkRole::Responder));
+        for i in 0..link::MAX_CONTROL_QUEUE {
+            assert!(shared.push_control(vec![i as u8]));
+        }
+        assert!(
+            !shared.closing(),
+            "the link closed at the bound rather than past it"
+        );
+    }
+
+    /// One past the bound the link closes. A peer that has not read 64 control
+    /// frames is gone, and dropping this DESTROY would leave it believing the
+    /// circuits those frames name are still alive (DECISIONS 23).
+    #[test]
+    fn a_refused_destroy_closes_the_link_and_is_counted() {
         let shared = Arc::new(LinkShared::new(LinkRole::Responder));
         let id = CircId::new(0x4000_0002).expect("a nonzero id");
         for i in 0..link::MAX_CONTROL_QUEUE {
@@ -1473,12 +1536,51 @@ mod tests {
         }
         let before = metrics::dropped_count("control_queue_full");
         send_destroy(&shared, id, 3, DestroyReason::Protocol);
+
+        assert!(
+            shared.closing(),
+            "a DESTROY was refused and the link was left open"
+        );
         assert_eq!(
             metrics::dropped_count("control_queue_full"),
             before + 1,
-            "a DESTROY was dropped without the counter moving"
+            "a DESTROY did not reach the peer without the counter moving"
         );
         assert_eq!(shared.lock().control.len(), link::MAX_CONTROL_QUEUE);
+    }
+
+    /// Closing the link releases every circuit on it and quarantines each id,
+    /// which is what a link loss does. A reconnecting peer must not be able to
+    /// reach for an id this side has just let go.
+    #[test]
+    fn closing_the_link_releases_every_circuit_and_quarantines_its_id() {
+        let shared = Arc::new(LinkShared::new(LinkRole::Responder));
+        let ids: Vec<CircId> = (1..=3)
+            .map(|i| CircId::new(0x4000_0010 + i).expect("a nonzero id"))
+            .collect();
+        {
+            let mut st = shared.lock();
+            for id in &ids {
+                st.table
+                    .accept_create(*id, test_transport(), Instant::now())
+                    .expect("room on the link");
+            }
+        }
+        assert_eq!(shared.lock().table.len(), ids.len());
+
+        assert_eq!(shared.release_all(), ids.len());
+
+        let now = Instant::now();
+        let st = shared.lock();
+        assert_eq!(st.table.len(), 0, "a circuit survived the link closing");
+        assert!(st.senders.is_empty());
+        for id in &ids {
+            assert!(
+                st.table.quarantined(*id, now),
+                "{:#010x} was released without being quarantined",
+                id.raw()
+            );
+        }
     }
 
     /// Draining one frame makes room for exactly one more, so a refusal is
