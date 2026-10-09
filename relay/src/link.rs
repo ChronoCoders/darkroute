@@ -1,0 +1,761 @@
+//! Per-link circuit table: ids, bounds, quarantine and the round-robin writer.
+//!
+//! One link carries many circuits, so everything that was per-connection state
+//! becomes a table entry here. The structure holds no I/O and takes the clock as
+//! an argument, which is what makes the bounds and the quarantine testable
+//! without standing up a link.
+//!
+//! The rules it enforces are in ARCHITECTURE 5.5 and SECURITY_MODEL 6.3, and the
+//! reasoning behind the id lifecycle is docs/DECISIONS.md entry 22.
+
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+use quiethop_crypto::circid::{self, CircId, CircIdError, LinkRole};
+use quiethop_crypto::flow::{AfterDelivery, FlowError, Windows};
+use quiethop_crypto::link::DestroyReason;
+use quiethop_crypto::noise::Transport;
+
+/// Circuits one link will carry. A create beyond it is answered with DESTROY.
+/// Provisional until the step 5 measurement (ARCHITECTURE 5.8).
+pub const MAX_CIRCUITS_PER_LINK: usize = 64;
+
+/// Frames one circuit may have queued for one direction. Over it, that circuit
+/// is destroyed rather than any data being dropped. Must stay at or above the
+/// flow-control window or a correct fast circuit would be torn down.
+pub const MAX_CIRCUIT_QUEUE: usize = 1024;
+
+/// How many link level control frames may wait on one link.
+///
+/// DESTROY outlives the circuit it names, so it cannot wait in that circuit's
+/// queue: destroying the circuit discards the queue. It waits here instead.
+/// Each circuit is destroyed once and a refused CREATE answers once, so one
+/// frame per circuit slot is the ceiling.
+pub const MAX_CONTROL_QUEUE: usize = MAX_CIRCUITS_PER_LINK;
+
+/// How long a destroyed id is held before it can be reallocated on that link.
+///
+/// Shares the relay's CELL_READ_TIMEOUT value. The timer narrows the window in
+/// which a stale frame could be misattributed; it does not close it, and the
+/// mechanism that does is dropping DATA that arrives before CREATED. With ids
+/// drawn at random from 31 bits the chance an allocation lands on a recently
+/// destroyed id is about 2^-31 anyway (docs/DECISIONS.md entry 22).
+pub const ID_QUARANTINE: Duration = Duration::from_secs(120);
+
+/// Quarantined ids held per link, oldest evicted first.
+///
+/// A memory bound rather than an availability one: with 64 circuits and 256
+/// quarantine slots the allocator still draws from about 2^31 minus 320 ids.
+/// Tor bug 12184 is the failure mode this bound exists against, where ids that
+/// stayed blocked led to "0 circuit IDs in use by circuits and 64 with pending
+/// destroy cells" and then "Failing a circuit".
+pub const QUARANTINE_CAP: usize = 256;
+
+/// Where a circuit is in its life.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// This side sent CREATE and is waiting for CREATED. A DATA frame arriving
+    /// now belongs to whatever used this id before and is dropped.
+    Pending,
+    /// Handshake complete, carrying traffic.
+    Open,
+}
+
+/// One circuit on a link.
+pub struct Circuit {
+    pub phase: Phase,
+    /// The Noise session. Absent while a locally created circuit is Pending,
+    /// because the responder's message has not arrived to complete it.
+    pub transport: Option<Transport>,
+    pub windows: Windows,
+    out: VecDeque<Vec<u8>>,
+}
+
+impl Circuit {
+    fn new(phase: Phase, transport: Option<Transport>) -> Self {
+        Self {
+            phase,
+            transport,
+            windows: Windows::new(),
+            out: VecDeque::new(),
+        }
+    }
+}
+
+/// What the dispatch should do with a frame.
+///
+/// Every variant that drops also counts, and none of them touch the link. The
+/// names say what happened rather than what to log, so a caller cannot conflate
+/// two different reasons for the same action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    /// Deliver to this circuit.
+    Deliver,
+    /// Not open on this link: drop and count.
+    NotOpen,
+    /// DATA on a circuit still awaiting CREATED: drop and count.
+    BeforeCreated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateRefusal {
+    /// MAX_CIRCUITS_PER_LINK reached. The caller answers DESTROY.
+    LinkFull,
+    /// The id is already open. The caller sends nothing.
+    Collision,
+    /// The id is in quarantine, so it cannot name a new circuit yet.
+    Quarantined,
+}
+
+/// Circuits on one link, with their ids and their outbound queues.
+pub struct LinkTable {
+    role: LinkRole,
+    circuits: HashMap<CircId, Circuit>,
+    /// Destroyed ids and when they were destroyed, oldest first.
+    quarantine: VecDeque<(CircId, Instant)>,
+    /// Ids with queued frames, in service order. Round-robin comes from taking
+    /// one frame from the front and putting the id back at the back.
+    rotation: VecDeque<CircId>,
+}
+
+impl LinkTable {
+    /// `role` is this side's role on the link, which fixes the half of the id
+    /// space this side allocates from.
+    pub fn new(role: LinkRole) -> Self {
+        Self {
+            role,
+            circuits: HashMap::new(),
+            quarantine: VecDeque::new(),
+            rotation: VecDeque::new(),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.circuits.len()
+    }
+
+    pub fn get_mut(&mut self, id: CircId) -> Option<&mut Circuit> {
+        self.circuits.get_mut(&id)
+    }
+
+    /// Whether `id` is still held back from reallocation at `now`.
+    pub fn quarantined(&self, id: CircId, now: Instant) -> bool {
+        self.quarantine
+            .iter()
+            .any(|(q, at)| *q == id && now.duration_since(*at) < ID_QUARANTINE)
+    }
+
+    /// Drop quarantine entries whose time has passed.
+    pub fn expire_quarantine(&mut self, now: Instant) {
+        while let Some((_, at)) = self.quarantine.front() {
+            if now.duration_since(*at) >= ID_QUARANTINE {
+                self.quarantine.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Allocate an id for a circuit this side is creating.
+    ///
+    /// Quarantined ids are skipped and count toward the collision bound exactly
+    /// as ids in use do, so a link whose id space is crowded fails the create
+    /// rather than scanning.
+    pub fn allocate<R: rand::Rng>(
+        &mut self,
+        rng: &mut R,
+        now: Instant,
+    ) -> Result<CircId, CircIdError> {
+        self.expire_quarantine(now);
+        let circuits = &self.circuits;
+        let quarantine = &self.quarantine;
+        circid::allocate(rng, self.role, |id| {
+            circuits.contains_key(&id)
+                || quarantine
+                    .iter()
+                    .any(|(q, at)| *q == id && now.duration_since(*at) < ID_QUARANTINE)
+        })
+    }
+
+    /// Open a circuit this side created, in Pending until CREATED arrives.
+    pub fn insert_pending(&mut self, id: CircId) -> Result<(), CreateRefusal> {
+        self.insert(id, Phase::Pending, None)
+    }
+
+    /// Accept a CREATE from the peer, which arrives with its handshake already
+    /// complete on this side, so it opens directly.
+    pub fn accept_create(
+        &mut self,
+        id: CircId,
+        transport: Transport,
+        now: Instant,
+    ) -> Result<(), CreateRefusal> {
+        if self.quarantined(id, now) {
+            return Err(CreateRefusal::Quarantined);
+        }
+        self.insert(id, Phase::Open, Some(transport))
+    }
+
+    fn insert(
+        &mut self,
+        id: CircId,
+        phase: Phase,
+        transport: Option<Transport>,
+    ) -> Result<(), CreateRefusal> {
+        if self.circuits.contains_key(&id) {
+            return Err(CreateRefusal::Collision);
+        }
+        if self.circuits.len() >= MAX_CIRCUITS_PER_LINK {
+            return Err(CreateRefusal::LinkFull);
+        }
+        self.circuits.insert(id, Circuit::new(phase, transport));
+        Ok(())
+    }
+
+    /// Complete a locally created circuit when its CREATED arrives.
+    ///
+    /// `transport` is `None` where this side holds no session for the circuit,
+    /// which is the case on a downstream link: that handshake belongs to the
+    /// client and this relay only couriers it (SECURITY_MODEL 6.1).
+    pub fn open_pending(&mut self, id: CircId, transport: Option<Transport>) -> bool {
+        match self.circuits.get_mut(&id) {
+            Some(c) if c.phase == Phase::Pending => {
+                c.phase = Phase::Open;
+                if transport.is_some() {
+                    c.transport = transport;
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// What to do with an arriving DATA frame for `id`.
+    pub fn disposition_for_data(&self, id: CircId) -> Disposition {
+        match self.circuits.get(&id) {
+            None => Disposition::NotOpen,
+            Some(c) if c.phase == Phase::Pending => Disposition::BeforeCreated,
+            Some(_) => Disposition::Deliver,
+        }
+    }
+
+    /// Remove a circuit and quarantine its id.
+    ///
+    /// Returns whether a circuit was there, so a DESTROY for an id not open can
+    /// be counted as such rather than silently succeeding.
+    pub fn destroy(&mut self, id: CircId, now: Instant) -> bool {
+        let existed = self.circuits.remove(&id).is_some();
+        self.rotation.retain(|r| *r != id);
+        if existed {
+            self.quarantine.push_back((id, now));
+            while self.quarantine.len() > QUARANTINE_CAP {
+                self.quarantine.pop_front();
+            }
+        }
+        existed
+    }
+
+    /// Queue a frame for writing on this link.
+    ///
+    /// `Err` means the circuit is at MAX_CIRCUIT_QUEUE and the caller destroys
+    /// it. No frame is dropped: on a shared link the alternative to ending one
+    /// circuit is stalling every circuit on it.
+    pub fn push_out(&mut self, id: CircId, frame: Vec<u8>) -> Result<(), QueueFull> {
+        let Some(c) = self.circuits.get_mut(&id) else {
+            return Err(QueueFull::NoCircuit);
+        };
+        if c.out.len() >= MAX_CIRCUIT_QUEUE {
+            return Err(QueueFull::AtCap);
+        }
+        let was_empty = c.out.is_empty();
+        c.out.push_back(frame);
+        if was_empty {
+            self.rotation.push_back(id);
+        }
+        Ok(())
+    }
+
+    /// Account for a DATA cell delivered to this circuit's consumer.
+    ///
+    /// `None` means the circuit is not open, which the caller has already
+    /// handled through [`Self::disposition_for_data`]; it is not an error here.
+    pub fn on_data_delivered(&mut self, id: CircId) -> Option<Result<AfterDelivery, FlowError>> {
+        self.circuits
+            .get_mut(&id)
+            .map(|c| c.windows.on_data_delivered())
+    }
+
+    /// Credit this circuit's deliver window for a SENDME just sent.
+    pub fn on_sendme_sent(&mut self, id: CircId) {
+        if let Some(c) = self.circuits.get_mut(&id) {
+            c.windows.on_sendme_sent();
+        }
+    }
+
+    /// Account for a SENDME arriving on this circuit.
+    pub fn on_sendme_received(&mut self, id: CircId) -> Option<Result<(), FlowError>> {
+        self.circuits
+            .get_mut(&id)
+            .map(|c| c.windows.on_sendme_received())
+    }
+
+    /// Whether this circuit may send another DATA cell.
+    pub fn may_send(&self, id: CircId) -> bool {
+        self.circuits.get(&id).is_some_and(|c| c.windows.may_send())
+    }
+
+    /// Account for a DATA cell sent on this circuit.
+    pub fn on_data_sent(&mut self, id: CircId) -> Option<Result<(), FlowError>> {
+        self.circuits.get_mut(&id).map(|c| c.windows.on_data_sent())
+    }
+
+    /// Take one frame from the circuit whose turn it is.
+    ///
+    /// One frame rather than one circuit's whole queue, so a circuit with a
+    /// large backlog cannot hold the writer while others wait. The id goes to
+    /// the back of the rotation if it still has frames.
+    pub fn pop_next_out(&mut self) -> Option<(CircId, Vec<u8>)> {
+        while let Some(id) = self.rotation.pop_front() {
+            let Some(c) = self.circuits.get_mut(&id) else {
+                continue;
+            };
+            let Some(frame) = c.out.pop_front() else {
+                continue;
+            };
+            if !c.out.is_empty() {
+                self.rotation.push_back(id);
+            }
+            return Some((id, frame));
+        }
+        None
+    }
+}
+
+/// The DESTROY reason a peer's flow-control violation maps to.
+///
+/// Every variant maps to Protocol, and the match is exhaustive on purpose: a new
+/// FlowError will fail to compile here rather than silently inherit a reason
+/// that may not fit it. This is the mapping STATUS_REPORT carries as a
+/// requirement for the multiplexer commits (SECURITY_MODEL 6.4).
+pub fn destroy_reason_for(err: &FlowError) -> DestroyReason {
+    match err {
+        FlowError::PackageWindowExhausted
+        | FlowError::DeliverWindowNegative(_)
+        | FlowError::UnexpectedSendme(_) => DestroyReason::Protocol,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueFull {
+    /// The circuit is at its queue cap: destroy it.
+    AtCap,
+    /// No such circuit, which is a caller bug rather than a peer's fault.
+    NoCircuit,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quiethop_crypto::noise::{generate_static_keypair, respond, Initiator};
+
+    fn table() -> LinkTable {
+        LinkTable::new(LinkRole::Responder)
+    }
+
+    /// An RNG that returns a scripted sequence of u32 values.
+    ///
+    /// Needed because the allocator draws from 31 bits: a random RNG would
+    /// essentially never produce a specific quarantined id, so a test built on
+    /// one cannot tell a working skip from a deleted one. `circid::allocate`
+    /// masks off the top bit and sets the role's, so a scripted value's low 31
+    /// bits are what decide the id.
+    struct ScriptedRng {
+        values: VecDeque<u32>,
+        drawn: usize,
+    }
+
+    impl ScriptedRng {
+        fn new(values: &[u32]) -> Self {
+            Self {
+                values: values.iter().copied().collect(),
+                drawn: 0,
+            }
+        }
+    }
+
+    impl rand::RngCore for ScriptedRng {
+        fn next_u32(&mut self) -> u32 {
+            self.drawn += 1;
+            self.values
+                .pop_front()
+                .expect("the script ran out of values")
+        }
+        fn next_u64(&mut self) -> u64 {
+            u64::from(self.next_u32())
+        }
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            for chunk in dest.chunks_mut(4) {
+                let v = self.next_u32().to_le_bytes();
+                chunk.copy_from_slice(&v[..chunk.len()]);
+            }
+        }
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand::Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+
+    /// A completed Noise session, so a circuit can be opened in tests without
+    /// a link. Both halves are generated here and discarded.
+    fn transport() -> Transport {
+        let kp = generate_static_keypair().expect("keygen");
+        let (initiator, msg1) = Initiator::start(&kp.public).expect("nk start");
+        let (responder, msg2) = respond(kp.private(), &msg1).expect("nk respond");
+        let _ = initiator.finish(&msg2).expect("nk finish");
+        responder
+    }
+
+    fn id(raw: u32) -> CircId {
+        CircId::new(raw).unwrap()
+    }
+
+    #[test]
+    fn a_frame_for_an_id_not_open_is_not_delivered() {
+        let t = table();
+        assert_eq!(t.disposition_for_data(id(1)), Disposition::NotOpen);
+    }
+
+    /// DATA arriving on a circuit still awaiting CREATED belongs to whatever
+    /// used the id before, so it is dropped rather than decrypted. This is the
+    /// mechanism that makes id reallocation safe (DECISIONS 22).
+    #[test]
+    fn data_before_created_is_dropped_and_after_it_is_delivered() {
+        let mut t = table();
+        let x = id(0x40);
+        t.insert_pending(x).expect("room on the link");
+        assert_eq!(t.disposition_for_data(x), Disposition::BeforeCreated);
+
+        assert!(t.open_pending(x, Some(transport())), "CREATED must open it");
+        assert_eq!(t.disposition_for_data(x), Disposition::Deliver);
+    }
+
+    /// A CREATE naming an id already open is refused as a collision, which the
+    /// caller answers with silence.
+    #[test]
+    fn a_create_for_an_open_id_is_a_collision() {
+        let mut t = table();
+        let x = id(0x41);
+        t.accept_create(x, transport(), Instant::now())
+            .expect("first create");
+        assert_eq!(
+            t.accept_create(x, transport(), Instant::now()),
+            Err(CreateRefusal::Collision)
+        );
+        // Still there: a third create for the same id is refused the same way,
+        // which it would not be if the collision had removed the circuit.
+        assert_eq!(
+            t.accept_create(x, transport(), Instant::now()),
+            Err(CreateRefusal::Collision)
+        );
+    }
+
+    /// The link bound is enforced at its limit and one past it.
+    #[test]
+    fn the_link_is_full_at_max_circuits_per_link() {
+        let mut t = table();
+        for i in 0..MAX_CIRCUITS_PER_LINK {
+            t.accept_create(id(i as u32 + 1), transport(), Instant::now())
+                .unwrap_or_else(|e| panic!("circuit {i} within the bound was refused: {e:?}"));
+        }
+        assert_eq!(t.len(), MAX_CIRCUITS_PER_LINK);
+        assert_eq!(
+            t.accept_create(
+                id(MAX_CIRCUITS_PER_LINK as u32 + 1),
+                transport(),
+                Instant::now()
+            ),
+            Err(CreateRefusal::LinkFull)
+        );
+        assert_eq!(
+            t.len(),
+            MAX_CIRCUITS_PER_LINK,
+            "a refused create adds nothing"
+        );
+    }
+
+    /// The queue bound is enforced at its limit and one past it, and the frame
+    /// is never dropped: the caller destroys the circuit instead.
+    #[test]
+    fn the_queue_is_full_at_max_circuit_queue() {
+        let mut t = table();
+        let x = id(0x42);
+        t.accept_create(x, transport(), Instant::now()).unwrap();
+        for i in 0..MAX_CIRCUIT_QUEUE {
+            t.push_out(x, vec![0u8; 4])
+                .unwrap_or_else(|e| panic!("frame {i} within the bound was refused: {e:?}"));
+        }
+        assert_eq!(t.push_out(x, vec![0u8; 4]), Err(QueueFull::AtCap));
+        // Still exactly at the cap: draining one frame makes room for exactly
+        // one more, which it would not if the refused frame had been added.
+        assert!(t.pop_next_out().is_some());
+        assert!(t.push_out(x, vec![0u8; 4]).is_ok());
+        assert_eq!(t.push_out(x, vec![0u8; 4]), Err(QueueFull::AtCap));
+    }
+
+    /// A destroyed id is held back, and released once the quarantine passes.
+    #[test]
+    fn a_destroyed_id_is_quarantined_then_released() {
+        let mut t = table();
+        let x = id(0x43);
+        let t0 = Instant::now();
+        t.accept_create(x, transport(), t0).unwrap();
+        assert!(t.destroy(x, t0));
+
+        assert!(t.quarantined(x, t0), "held immediately after destroy");
+        assert!(
+            t.quarantined(x, t0 + ID_QUARANTINE - Duration::from_millis(1)),
+            "still held one millisecond before the quarantine ends"
+        );
+        assert!(
+            !t.quarantined(x, t0 + ID_QUARANTINE),
+            "released once the quarantine has passed"
+        );
+
+        // And a create for it is refused while held, accepted after.
+        assert_eq!(
+            t.accept_create(x, transport(), t0),
+            Err(CreateRefusal::Quarantined)
+        );
+        assert!(t.accept_create(x, transport(), t0 + ID_QUARANTINE).is_ok());
+    }
+
+    /// A quarantined id is not handed out by the allocator.
+    ///
+    /// The RNG is scripted to offer the held id first and a free one second.
+    /// A random RNG draws from 31 bits and would essentially never produce the
+    /// held id, which would let a deleted skip pass unnoticed.
+    #[test]
+    fn the_allocator_skips_a_quarantined_id() {
+        let mut t = LinkTable::new(LinkRole::Initiator);
+        let t0 = Instant::now();
+
+        let held = id(0x8000_0005);
+        t.insert_pending(held).unwrap();
+        assert!(t.destroy(held, t0));
+        assert!(t.quarantined(held, t0));
+
+        let mut r = ScriptedRng::new(&[0x05, 0x09]);
+        let got = t.allocate(&mut r, t0).expect("the second draw is free");
+        assert_eq!(
+            got,
+            id(0x8000_0009),
+            "the allocator returned the quarantined id instead of skipping it"
+        );
+        assert_eq!(r.drawn, 2, "the held id must consume a draw");
+    }
+
+    /// A quarantined id consumes an attempt, so a link crowded by held ids
+    /// fails the create rather than scanning for a free one.
+    #[test]
+    fn a_quarantined_id_counts_toward_the_collision_bound() {
+        let mut t = LinkTable::new(LinkRole::Initiator);
+        let t0 = Instant::now();
+        let held = id(0x8000_0005);
+        t.insert_pending(held).unwrap();
+        assert!(t.destroy(held, t0));
+
+        let script = vec![0x05u32; circid::MAX_ID_COLLISIONS];
+        let mut r = ScriptedRng::new(&script);
+        assert_eq!(t.allocate(&mut r, t0), Err(CircIdError::Exhausted));
+        assert_eq!(
+            r.drawn,
+            circid::MAX_ID_COLLISIONS,
+            "every held draw must count toward the bound"
+        );
+    }
+
+    /// Destroying an id that is not open reports false, so the caller can count
+    /// it as a frame for an unknown circuit rather than a successful teardown.
+    #[test]
+    fn destroying_an_unknown_id_reports_nothing_was_there() {
+        let mut t = table();
+        assert!(!t.destroy(id(0x44), Instant::now()));
+    }
+
+    /// The quarantine set is bounded, so churn cannot grow it without limit.
+    #[test]
+    fn the_quarantine_set_is_capped() {
+        let mut t = table();
+        let t0 = Instant::now();
+        for i in 0..(QUARANTINE_CAP * 2) {
+            let x = id(i as u32 + 1);
+            t.accept_create(x, transport(), t0).ok();
+            t.destroy(x, t0);
+        }
+        assert_eq!(t.quarantine.len(), QUARANTINE_CAP);
+        // Oldest first means the earliest ids were the ones evicted.
+        assert!(!t.quarantined(id(1), t0), "the oldest entry was evicted");
+        assert!(
+            t.quarantined(id((QUARANTINE_CAP * 2) as u32), t0),
+            "the newest entry is still held"
+        );
+    }
+
+    /// Every flow-control violation a peer can cause maps to Protocol. One
+    /// assertion per variant, because the requirement is a mapping per
+    /// violation rather than a default.
+    #[test]
+    fn every_flow_violation_maps_to_destroy_protocol() {
+        for err in [
+            FlowError::PackageWindowExhausted,
+            FlowError::DeliverWindowNegative(-1),
+            FlowError::UnexpectedSendme(1000),
+        ] {
+            assert_eq!(
+                destroy_reason_for(&err),
+                DestroyReason::Protocol,
+                "{err:?} did not map to Protocol"
+            );
+        }
+    }
+
+    /// Flow accounting reaches the right circuit's windows, and a peer sending
+    /// past its window surfaces the violation the caller destroys on.
+    #[test]
+    fn flow_accounting_is_per_circuit() {
+        let mut t = table();
+        let a = id(0x80);
+        let b = id(0x81);
+        t.accept_create(a, transport(), Instant::now()).unwrap();
+        t.accept_create(b, transport(), Instant::now()).unwrap();
+
+        // Deliveries on a do not touch b.
+        for _ in 0..100 {
+            match t.on_data_delivered(a).expect("a is open") {
+                Ok(AfterDelivery::SendmeOwed) => t.on_sendme_sent(a),
+                Ok(AfterDelivery::Nothing) => {}
+                Err(e) => panic!("within the window: {e:?}"),
+            }
+        }
+        assert!(t.may_send(a) && t.may_send(b));
+
+        // b's window is untouched, so it absorbs a full window of its own.
+        for _ in 0..1000 {
+            t.on_data_sent(b)
+                .expect("b is open")
+                .expect("within window");
+        }
+        assert!(!t.may_send(b), "b stopped at its own window");
+        assert!(t.may_send(a), "a is unaffected by b");
+    }
+
+    /// An unowed SENDME surfaces as a violation through the table, which is how
+    /// the dispatch learns to destroy the circuit.
+    #[test]
+    fn an_unowed_sendme_surfaces_as_a_violation() {
+        let mut t = table();
+        let x = id(0x82);
+        t.accept_create(x, transport(), Instant::now()).unwrap();
+        let err = t
+            .on_sendme_received(x)
+            .expect("x is open")
+            .expect_err("nothing was owed");
+        assert_eq!(err, FlowError::UnexpectedSendme(1000));
+        assert_eq!(destroy_reason_for(&err), DestroyReason::Protocol);
+    }
+
+    /// Flow calls for a circuit that is not open report absence rather than
+    /// inventing a violation, because the frame was already dropped as NotOpen.
+    #[test]
+    fn flow_calls_for_an_unknown_circuit_report_absence() {
+        let mut t = table();
+        let x = id(0x83);
+        assert!(t.on_data_delivered(x).is_none());
+        assert!(t.on_sendme_received(x).is_none());
+        assert!(t.on_data_sent(x).is_none());
+        assert!(!t.may_send(x));
+    }
+
+    /// Both circuits backlogged: the writer must strictly alternate, which is
+    /// what round-robin means. Each holds six frames, so the first eight picks
+    /// are a, b, a, b, a, b, a, b and neither runs out.
+    #[test]
+    fn the_writer_alternates_between_two_backlogged_circuits() {
+        let mut t = table();
+        let a = id(0x50);
+        let b = id(0x51);
+        t.accept_create(a, transport(), Instant::now()).unwrap();
+        t.accept_create(b, transport(), Instant::now()).unwrap();
+        for _ in 0..6 {
+            t.push_out(a, vec![0xAA]).unwrap();
+            t.push_out(b, vec![0xBB]).unwrap();
+        }
+
+        let order: Vec<CircId> = (0..8)
+            .filter_map(|_| t.pop_next_out().map(|(i, _)| i))
+            .collect();
+        assert_eq!(
+            order,
+            vec![a, b, a, b, a, b, a, b],
+            "expected strict alternation, got {order:?}"
+        );
+    }
+
+    /// The uneven case, labelled for what it is. a holds ten frames and b holds
+    /// exactly one, so b runs out after its first turn and a is served alone
+    /// from then on. The property under test is only that b was served on its
+    /// turn rather than behind a's whole backlog.
+    #[test]
+    fn a_circuit_that_runs_out_stops_taking_turns() {
+        let mut t = table();
+        let a = id(0x52);
+        let b = id(0x53);
+        t.accept_create(a, transport(), Instant::now()).unwrap();
+        t.accept_create(b, transport(), Instant::now()).unwrap();
+        for _ in 0..10 {
+            t.push_out(a, vec![0xAA]).unwrap();
+        }
+        t.push_out(b, vec![0xBB]).unwrap();
+
+        let order: Vec<CircId> = (0..4)
+            .filter_map(|_| t.pop_next_out().map(|(i, _)| i))
+            .collect();
+        assert_eq!(
+            order,
+            vec![a, b, a, a],
+            "b second, then a alone once b is empty, got {order:?}"
+        );
+    }
+
+    /// A stalled circuit, one that queues nothing, does not hold the writer.
+    #[test]
+    fn a_circuit_with_nothing_queued_does_not_hold_the_writer() {
+        let mut t = table();
+        let busy = id(0x60);
+        let idle = id(0x61);
+        t.accept_create(busy, transport(), Instant::now()).unwrap();
+        t.accept_create(idle, transport(), Instant::now()).unwrap();
+
+        for _ in 0..5 {
+            t.push_out(busy, vec![0x01]).unwrap();
+        }
+        let mut served = 0;
+        while let Some((who, _)) = t.pop_next_out() {
+            assert_eq!(who, busy, "only the busy circuit had frames");
+            served += 1;
+        }
+        assert_eq!(served, 5, "the idle circuit neither blocked nor was served");
+    }
+
+    /// Destroying a circuit removes it from the rotation, so the writer does
+    /// not spin on an id that no longer exists.
+    #[test]
+    fn destroying_a_circuit_clears_its_queued_frames() {
+        let mut t = table();
+        let x = id(0x70);
+        t.accept_create(x, transport(), Instant::now()).unwrap();
+        t.push_out(x, vec![0x01]).unwrap();
+        t.destroy(x, Instant::now());
+        assert!(t.pop_next_out().is_none());
+    }
+}

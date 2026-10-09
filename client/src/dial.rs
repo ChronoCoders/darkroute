@@ -16,10 +16,11 @@ use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 
 use quiethop_crypto::cell::{
-    link_cell_len, parse_extend_backward, Cell, CellType, ConnectPayload, ExtendForward,
-    CELL_PAYLOAD_LEN,
+    parse_extend_backward, Cell, CellType, ConnectPayload, ExtendForward, CELL_PAYLOAD_LEN,
 };
+use quiethop_crypto::circid::{self, CircId, LinkRole};
 use quiethop_crypto::layer::{peel, seal_forward, seal_to_me, FrameReader, Peeled};
+use quiethop_crypto::link::{self as link_frame, LinkCommand};
 use quiethop_crypto::noise::{Initiator, Transport, NOISE_MSG_LEN};
 use quiethop_crypto::wire::PROTO_CLIENT;
 
@@ -30,6 +31,26 @@ use quiethop_crypto::registry::RelayEntry;
 
 /// The client-guard link carries one layer per hop.
 const CLIENT_LAYERS: usize = 3;
+
+/// Size of every frame on the client-guard link, both directions.
+const LINK_FRAME_LEN: usize = link_frame::link_frame_len(CLIENT_LAYERS);
+
+/// Decode one inbound link frame and hand back the sealed cell in its body.
+///
+/// A frame naming another circuit cannot be meant for this one, and the client
+/// opens a single circuit per link, so it is a protocol violation rather than
+/// something to skip. DESTROY is the relay ending the circuit.
+fn inbound_body(wire: &[u8], circ_id: CircId) -> Result<&[u8], ClientError> {
+    let frame = link_frame::decode(wire, CLIENT_LAYERS, LinkRole::Responder)?;
+    if frame.circ_id != circ_id {
+        return Err(ClientError::ForeignCircuit(frame.circ_id.raw()));
+    }
+    match frame.command {
+        LinkCommand::Data => Ok(frame.body),
+        LinkCommand::Destroy => Err(ClientError::CircuitDestroyed),
+        other => Err(ClientError::UnexpectedLinkCommand(other)),
+    }
+}
 
 /// Read from the user in whole cells. Each cell carries at most
 /// CELL_PAYLOAD_LEN bytes, so a larger write is split across cells.
@@ -86,23 +107,48 @@ pub async fn dial(
 
     let mut tls = tls::dial(connector, guard_addr, &route.guard.tls_name).await?;
 
+    // This side opened the link, so the id comes from the initiator half. The
+    // link is new and carries one circuit, so nothing is in use yet.
+    let circ_id = circid::allocate(&mut rand::rngs::OsRng, LinkRole::Initiator, |_| false)?;
+
     tls.write_all(&[PROTO_CLIENT]).await?;
-    tls.write_all(m_raw).await?;
-    tls.write_all(token).await?;
 
-    // Hop 1: the guard, directly on this connection.
+    // Hop 1: the guard, directly on this connection. The token is presented in
+    // the CREATE rather than once per connection, so one token buys one
+    // circuit rather than a link's worth (SECURITY_MODEL 5.10).
     let (init, msg1) = Initiator::start(&guard_key)?;
-    tls.write_all(&msg1).await?;
+    let mut create = Vec::with_capacity(link_frame::CREATE_CLIENT_BODY_LEN);
+    create.extend_from_slice(m_raw);
+    create.extend_from_slice(token);
+    create.extend_from_slice(&msg1);
+    let frame = link_frame::encode(CLIENT_LAYERS, circ_id, LinkCommand::Create, &create)?;
+    tls.write_all(&frame).await?;
     tls.flush().await?;
-    let mut msg2 = [0u8; NOISE_MSG_LEN];
-    tls.read_exact(&mut msg2).await?;
-    let guard_tx = init.finish(&msg2)?;
 
-    let mut guard_tx = guard_tx;
+    let mut back = vec![0u8; LINK_FRAME_LEN];
+    tls.read_exact(&mut back).await?;
+    let created = link_frame::decode(&back, CLIENT_LAYERS, LinkRole::Responder)?;
+    if created.circ_id != circ_id {
+        return Err(ClientError::ForeignCircuit(created.circ_id.raw()));
+    }
+    if created.command != LinkCommand::Created {
+        return Err(ClientError::UnexpectedLinkCommand(created.command));
+    }
+    let mut msg2 = [0u8; NOISE_MSG_LEN];
+    msg2.copy_from_slice(link_frame::payload(created.body, NOISE_MSG_LEN)?);
+    let mut guard_tx = init.finish(&msg2)?;
+
     // Hop 2: the middle, acted on by the guard.
-    let mut middle_tx = extend_hop(&mut tls, &mut guard_tx, None, &route.middle).await?;
+    let mut middle_tx = extend_hop(&mut tls, &mut guard_tx, None, &route.middle, circ_id).await?;
     // Hop 3: the exit, acted on by the middle.
-    let exit_tx = extend_hop(&mut tls, &mut guard_tx, Some(&mut middle_tx), &route.exit).await?;
+    let exit_tx = extend_hop(
+        &mut tls,
+        &mut guard_tx,
+        Some(&mut middle_tx),
+        &route.exit,
+        circ_id,
+    )
+    .await?;
 
     let mut layers = Layers {
         guard: guard_tx,
@@ -117,11 +163,12 @@ pub async fn dial(
     };
     let cell = Cell::new(CellType::Connect, connect.encode()?)?;
     let wire = layers.seal_for_exit(&cell)?;
-    tls.write_all(&wire).await?;
+    let frame = link_frame::encode(CLIENT_LAYERS, circ_id, LinkCommand::Data, &wire)?;
+    tls.write_all(&frame).await?;
     tls.flush().await?;
 
     let (user_side, internal_side) = tokio::io::duplex(DUPLEX_BUF);
-    tokio::spawn(circuit_task(tls, layers, internal_side));
+    tokio::spawn(circuit_task(tls, layers, internal_side, circ_id));
     Ok(CircuitStream { inner: user_side })
 }
 
@@ -135,6 +182,7 @@ async fn extend_hop(
     guard: &mut Transport,
     middle: Option<&mut Transport>,
     next: &RelayEntry,
+    circ_id: CircId,
 ) -> Result<Transport, ClientError> {
     let (init, msg1) = Initiator::start(&next.static_key()?)?;
     let extend = ExtendForward {
@@ -150,13 +198,15 @@ async fn extend_hop(
             (seal_forward(guard, &inner, CLIENT_LAYERS)?, Some(mid))
         }
     };
-    tls.write_all(&wire).await?;
+    let frame = link_frame::encode(CLIENT_LAYERS, circ_id, LinkCommand::Data, &wire)?;
+    tls.write_all(&frame).await?;
     tls.flush().await?;
 
-    let mut back = vec![0u8; link_cell_len(CLIENT_LAYERS)];
+    let mut back = vec![0u8; LINK_FRAME_LEN];
     tls.read_exact(&mut back).await?;
+    let body = inbound_body(&back, circ_id)?;
 
-    let reply = match (peel(guard, &back, CLIENT_LAYERS)?, middle) {
+    let reply = match (peel(guard, body, CLIENT_LAYERS)?, middle) {
         (Peeled::ToMe(c), None) => c,
         (Peeled::Forward(blob), Some(mid)) => match peel(mid, &blob, CLIENT_LAYERS - 1)? {
             Peeled::ToMe(c) => c,
@@ -181,13 +231,14 @@ async fn circuit_task(
     tls: TlsStream<TcpStream>,
     mut layers: Layers,
     internal: tokio::io::DuplexStream,
+    circ_id: CircId,
 ) {
     let (tls_read, mut tls_write) = tokio::io::split(tls);
     let (mut from_user, mut to_user) = tokio::io::split(internal);
     // Cancel safe: FrameReader keeps any partial frame when the user-write
     // branch wins the race. read_exact would drop those bytes and leave every
     // later read starting mid-cell.
-    let mut inbound = FrameReader::new(tls_read, link_cell_len(CLIENT_LAYERS));
+    let mut inbound = FrameReader::new(tls_read, LINK_FRAME_LEN);
     let mut user_buf = vec![0u8; USER_READ_BUF];
 
     loop {
@@ -210,7 +261,12 @@ async fn circuit_task(
                         Ok(w) => w,
                         Err(_) => { failed = true; break; }
                     };
-                    if tls_write.write_all(&wire).await.is_err() {
+                    let framed =
+                        match link_frame::encode(CLIENT_LAYERS, circ_id, LinkCommand::Data, &wire) {
+                            Ok(f) => f,
+                            Err(_) => { failed = true; break; }
+                        };
+                    if tls_write.write_all(&framed).await.is_err() {
                         failed = true;
                         break;
                     }
@@ -225,9 +281,13 @@ async fn circuit_task(
                     Ok(f) => f,
                     Err(_) => break,
                 };
-                let cell = match layers.peel_inbound(&frame) {
+                // A foreign id, a DESTROY or an authentication failure all
+                // tear the circuit down.
+                let Ok(body) = inbound_body(&frame, circ_id) else {
+                    break;
+                };
+                let cell = match layers.peel_inbound(body) {
                     Ok(c) => c,
-                    // Any authentication failure tears the circuit down.
                     Err(_) => break,
                 };
                 match cell.cell_type {
@@ -250,8 +310,11 @@ async fn circuit_task(
     // Best effort teardown: ask the exit to close, then drop everything.
     if let Ok(cell) = Cell::new(CellType::CloseRequest, Vec::new()) {
         if let Ok(wire) = layers.seal_for_exit(&cell) {
-            let _ = tls_write.write_all(&wire).await;
-            let _ = tls_write.flush().await;
+            if let Ok(frame) = link_frame::encode(CLIENT_LAYERS, circ_id, LinkCommand::Data, &wire)
+            {
+                let _ = tls_write.write_all(&frame).await;
+                let _ = tls_write.flush().await;
+            }
         }
     }
     let _ = tls_write.shutdown().await;

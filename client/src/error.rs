@@ -38,6 +38,16 @@ pub enum ClientError {
     Cell(#[from] CellError),
     #[error("circuit handshake: unexpected cell type {0:?}")]
     UnexpectedCell(quiethop_crypto::cell::CellType),
+    #[error("link frame: {0}")]
+    LinkFrame(#[from] quiethop_crypto::link::LinkError),
+    #[error("circuit id: {0}")]
+    CircId(#[from] quiethop_crypto::circid::CircIdError),
+    #[error("link frame named circuit {0:#010x}, which is not this circuit")]
+    ForeignCircuit(u32),
+    #[error("the relay destroyed the circuit")]
+    CircuitDestroyed,
+    #[error("unexpected link command {0:?} on an open circuit")]
+    UnexpectedLinkCommand(quiethop_crypto::link::LinkCommand),
     #[error("native root certificate store could not be loaded: {0}")]
     NativeRoots(std::io::Error),
 }

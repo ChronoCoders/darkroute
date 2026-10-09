@@ -20,6 +20,7 @@
 //! cell and a wrong-size cell. All four must end with the relay closing the
 //! connection and sending nothing.
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -40,7 +41,9 @@ use quiethop_crypto::cell::{
     link_cell_len, parse_extend_backward, Cell, CellType, ConnectPayload, ExtendForward,
     CELL_PAYLOAD_LEN,
 };
+use quiethop_crypto::circid::{CircId, LinkRole};
 use quiethop_crypto::layer::{peel, seal_forward, seal_to_me, Peeled};
+use quiethop_crypto::link::{self as link_frame, DestroyReason};
 use quiethop_crypto::noise::{Initiator, Transport, NOISE_MSG_LEN, STATIC_KEY_LEN};
 use quiethop_crypto::registry::{Document, RelayEntry, Verified};
 
@@ -210,6 +213,8 @@ fn parse_hour(rfc3339: &str) -> i64 {
 struct SpawnedRelay {
     addr: SocketAddr,
     static_pubkey: [u8; STATIC_KEY_LEN],
+    /// Needed because a link's frame size follows the relay's role.
+    role: Role,
 }
 
 /// Spawn one relay. Its keypair is generated at runtime into `keydir`, so no
@@ -252,6 +257,7 @@ async fn spawn_relay(
     SpawnedRelay {
         addr,
         static_pubkey,
+        role,
     }
 }
 
@@ -431,6 +437,9 @@ struct MockClient {
     guard: Transport,
     middle: Option<Transport>,
     exit: Option<Transport>,
+    /// The id this client chose for its circuit on the guard link. The client
+    /// opened the link, so the id carries the top bit set.
+    circ_id: CircId,
     /// Every frame size observed on the client-guard link, in both directions.
     observed: Vec<usize>,
 }
@@ -461,26 +470,69 @@ impl MockClient {
         auth_priv: &RsaPrivateKey,
         m_raw: [u8; 32],
     ) -> Self {
+        Self::connect_with_token_and_id(connector, guard, auth_priv, m_raw, 0x8000_0001).await
+    }
+
+    /// Connect with a caller-chosen token and circuit id.
+    ///
+    /// The id is a parameter because the interleaving tests put two circuits on
+    /// one link and each needs its own.
+    async fn connect_with_token_and_id(
+        connector: &TlsConnector,
+        guard: &SpawnedRelay,
+        auth_priv: &RsaPrivateKey,
+        m_raw: [u8; 32],
+        raw_id: u32,
+    ) -> Self {
+        let circ_id = CircId::new(raw_id).expect("a nonzero id");
         let mut sock = tls_connect(connector, guard.addr).await;
         sock.write_all(&[super::PROTO_CLIENT]).await.expect("proto");
-        let token = raw_sign(&m_raw, auth_priv);
-        sock.write_all(&m_raw).await.expect("m_raw");
-        sock.write_all(&token).await.expect("token");
-
-        let (init, msg1) = Initiator::start(&guard.static_pubkey).expect("nk start");
-        sock.write_all(&msg1).await.expect("msg1");
-        sock.flush().await.expect("flush");
-        let mut msg2 = [0u8; NOISE_MSG_LEN];
-        sock.read_exact(&mut msg2).await.expect("msg2");
-        let guard_tx = init.finish(&msg2).expect("nk finish");
-
+        let guard_tx = Self::create_on(&mut sock, guard, auth_priv, m_raw, circ_id).await;
         Self {
             sock,
             guard: guard_tx,
             middle: None,
             exit: None,
+            circ_id,
             observed: Vec::new(),
         }
+    }
+
+    /// Send CREATE on an open socket and complete the handshake.
+    async fn create_on(
+        sock: &mut ClientTlsStream<TcpStream>,
+        guard: &SpawnedRelay,
+        auth_priv: &RsaPrivateKey,
+        m_raw: [u8; 32],
+        circ_id: CircId,
+    ) -> Transport {
+        let token = raw_sign(&m_raw, auth_priv);
+        let (init, msg1) = Initiator::start(&guard.static_pubkey).expect("nk start");
+
+        // CREATE body: the token presentation then the client's first Noise
+        // message. The token is per circuit, so one token buys one circuit.
+        let mut body = Vec::with_capacity(super::PRESENTATION_LEN + NOISE_MSG_LEN);
+        body.extend_from_slice(&m_raw);
+        body.extend_from_slice(&token);
+        body.extend_from_slice(&msg1);
+        let create = link_frame::encode(
+            CLIENT_LAYERS,
+            circ_id,
+            link_frame::LinkCommand::Create,
+            &body,
+        )
+        .expect("encode create");
+        sock.write_all(&create).await.expect("create");
+        sock.flush().await.expect("flush");
+
+        let mut buf = vec![0u8; link_frame::link_frame_len(CLIENT_LAYERS)];
+        sock.read_exact(&mut buf).await.expect("created");
+        let back = link_frame::decode(&buf, CLIENT_LAYERS, LinkRole::Responder).expect("decode");
+        assert_eq!(back.command, link_frame::LinkCommand::Created);
+        assert_eq!(back.circ_id, circ_id);
+        let mut msg2 = [0u8; NOISE_MSG_LEN];
+        msg2.copy_from_slice(link_frame::payload(back.body, NOISE_MSG_LEN).expect("msg2"));
+        init.finish(&msg2).expect("nk finish")
     }
 
     /// Number of hops whose transports are established.
@@ -525,19 +577,48 @@ impl MockClient {
         assert_eq!(
             wire.len(),
             link_cell_len(CLIENT_LAYERS),
-            "a frame on the client-guard link was not the fixed size"
+            "a sealed cell on the client-guard link was not the fixed size"
         );
-        self.observed.push(wire.len());
-        self.sock.write_all(wire).await.expect("write frame");
+        let frame = link_frame::encode(
+            CLIENT_LAYERS,
+            self.circ_id,
+            link_frame::LinkCommand::Data,
+            wire,
+        )
+        .expect("encode link frame");
+        assert_eq!(
+            frame.len(),
+            link_frame::link_frame_len(CLIENT_LAYERS),
+            "a link frame on the client-guard link was not the fixed size"
+        );
+        self.observed.push(frame.len());
+        self.sock.write_all(&frame).await.expect("write frame");
         self.sock.flush().await.expect("flush");
     }
 
-    /// Read exactly one fixed-size frame. No length prefix exists on the wire.
+    /// Read one link frame and return the sealed cell inside it.
+    ///
+    /// A frame for another circuit, or any command other than DATA, is an error
+    /// here rather than being skipped: this client has one circuit and anything
+    /// else means the relay mixed circuits up, which is what the interleaving
+    /// test exists to catch.
     async fn read_frame(&mut self) -> std::io::Result<Vec<u8>> {
-        let mut buf = vec![0u8; link_cell_len(CLIENT_LAYERS)];
+        let mut buf = vec![0u8; link_frame::link_frame_len(CLIENT_LAYERS)];
         self.sock.read_exact(&mut buf).await?;
         self.observed.push(buf.len());
-        Ok(buf)
+        let frame = link_frame::decode(&buf, CLIENT_LAYERS, LinkRole::Responder)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        if frame.circ_id != self.circ_id {
+            return Err(std::io::Error::other(format!(
+                "frame for circuit {:#010x} arrived on a client holding {:#010x}",
+                frame.circ_id.raw(),
+                self.circ_id.raw()
+            )));
+        }
+        match frame.command {
+            link_frame::LinkCommand::Data => Ok(frame.body.to_vec()),
+            other => Err(std::io::Error::other(format!("unexpected {other:?}"))),
+        }
     }
 
     /// Read one frame and peel every established layer until a cell appears.
@@ -605,7 +686,16 @@ impl MockClient {
         let cell = Cell::new(CellType::Extend, extend.encode()).expect("extend cell");
         let depth = self.hops();
         let wire = self.seal_for_depth(&cell, depth);
-        if self.sock.write_all(&wire).await.is_err() || self.sock.flush().await.is_err() {
+        let Ok(frame) = link_frame::encode(
+            CLIENT_LAYERS,
+            self.circ_id,
+            link_frame::LinkCommand::Data,
+            &wire,
+        ) else {
+            return false;
+        };
+        self.observed.push(frame.len());
+        if self.sock.write_all(&frame).await.is_err() || self.sock.flush().await.is_err() {
             return false;
         }
         let Ok(Ok(wire)) = tokio::time::timeout(Duration::from_secs(10), self.read_frame()).await
@@ -710,7 +800,7 @@ async fn run_test() {
     for (i, n) in client.observed.iter().enumerate() {
         assert_eq!(
             *n,
-            link_cell_len(CLIENT_LAYERS),
+            link_frame::link_frame_len(CLIENT_LAYERS),
             "frame {i} on the client-guard link was {n} bytes"
         );
     }
@@ -789,26 +879,44 @@ async fn wrong_static_key_fails_the_handshake() {
         let impostor = SpawnedRelay {
             addr: fleet.guard.addr,
             static_pubkey: fleet.exit.static_pubkey,
+            role: Role::Guard,
         };
         assert_ne!(impostor.static_pubkey, fleet.guard.static_pubkey);
 
         let mut sock = tls_connect(&connector, impostor.addr).await;
         sock.write_all(&[super::PROTO_CLIENT]).await.expect("proto");
-        let m_raw: [u8; 32] = [0xA5; 32];
+        // A token the control did not spend. Reusing the control's token would
+        // make the guard refuse on replay, and a refusal on replay looks
+        // exactly like a refusal on the static key.
+        let m_raw: [u8; 32] = [0xA6; 32];
         let token = raw_sign(&m_raw, &auth_priv);
-        sock.write_all(&m_raw).await.expect("m_raw");
-        sock.write_all(&token).await.expect("token");
         let (init, msg1) = Initiator::start(&impostor.static_pubkey).expect("nk start");
-        sock.write_all(&msg1).await.expect("msg1");
+        let circ_id = CircId::new(0x8000_0002).expect("a nonzero id");
+        let mut body = Vec::with_capacity(super::PRESENTATION_LEN + NOISE_MSG_LEN);
+        body.extend_from_slice(&m_raw);
+        body.extend_from_slice(&token);
+        body.extend_from_slice(&msg1);
+        let create = link_frame::encode(
+            CLIENT_LAYERS,
+            circ_id,
+            link_frame::LinkCommand::Create,
+            &body,
+        )
+        .expect("encode create");
+        sock.write_all(&create).await.expect("create");
         sock.flush().await.expect("flush");
 
         // The guard cannot decrypt message 1 under its own static key, so it
         // closes without replying. Either an EOF or an unusable message 2 is
         // acceptable; what must not happen is a working circuit.
-        let mut msg2 = [0u8; NOISE_MSG_LEN];
-        match sock.read_exact(&mut msg2).await {
+        let mut buf = vec![0u8; link_frame::link_frame_len(CLIENT_LAYERS)];
+        match sock.read_exact(&mut buf).await {
             Err(_) => {}
             Ok(_) => {
+                let back = link_frame::decode(&buf, CLIENT_LAYERS, LinkRole::Responder)
+                    .expect("decode created");
+                let mut msg2 = [0u8; NOISE_MSG_LEN];
+                msg2.copy_from_slice(link_frame::payload(back.body, NOISE_MSG_LEN).expect("msg2"));
                 assert!(
                     init.finish(&msg2).is_err(),
                     "a handshake against the wrong static key completed"
@@ -820,9 +928,85 @@ async fn wrong_static_key_fails_the_handshake() {
     .expect("test timed out");
 }
 
-/// A tampered cell tears the circuit down with no reply.
+/// A CREATE naming a circuit that is already open is ignored, and the circuit
+/// it named keeps working.
+///
+/// Answering it with DESTROY would hand any peer on the link a way to end any
+/// circuit on that link: name its id in a CREATE and the relay tears it down
+/// (DECISIONS 22). So the refusal is silence, and the test has to show both
+/// halves, that nothing comes back and that the live circuit survives.
 #[tokio::test]
-async fn tampered_cell_tears_down_the_circuit() {
+async fn a_create_for_an_open_circuit_is_ignored_and_the_circuit_survives() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        ensure_crypto_provider();
+        let keydir = tempfile::tempdir().expect("keydir");
+        let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let pki = make_pki();
+        let server_config = make_server_config(&pki);
+        let connector = Arc::new(make_connector(&pki));
+        let over = default_override();
+        let fleet = spawn_fleet(
+            &auth_priv,
+            &over,
+            server_config,
+            connector.clone(),
+            keydir.path(),
+        )
+        .await;
+
+        let mut client =
+            MockClient::connect_with_token(&connector, &fleet.guard, &auth_priv, [0xD1; 32]).await;
+
+        // A second CREATE for the id the first one opened. A fresh token, so a
+        // replay refusal cannot stand in for the collision refusal.
+        let m_raw: [u8; 32] = [0xD2; 32];
+        let token = raw_sign(&m_raw, &auth_priv);
+        let (_init, msg1) = Initiator::start(&fleet.guard.static_pubkey).expect("nk start");
+        let mut body = Vec::with_capacity(super::PRESENTATION_LEN + NOISE_MSG_LEN);
+        body.extend_from_slice(&m_raw);
+        body.extend_from_slice(&token);
+        body.extend_from_slice(&msg1);
+        let collide = link_frame::encode(
+            CLIENT_LAYERS,
+            client.circ_id,
+            link_frame::LinkCommand::Create,
+            &body,
+        )
+        .expect("encode colliding create");
+        client.sock.write_all(&collide).await.expect("write create");
+        client.sock.flush().await.expect("flush");
+
+        // Nothing comes back. Reading has to time out rather than produce a
+        // frame, so the read timeout here is the assertion and not a wait for
+        // something slow.
+        let mut buf = vec![0u8; link_frame::link_frame_len(CLIENT_LAYERS)];
+        let answered =
+            tokio::time::timeout(Duration::from_secs(3), client.sock.read_exact(&mut buf)).await;
+        assert!(
+            answered.is_err(),
+            "the guard answered a colliding CREATE, which lets any peer end any circuit on the link"
+        );
+
+        // The circuit the collision named is untouched: it still extends.
+        assert!(
+            client
+                .try_extend_to(fleet.middle.addr, fleet.middle.static_pubkey)
+                .await,
+            "the colliding CREATE ended the circuit it named"
+        );
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// A tampered cell destroys that circuit and nothing else.
+///
+/// Before multiplexing the guard closed the connection, which was the same
+/// thing. It is not any more: a link carries many circuits, so ending the link
+/// over one circuit's AEAD failure would let any client end every circuit
+/// riding beside it. The guard answers with DESTROY for that id instead.
+#[tokio::test]
+async fn tampered_cell_destroys_only_that_circuit() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         ensure_crypto_provider();
         let keydir = tempfile::tempdir().expect("keydir");
@@ -844,15 +1028,33 @@ async fn tampered_cell_tears_down_the_circuit() {
         let cell = Cell::new(CellType::Data, b"tamper".to_vec()).expect("cell");
         let mut wire = client.seal_for_depth(&cell, 1);
         wire[30] ^= 0x01;
-        client.sock.write_all(&wire).await.expect("write");
-        client.sock.flush().await.expect("flush");
+        // Framed correctly: the frame is whole and only the sealed cell inside
+        // it is corrupt, so the teardown is attributable to the AEAD failure
+        // and not to a short read.
+        client.write_frame(&wire).await;
 
-        // The guard closes. Reading must reach EOF rather than a frame.
-        let mut buf = vec![0u8; link_cell_len(CLIENT_LAYERS)];
-        let res = tokio::time::timeout(Duration::from_secs(10), client.sock.read_exact(&mut buf))
+        // What comes back is DESTROY for this circuit, not an answer to the
+        // cell and not an EOF.
+        let mut buf = vec![0u8; link_frame::link_frame_len(CLIENT_LAYERS)];
+        tokio::time::timeout(Duration::from_secs(10), client.sock.read_exact(&mut buf))
             .await
-            .expect("relay neither replied nor closed");
-        assert!(res.is_err(), "the relay answered a tampered cell");
+            .expect("the guard neither destroyed the circuit nor closed")
+            .expect("read destroy");
+        let back =
+            link_frame::decode(&buf, CLIENT_LAYERS, LinkRole::Responder).expect("decode destroy");
+        assert_eq!(back.circ_id, client.circ_id);
+        assert_eq!(
+            back.command,
+            link_frame::LinkCommand::Destroy,
+            "a tampered cell must destroy the circuit, not be answered"
+        );
+        let reason =
+            link_frame::payload(back.body, link_frame::DESTROY_BODY_LEN).expect("destroy body");
+        assert_eq!(
+            reason[0],
+            DestroyReason::Protocol as u8,
+            "an AEAD failure is a protocol violation"
+        );
     })
     .await
     .expect("test timed out");
@@ -918,6 +1120,117 @@ async fn replayed_cell_tears_down_the_circuit() {
     .expect("test timed out");
 }
 
+/// Two circuits riding one link do not mix.
+///
+/// This is the claim multiplexing adds and the previous shape could not make:
+/// one connection, two circuit ids, both in flight at the same time. Both
+/// EXTENDs are written before either reply is read, so the guard holds two
+/// half-built circuits at once and has to keep them apart.
+///
+/// A mix-up is caught twice over. The id on the returning frame must be the
+/// one that asked, and the body must decrypt under that circuit's own
+/// transport, which a swap fails in the AEAD rather than merely looking odd.
+#[tokio::test]
+async fn two_circuits_on_one_link_do_not_mix() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        ensure_crypto_provider();
+        let keydir = tempfile::tempdir().expect("keydir");
+        let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let pki = make_pki();
+        let server_config = make_server_config(&pki);
+        let connector = Arc::new(make_connector(&pki));
+        let over = default_override();
+        let fleet = spawn_fleet(
+            &auth_priv,
+            &over,
+            server_config,
+            connector.clone(),
+            keydir.path(),
+        )
+        .await;
+
+        // One socket, one PROTO_CLIENT byte, two circuits. Each CREATE carries
+        // its own token, because one token buys one circuit.
+        let mut sock = tls_connect(&connector, fleet.guard.addr).await;
+        sock.write_all(&[super::PROTO_CLIENT]).await.expect("proto");
+
+        let id_a = CircId::new(0x8000_0010).expect("a nonzero id");
+        let id_b = CircId::new(0x8000_0011).expect("a nonzero id");
+        let mut tx_a =
+            MockClient::create_on(&mut sock, &fleet.guard, &auth_priv, [0xC1; 32], id_a).await;
+        let mut tx_b =
+            MockClient::create_on(&mut sock, &fleet.guard, &auth_priv, [0xC2; 32], id_b).await;
+
+        // Both EXTENDs out before either reply is read.
+        let mut pending = HashMap::new();
+        for (id, tx) in [(id_a, &mut tx_a), (id_b, &mut tx_b)] {
+            let (init, msg1) =
+                Initiator::start(&fleet.middle.static_pubkey).expect("nk start");
+            let extend = ExtendForward {
+                next_hop: fleet.middle.addr,
+                noise_msg1: msg1,
+            };
+            let cell = Cell::new(CellType::Extend, extend.encode()).expect("extend cell");
+            let wire = seal_to_me(tx, &cell, CLIENT_LAYERS).expect("seal extend");
+            let frame =
+                link_frame::encode(CLIENT_LAYERS, id, link_frame::LinkCommand::Data, &wire)
+                    .expect("encode extend");
+            sock.write_all(&frame).await.expect("write extend");
+            pending.insert(id, init);
+        }
+        sock.flush().await.expect("flush");
+
+        // Two replies, in whatever order the guard finishes the two dials.
+        let mut answered = Vec::new();
+        for _ in 0..2 {
+            let mut buf = vec![0u8; link_frame::link_frame_len(CLIENT_LAYERS)];
+            tokio::time::timeout(Duration::from_secs(20), sock.read_exact(&mut buf))
+                .await
+                .expect("the guard answered only one of the two circuits")
+                .expect("read reply");
+            let back = link_frame::decode(&buf, CLIENT_LAYERS, LinkRole::Responder)
+                .expect("decode reply");
+            assert_eq!(
+                back.command,
+                link_frame::LinkCommand::Data,
+                "circuit {:#010x} was destroyed instead of extended",
+                back.circ_id.raw()
+            );
+            let init = pending
+                .remove(&back.circ_id)
+                .unwrap_or_else(|| panic!("a reply for {:#010x}, which never asked, or a second reply for one that already did", back.circ_id.raw()));
+
+            // Peel under this circuit's own transport, not the other one's.
+            let tx = if back.circ_id == id_a {
+                &mut tx_a
+            } else {
+                &mut tx_b
+            };
+            let peeled = peel(tx, back.body, CLIENT_LAYERS).expect("peel under its own transport");
+            let Peeled::ToMe(cell) = peeled else {
+                panic!("the guard forwarded a reply it should have addressed to the client");
+            };
+            assert_eq!(cell.cell_type, CellType::Extend);
+            let msg2 = parse_extend_backward(&cell.payload).expect("parse msg2");
+            init.finish(&msg2).expect("the middle completed this circuit's handshake");
+            answered.push(back.circ_id);
+        }
+
+        answered.sort_by_key(|c| c.raw());
+        assert_eq!(
+            answered,
+            vec![id_a, id_b],
+            "both circuits on the link must be answered, each on its own id"
+        );
+        assert!(
+            pending.is_empty(),
+            "a circuit was left unanswered on a link that served the other"
+        );
+    })
+    .await
+    .expect("test timed out");
+}
+
 /// A wrong-size frame desynchronises framing and tears the circuit down.
 #[tokio::test]
 async fn wrong_size_cell_tears_down_the_circuit() {
@@ -942,17 +1255,24 @@ async fn wrong_size_cell_tears_down_the_circuit() {
         let cell = Cell::new(CellType::Data, b"short".to_vec()).expect("cell");
         let wire = client.seal_for_depth(&cell, 1);
 
-        // One byte short of a cell, then close the write half. The guard is
-        // blocked in read_exact for a full cell and must never process this.
+        // One byte short of a frame, then close the write half. The guard is
+        // blocked waiting for a whole frame and must never process this.
+        let frame = link_frame::encode(
+            CLIENT_LAYERS,
+            client.circ_id,
+            link_frame::LinkCommand::Data,
+            &wire,
+        )
+        .expect("encode frame");
         client
             .sock
-            .write_all(&wire[..wire.len() - 1])
+            .write_all(&frame[..frame.len() - 1])
             .await
             .expect("write short");
         client.sock.flush().await.expect("flush");
         client.sock.shutdown().await.ok();
 
-        let mut buf = vec![0u8; link_cell_len(CLIENT_LAYERS)];
+        let mut buf = vec![0u8; link_frame::link_frame_len(CLIENT_LAYERS)];
         let res = tokio::time::timeout(Duration::from_secs(10), client.sock.read_exact(&mut buf))
             .await
             .expect("relay neither replied nor closed");
@@ -1018,109 +1338,6 @@ async fn run_data_test() {
         .expect("no DATA came back");
     assert_eq!(back.cell_type, CellType::Data);
     assert_eq!(back.payload, payload, "echo did not round trip");
-}
-
-/// A relay link carries exactly one circuit, so a second CIRCUIT_START after a
-/// finished circuit is not served and the link is closed (DECISIONS 15).
-///
-/// The control is the first circuit in the same test: it completes its
-/// handshake on the same link, so a failure to serve the second one cannot be
-/// explained by the relay refusing circuits in general.
-#[tokio::test]
-async fn a_second_circuit_start_on_a_finished_link_is_not_served() {
-    tokio::time::timeout(TEST_TIMEOUT, run_one_circuit_per_link_test())
-        .await
-        .expect("test timed out");
-}
-
-async fn run_one_circuit_per_link_test() {
-    ensure_crypto_provider();
-    let keydir = tempfile::tempdir().expect("keydir");
-    let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
-    let pki = make_pki();
-    let server_config = make_server_config(&pki);
-    let connector = Arc::new(make_connector(&pki));
-    let over = default_override();
-
-    let registry = RegistryHandle::new();
-    let exit = spawn_relay(
-        Role::Exit,
-        &auth_priv,
-        &over,
-        registry.clone(),
-        server_config,
-        connector.clone(),
-        keydir.path(),
-    )
-    .await;
-    // This test opens the relay link itself, so the registry must list a middle
-    // at the address it dials from, which is loopback.
-    let (after, fresh, until) = current_window();
-    registry.publish(Arc::new(document_from(
-        &[
-            (
-                "middle",
-                "127.0.0.1:1".parse().unwrap(),
-                [0u8; STATIC_KEY_LEN],
-            ),
-            ("exit", exit.addr, exit.static_pubkey),
-        ],
-        &after,
-        &fresh,
-        &until,
-    )));
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let frame_len = link_cell_len(1);
-    let mut sock = tls_connect(&connector, exit.addr).await;
-    sock.write_all(&[super::PROTO_RELAY]).await.expect("proto");
-
-    // Control: the first circuit on this link completes its handshake.
-    let (init1, msg1) = Initiator::start(&exit.static_pubkey).expect("nk start");
-    sock.write_all(&[super::CIRCUIT_START])
-        .await
-        .expect("start");
-    sock.write_all(&msg1).await.expect("msg1");
-    sock.flush().await.expect("flush");
-    let mut msg2 = [0u8; NOISE_MSG_LEN];
-    sock.read_exact(&mut msg2)
-        .await
-        .expect("the first circuit must be served");
-    let mut tx1 = init1.finish(&msg2).expect("nk finish");
-
-    // End the first circuit cleanly.
-    let close = Cell::new(CellType::CloseRequest, Vec::new()).expect("close cell");
-    let close_wire = seal_to_me(&mut tx1, &close, 1).expect("seal close");
-    sock.write_all(&close_wire).await.expect("close request");
-    sock.flush().await.expect("flush");
-
-    let mut ack = vec![0u8; frame_len];
-    sock.read_exact(&mut ack).await.expect("close ack");
-    match peel(&mut tx1, &ack, 1).expect("peel ack") {
-        Peeled::ToMe(c) => assert_eq!(c.cell_type, CellType::CloseAck, "expected CLOSE_ACK"),
-        Peeled::Forward(_) => panic!("FORWARD at the innermost layer"),
-    }
-
-    // A second CIRCUIT_START must not be served. The relay has closed the link,
-    // so either the write fails or the read reaches EOF. What must not happen is
-    // a usable handshake reply.
-    let (init2, msg1_b) = Initiator::start(&exit.static_pubkey).expect("nk start 2");
-    let _ = sock.write_all(&[super::CIRCUIT_START]).await;
-    let _ = sock.write_all(&msg1_b).await;
-    let _ = sock.flush().await;
-
-    let mut msg2_b = [0u8; NOISE_MSG_LEN];
-    let outcome = tokio::time::timeout(Duration::from_secs(10), sock.read_exact(&mut msg2_b)).await;
-    match outcome {
-        Err(_) => {}
-        Ok(Err(_)) => {}
-        Ok(Ok(_)) => {
-            assert!(
-                init2.finish(&msg2_b).is_err(),
-                "a second circuit was served on a link that had already finished one"
-            );
-        }
-    }
 }
 
 /// A TCP proxy that forwards both directions in 1 to 7 byte writes, yielding
@@ -1286,18 +1503,21 @@ async fn run_adverse_delivery_test() {
     let guard_hop = SpawnedRelay {
         addr: guard_via,
         static_pubkey: guard.static_pubkey,
+        role: Role::Guard,
     };
     let mut client = MockClient::connect(&connector, &guard_hop, &auth_priv).await;
     client
         .extend_to(&SpawnedRelay {
             addr: middle_via,
             static_pubkey: middle.static_pubkey,
+            role: Role::Middle,
         })
         .await;
     client
         .extend_to(&SpawnedRelay {
             addr: exit_via,
             static_pubkey: exit.static_pubkey,
+            role: Role::Exit,
         })
         .await;
 
@@ -1349,7 +1569,7 @@ async fn run_adverse_delivery_test() {
     for (i, n) in client.observed.iter().enumerate() {
         assert_eq!(
             *n,
-            link_cell_len(CLIENT_LAYERS),
+            link_frame::link_frame_len(CLIENT_LAYERS),
             "frame {i} on the client-guard link was {n} bytes"
         );
     }
@@ -1562,21 +1782,47 @@ async fn inbound_is_refused_from_an_unlisted_peer() {
 
 /// Open a relay link and report whether the hop completed its handshake.
 async fn relay_link_is_served(connector: &TlsConnector, target: &SpawnedRelay) -> bool {
+    let layers = relay_link_layers(target.role);
     let mut sock = tls_connect(connector, target.addr).await;
     if sock.write_all(&[super::PROTO_RELAY]).await.is_err() {
         return false;
     }
     let (init, msg1) = Initiator::start(&target.static_pubkey).expect("nk start");
-    if sock.write_all(&[super::CIRCUIT_START]).await.is_err()
-        || sock.write_all(&msg1).await.is_err()
-        || sock.flush().await.is_err()
-    {
+    // A relay link CREATE carries the handshake alone: no token appears here.
+    let circ_id = CircId::new(0x8000_00f1).expect("nonzero");
+    let Ok(create) = link_frame::encode(layers, circ_id, link_frame::LinkCommand::Create, &msg1)
+    else {
+        return false;
+    };
+    if sock.write_all(&create).await.is_err() || sock.flush().await.is_err() {
         return false;
     }
+    let mut buf = vec![0u8; link_frame::link_frame_len(layers)];
+    match tokio::time::timeout(Duration::from_secs(10), sock.read_exact(&mut buf)).await {
+        Ok(Ok(_)) => {}
+        _ => return false,
+    }
+    let Ok(back) = link_frame::decode(&buf, layers, LinkRole::Responder) else {
+        return false;
+    };
+    if back.command != link_frame::LinkCommand::Created || back.circ_id != circ_id {
+        return false;
+    }
+    let Ok(msg2_bytes) = link_frame::payload(back.body, NOISE_MSG_LEN) else {
+        return false;
+    };
     let mut msg2 = [0u8; NOISE_MSG_LEN];
-    match tokio::time::timeout(Duration::from_secs(10), sock.read_exact(&mut msg2)).await {
-        Ok(Ok(_)) => init.finish(&msg2).is_ok(),
-        _ => false,
+    msg2.copy_from_slice(msg2_bytes);
+    init.finish(&msg2).is_ok()
+}
+
+/// Layers on the inbound link of a relay in this role, which fixes its frame
+/// size: a middle sees two and an exit one.
+fn relay_link_layers(role: Role) -> usize {
+    match role {
+        Role::Guard => 3,
+        Role::Middle => 2,
+        Role::Exit => 1,
     }
 }
 

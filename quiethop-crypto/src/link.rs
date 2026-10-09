@@ -97,6 +97,17 @@ impl TryFrom<u8> for LinkCommand {
 
 /// Why a circuit was destroyed. Carried in the DESTROY body for operators and
 /// logs; no behaviour depends on it, so an unknown value is not an error.
+///
+/// A reason is never propagated. tor-spec: "Reasons in DESTROY cell SHOULD NOT
+/// be propagated downward or upward, due to potential side channel risk", and
+/// "An OR receiving a DESTROY command should use the DESTROYED reason for its
+/// next cell." So a DESTROY forwarded on from one received carries
+/// [`DestroyReason::Destroyed`], while a DESTROY a relay originates itself
+/// carries the reason it chose.
+///
+/// There is deliberately no way to parse a reason off the wire. Forwarding uses
+/// `Destroyed` unconditionally, so with no parser there is no path by which a
+/// received reason could reach a sent one (SECURITY_MODEL 6.3).
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DestroyReason {
@@ -106,6 +117,8 @@ pub enum DestroyReason {
     LinkLost = 0x03,
     FlowControl = 0x04,
     Internal = 0x05,
+    /// The only reason a forwarded DESTROY ever carries.
+    Destroyed = 0x06,
 }
 
 /// A frame read off a link. `body` is the whole padded body; what counts as
@@ -294,6 +307,19 @@ mod tests {
         assert_eq!(body, 564);
         assert!(CREATE_CLIENT_BODY_LEN < body);
         assert_eq!(body - CREATE_CLIENT_BODY_LEN, 228);
+    }
+
+    /// The wire values are fixed, and Destroyed is the one a forwarded DESTROY
+    /// carries. Asserted as literals so a reordering of the enum is visible.
+    #[test]
+    fn destroy_reasons_have_fixed_wire_values() {
+        assert_eq!(DestroyReason::Requested as u8, 0x00);
+        assert_eq!(DestroyReason::Protocol as u8, 0x01);
+        assert_eq!(DestroyReason::Resource as u8, 0x02);
+        assert_eq!(DestroyReason::LinkLost as u8, 0x03);
+        assert_eq!(DestroyReason::FlowControl as u8, 0x04);
+        assert_eq!(DestroyReason::Internal as u8, 0x05);
+        assert_eq!(DestroyReason::Destroyed as u8, 0x06);
     }
 
     #[test]

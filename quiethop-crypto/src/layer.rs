@@ -118,10 +118,11 @@ impl<R: tokio::io::AsyncRead + Unpin> FrameReader<R> {
             // Read only as far as the end of the frame being assembled.
             // Sizing this to the whole scratch buffer would let one read take
             // the rest of the frame plus the bytes after it, and those bytes
-            // would then be dropped along with this reader. On a relay's
-            // inbound link they are the next circuit's CIRCUIT_START and
-            // handshake message. `pending` is below frame_len here, because a
-            // full frame was already drained above, so room is at least 1.
+            // would then be dropped along with this reader. On a multiplexed
+            // link they are the start of another circuit's frame, and losing
+            // them would misalign every frame after it. `pending` is below
+            // frame_len here, because a full frame was already drained above,
+            // so room is at least 1.
             let room = self.scratch.len() - self.acc.pending();
             let n = self.inner.read(&mut self.scratch[..room]).await?;
             if n == 0 {
@@ -602,8 +603,8 @@ mod cancel_safety {
     /// With a partial frame buffered, a read sized to the whole scratch buffer
     /// can take the rest of the frame plus the bytes that follow it. Those
     /// trailing bytes then live inside the reader, and anything that drops the
-    /// reader drops them. On a relay's inbound link the bytes after a cell are
-    /// the next circuit's CIRCUIT_START and handshake message.
+    /// reader drops them. On a multiplexed link the bytes after a frame are the
+    /// start of another circuit's frame.
     #[tokio::test]
     async fn next_frame_never_reads_past_the_frame_it_returns() {
         let (mut tx, rx) = tokio::io::duplex(1024);

@@ -73,11 +73,87 @@ fn tokens_rejected() -> &'static IntCounterVec {
     })
 }
 
+static FRAMES_DROPPED: OnceLock<IntCounterVec> = OnceLock::new();
+
+/// Link frames dropped without being delivered, labelled by why.
+///
+/// A dropped frame is routine rather than alarming: a DESTROY this relay sent
+/// and a DATA the peer already had in flight cross on the wire, and on a link
+/// carrying many circuits that must not be fatal. The counter is what keeps the
+/// drop visible instead of silent (ARCHITECTURE 5.5).
+fn frames_dropped() -> &'static IntCounterVec {
+    FRAMES_DROPPED.get_or_init(|| {
+        let opts = Opts::new(
+            "quiethop_link_frames_dropped_total",
+            "Link frames dropped since startup, labelled by reason",
+        );
+        let c = IntCounterVec::new(opts, &["reason"])
+            .expect("static counter vec name and labels are valid");
+        registry()
+            .register(Box::new(c.clone()))
+            .expect("static counter vec registration is unique");
+        for r in [
+            "not_open",
+            "before_created",
+            "create_collision",
+            "create_quarantined",
+            "link_full",
+            "queue_full",
+        ] {
+            c.with_label_values(&[r]);
+        }
+        c
+    })
+}
+
+/// Reasons a frame was dropped. One per rule in ARCHITECTURE 5.5, so a reader
+/// of /metrics can tell a routine crossing from a peer exceeding its window.
+#[derive(Debug, Clone, Copy)]
+pub enum DropReason {
+    /// The circuit id is not open on this link.
+    NotOpen,
+    /// DATA on a circuit still awaiting CREATED.
+    BeforeCreated,
+    /// A CREATE naming an id already open.
+    CreateCollision,
+    /// A CREATE naming an id still in quarantine.
+    CreateQuarantined,
+    /// A CREATE beyond MAX_CIRCUITS_PER_LINK.
+    LinkFull,
+    /// The circuit is at MAX_CIRCUIT_QUEUE, so the peer exceeded its window.
+    QueueFull,
+    /// The link is at MAX_CONTROL_QUEUE, so a DESTROY went unsent.
+    ControlQueueFull,
+}
+
+pub fn record_frame_dropped(reason: DropReason) {
+    let label = match reason {
+        DropReason::NotOpen => "not_open",
+        DropReason::BeforeCreated => "before_created",
+        DropReason::CreateCollision => "create_collision",
+        DropReason::CreateQuarantined => "create_quarantined",
+        DropReason::LinkFull => "link_full",
+        DropReason::QueueFull => "queue_full",
+        DropReason::ControlQueueFull => "control_queue_full",
+    };
+    frames_dropped().with_label_values(&[label]).inc();
+}
+
 /// Eager registration of all metric families. Called once at startup so
 /// the /metrics endpoint always returns a populated payload, even before
 /// the first connection arrives.
+/// Current value of the dropped-frame counter for one reason label.
+///
+/// Test only. A dropped DESTROY is allowed to be lost but not to be lost
+/// quietly, and that is only true if something reads this back.
+#[cfg(test)]
+pub fn dropped_count(reason: &str) -> u64 {
+    frames_dropped().with_label_values(&[reason]).get()
+}
+
 pub fn init() {
     let _ = tokens_verified();
+    let _ = frames_dropped();
     let _ = tokens_rejected();
 }
 
