@@ -127,6 +127,8 @@ pub enum DropReason {
     /// A peer DESTROY arrived for a circuit whose task had already ended, so
     /// the signal had no receiver left.
     DestroySignalLost,
+    /// A socket write made no progress inside CELL_WRITE_TIMEOUT.
+    WriteTimeout,
 }
 
 pub fn record_frame_dropped(reason: DropReason) {
@@ -139,6 +141,7 @@ pub fn record_frame_dropped(reason: DropReason) {
         DropReason::QueueFull => "queue_full",
         DropReason::ControlQueueFull => "control_queue_full",
         DropReason::DestroySignalLost => "destroy_signal_lost",
+        DropReason::WriteTimeout => "write_timeout",
     };
     frames_dropped().with_label_values(&[label]).inc();
 }

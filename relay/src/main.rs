@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
 use tokio::sync::{mpsc, watch, Notify};
@@ -51,6 +51,14 @@ const PRESENTATION_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CELL_READ_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long one socket write or flush may make no progress.
+///
+/// The same 120 seconds as CELL_READ_TIMEOUT, because both answer whether the
+/// peer is still there, one from each direction. A second constant tuned
+/// separately would have nothing to be tuned against. A 569 byte frame that has
+/// made no progress for two minutes, on a connection whose peer is still
+/// sending, is not a slow peer (docs/DECISIONS.md entry 26).
+const CELL_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 // Read in whole cells. 32 payloads per read keeps the syscall count near the
 // old 16 KiB buffer while every cell on the wire stays CELL_PAYLOAD_LEN.
 const DEST_READ_BUF: usize = cell::CELL_PAYLOAD_LEN * 32;
@@ -463,6 +471,8 @@ enum HandleError {
     DestroyedByPeer,
     #[error("the next hop destroyed this circuit")]
     DestroyedByNextHop,
+    #[error("a socket write made no progress inside CELL_WRITE_TIMEOUT")]
+    WriteTimeout,
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("read timeout")]
@@ -797,23 +807,38 @@ async fn run_link(
 ///
 /// One frame per circuit per turn, so a circuit with a large backlog cannot
 /// hold the link while others wait.
-async fn run_link_writer(shared: Arc<LinkShared>, mut w: WriteHalf<InboundStream>) {
+async fn run_link_writer<W: AsyncWrite + Unpin>(shared: Arc<LinkShared>, mut w: W) {
     loop {
         let mut wrote = false;
         // The lock is taken and released once per frame, never across the write.
         while let Some(frame) = shared.pop_next_out() {
-            if w.write_all(&frame).await.is_err() {
-                return;
+            match tokio::time::timeout(CELL_WRITE_TIMEOUT, w.write_all(&frame)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return,
+                Err(_) => return stalled_write(&shared),
             }
             wrote = true;
         }
-        if wrote && w.flush().await.is_err() {
-            return;
+        if wrote {
+            match tokio::time::timeout(CELL_WRITE_TIMEOUT, w.flush()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return,
+                Err(_) => return stalled_write(&shared),
+            }
         }
         // A notify_one between the drain and here leaves a permit, so a frame
         // queued in that window is not missed.
         shared.wake.notified().await;
     }
+}
+
+/// A write that made no progress for CELL_WRITE_TIMEOUT. The peer is not
+/// reading, so the link ends the same way a full control queue ends it: the
+/// reader owns the teardown and releases every circuit.
+fn stalled_write(shared: &Arc<LinkShared>) {
+    metrics::record_frame_dropped(metrics::DropReason::WriteTimeout);
+    warn!("a link write made no progress inside the write timeout, closing the link");
+    shared.request_close();
 }
 
 /// Act on one inbound link frame.
@@ -1114,8 +1139,11 @@ async fn run_circuit(
                         let out = out_layers.ok_or(HandleError::ForwardWithoutNextLink(role))?;
                         let framed =
                             link_frame::encode(out, nl.circ_id, link_frame::LinkCommand::Data, &blob)?;
-                        nl.write.write_all(&framed).await?;
-                        nl.write.flush().await?;
+                        // A stalled next hop ends this circuit and nothing
+                        // else. request_close here would take down the inbound
+                        // link and every other circuit riding it, for a hop
+                        // only this circuit uses.
+                        write_with_timeout(&mut nl.write, &framed).await?;
                     }
                     layer::Peeled::ToMe(cell) => match (cell.cell_type, role) {
                         (CellType::Extend, Role::Guard) | (CellType::Extend, Role::Middle) => {
@@ -1310,6 +1338,8 @@ async fn run_circuit(
             DestroyReason::Protocol
         }
         Err(HandleError::IllegalCellForRole(_, _)) => DestroyReason::Protocol,
+        // The next hop stopped reading, which is a link loss toward it.
+        Err(HandleError::WriteTimeout) => DestroyReason::LinkLost,
         Err(HandleError::PeerClosed) => DestroyReason::Requested,
         // Both are returned above, before a reason is chosen here.
         Err(HandleError::DestroyedByPeer) | Err(HandleError::DestroyedByNextHop) => {
@@ -1335,6 +1365,26 @@ fn queue_or_end(
     shared.push_out(id, frame)
 }
 
+/// Write one frame to the next hop, bounded by CELL_WRITE_TIMEOUT.
+async fn write_with_timeout<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    frame: &[u8],
+) -> Result<(), HandleError> {
+    match tokio::time::timeout(CELL_WRITE_TIMEOUT, async {
+        w.write_all(frame).await?;
+        w.flush().await
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(HandleError::Io(e)),
+        Err(_) => {
+            metrics::record_frame_dropped(metrics::DropReason::WriteTimeout);
+            Err(HandleError::WriteTimeout)
+        }
+    }
+}
+
 /// Forward DESTROY to the next hop, always with DESTROYED.
 ///
 /// tor-spec: "Reasons in DESTROY cell SHOULD NOT be propagated downward or
@@ -1350,8 +1400,9 @@ async fn forward_destroy(next_link: &mut Option<NextLinkState>, out_layers: Opti
         link_frame::LinkCommand::Destroy,
         &[DestroyReason::Destroyed as u8],
     ) {
-        let _ = nl.write.write_all(&frame).await;
-        let _ = nl.write.flush().await;
+        // Best effort, and bounded: a hop that has stopped reading must not
+        // hold this task open while it winds up.
+        let _ = write_with_timeout(&mut nl.write, &frame).await;
     }
     drop(next_link.take());
 }
@@ -1418,8 +1469,7 @@ async fn open_next_link(
         link_frame::LinkCommand::Create,
         &extend.noise_msg1,
     )?;
-    write.write_all(&create).await?;
-    write.flush().await?;
+    write_with_timeout(&mut write, &create).await?;
 
     let mut reader = layer::FrameReader::new(read, link_frame::link_frame_len(frame_layers));
     let wire = match tokio::time::timeout(HANDSHAKE_READ_TIMEOUT, reader.next_frame()).await {
@@ -1684,6 +1734,171 @@ mod tests {
         assert_eq!(shared.pop_next_out(), Some(vec![b'c']));
         assert_eq!(shared.pop_next_out(), Some(vec![b'd']));
         assert_eq!(shared.pop_next_out(), None);
+    }
+
+    use std::future::Future;
+
+    /// A writer that never takes a byte, which is what a peer that has stopped
+    /// reading looks like from here.
+    struct StalledWriter;
+
+    impl tokio::io::AsyncWrite for StalledWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Pending
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Pending
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A writer that takes the bytes once a delay has passed, so the test can
+    /// put the delay either side of the deadline.
+    struct SlowWriter {
+        delay: std::pin::Pin<Box<tokio::time::Sleep>>,
+        ready: bool,
+    }
+
+    impl SlowWriter {
+        fn after(d: Duration) -> Self {
+            Self {
+                delay: Box::pin(tokio::time::sleep(d)),
+                ready: false,
+            }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for SlowWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if !self.ready {
+                match self.delay.as_mut().poll(cx) {
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                    std::task::Poll::Ready(()) => self.ready = true,
+                }
+            }
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A write that makes no progress closes the link once the deadline passes.
+    ///
+    /// Time is paused, so the 120 seconds are accounted and not waited for.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_that_never_progresses_closes_the_link() {
+        let shared = Arc::new(LinkShared::new(LinkRole::Responder));
+        assert!(shared.push_control(vec![0xAA; 8]));
+        assert!(!shared.closing(), "nothing has stalled yet");
+
+        // The budget is the assertion, not a hang: without the write timeout
+        // run_link_writer never returns, and this reports that as a failure
+        // rather than stopping the suite.
+        let ended = tokio::time::timeout(
+            CELL_WRITE_TIMEOUT * 3,
+            run_link_writer(shared.clone(), StalledWriter),
+        )
+        .await;
+
+        assert!(
+            ended.is_ok(),
+            "the writer never gave up on a write that made no progress"
+        );
+        assert!(
+            shared.closing(),
+            "a write that never progressed left the link open"
+        );
+    }
+
+    /// The outbound helper gives up on a write that makes no progress.
+    ///
+    /// This covers the next hop direction, where the two link writer tests
+    /// above cannot reach: a stalled next hop ends the circuit rather than the
+    /// inbound link, so there is no `closing` flag to observe. Both outbound
+    /// write sites go through this helper and nothing writes to a next hop
+    /// without it, which `no_outbound_write_bypasses_the_timeout` holds.
+    #[tokio::test(start_paused = true)]
+    async fn the_outbound_write_helper_gives_up_on_a_stalled_hop() {
+        let mut w = StalledWriter;
+        let ended = tokio::time::timeout(
+            CELL_WRITE_TIMEOUT * 3,
+            write_with_timeout(&mut w, &[0u8; 8]),
+        )
+        .await
+        .expect("the helper never gave up on a stalled write");
+
+        assert!(
+            matches!(ended, Err(HandleError::WriteTimeout)),
+            "a stalled outbound write produced {ended:?} rather than WriteTimeout"
+        );
+    }
+
+    /// Nothing writes to a next hop except through the bounded helper.
+    ///
+    /// The helper having a timeout says nothing about whether the write paths
+    /// call it, so the two are checked separately. This reads the source rather
+    /// than the behaviour, which is the only way to see a site that is absent.
+    #[test]
+    fn no_outbound_write_bypasses_the_timeout() {
+        let src = include_str!("main.rs");
+        // Split so the needle never appears whole in this file, or the check
+        // matches its own source and reports itself.
+        let needle = ["write.write", "_all"].concat();
+        let guard = ["write_with", "_timeout"].concat();
+        let offenders: Vec<&str> = src
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.starts_with("//"))
+            .filter(|l| l.contains(&needle) && !l.contains(&guard))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these write to a next hop without the timeout: {offenders:?}"
+        );
+    }
+
+    /// A write that lands one second inside the deadline does not close it.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_that_lands_inside_the_deadline_does_not_close_the_link() {
+        let shared = Arc::new(LinkShared::new(LinkRole::Responder));
+        assert!(shared.push_control(vec![0xBB; 8]));
+
+        let w = SlowWriter::after(CELL_WRITE_TIMEOUT - Duration::from_secs(1));
+        // The writer parks on its queue once the frame is out, so the only way
+        // out of run_link_writer here is this budget expiring.
+        let _ =
+            tokio::time::timeout(CELL_WRITE_TIMEOUT * 3, run_link_writer(shared.clone(), w)).await;
+
+        assert!(
+            !shared.closing(),
+            "a write that completed inside the deadline closed the link"
+        );
     }
 
     /// A completed Noise session, so a circuit can occupy a table slot without

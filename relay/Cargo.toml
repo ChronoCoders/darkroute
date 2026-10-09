@@ -30,3 +30,6 @@ futures-util = { workspace = true }
 rcgen = "0.13"
 rand_core = { workspace = true }
 tempfile = "3"
+# test-util alone, for paused time in the write timeout tests. A dev dependency
+# so the shipped binary cannot pause its own clock.
+tokio = { workspace = true, features = ["test-util"] }
