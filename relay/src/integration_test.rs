@@ -1263,9 +1263,14 @@ async fn tampered_cell_destroys_only_that_circuit() {
     .expect("test timed out");
 }
 
-/// A replayed cell tears the circuit down: the Noise counter has advanced.
+/// A replayed cell destroys the circuit: the Noise counter has advanced.
+///
+/// The replay is rejected at the middle, which destroys the circuit on its own
+/// link, and the guard turns that into a DESTROY for the client. As with a
+/// tampered cell, the link itself stays up, because other circuits may be
+/// riding it.
 #[tokio::test]
-async fn replayed_cell_tears_down_the_circuit() {
+async fn replayed_cell_destroys_the_circuit() {
     tokio::time::timeout(TEST_TIMEOUT, async {
         ensure_crypto_provider();
         let keydir = tempfile::tempdir().expect("keydir");
@@ -1296,28 +1301,56 @@ async fn replayed_cell_tears_down_the_circuit() {
         };
         let cell = Cell::new(CellType::Extend, extend.encode()).expect("cell");
         let wire = client.seal_for_depth(&cell, 2);
-        client.sock.write_all(&wire).await.expect("first send");
-        client.sock.flush().await.expect("flush");
-        client.sock.write_all(&wire).await.expect("replay");
-        client.sock.flush().await.expect("flush");
+        // Both go out inside link frames. Writing the bare cell would leave the
+        // guard reading 569 bytes across two 564 byte cells, and whether that
+        // decoded at all came down to whether a ciphertext byte happened to be
+        // a valid link command, which made this test fail about one run in 40
+        // and pass the rest for the wrong reason.
+        client.write_frame(&wire).await;
 
-        // The middle rejects the replay, which tears down the whole circuit,
-        // so the client eventually sees the guard close.
-        let mut buf = vec![0u8; link_cell_len(CLIENT_LAYERS)];
-        let mut closed = false;
+        // Control: sent once the very same frame is accepted, and the middle
+        // answers EXTEND backward. Without this the refusal below could be the
+        // frame being bad rather than it being a repeat.
+        let back = client.read_cell().await;
+        assert_eq!(
+            back.cell_type,
+            CellType::Extend,
+            "the first send was not served, so nothing below is about the replay"
+        );
+
+        // Now the byte-identical repeat. Every hop's Noise counter has already
+        // consumed these exact bytes, so the first hop to peel it fails and
+        // destroys the circuit, and what arrives is DESTROY for this id.
+        client.write_frame(&wire).await;
+
+        let mut destroyed = false;
         for _ in 0..3 {
+            let mut buf = vec![0u8; link_frame::link_frame_len(CLIENT_LAYERS)];
             match tokio::time::timeout(Duration::from_secs(10), client.sock.read_exact(&mut buf))
                 .await
             {
+                Ok(Ok(_)) => {
+                    let back = link_frame::decode(&buf, CLIENT_LAYERS, LinkRole::Responder)
+                        .expect("decode frame");
+                    assert_eq!(back.circ_id, client.circ_id);
+                    if back.command == link_frame::LinkCommand::Destroy {
+                        destroyed = true;
+                        break;
+                    }
+                }
+                // An EOF is acceptable too: the circuit is gone either way.
                 Ok(Err(_)) => {
-                    closed = true;
+                    destroyed = true;
                     break;
                 }
-                Ok(Ok(_)) => continue,
                 Err(_) => break,
             }
         }
-        assert!(closed, "the replayed cell did not tear the circuit down");
+        assert!(
+            destroyed,
+            "the replayed cell left the circuit alive: the middle accepted a cell whose \
+             Noise counter had already been used"
+        );
     })
     .await
     .expect("test timed out");
