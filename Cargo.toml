@@ -36,12 +36,25 @@ futures-util = "0.3"
 
 # RSA 2048 bit key generation costs about 20 seconds per key in an unoptimised
 # build, measured on this machine, and the integration tests generate one per
-# test. The rsa 0.9.10 README: "If you encounter unusually slow key generation
-# time while using `RsaPrivateKey::new` you can try to compile in release mode",
-# and "If you don't want to turn on optimizations for all dependencies, you can
-# only optimize the `num-bigint-dig` dependency. This should give most of the
-# speedups." Per-package overrides cannot set panic, lto or rpath, which is why
-# this is opt-level alone.
+# test. With this override it is about 0.23 seconds, which took the serial
+# integration suite from 283.6 seconds to 11.3 seconds.
+#
+# Source: the rsa 0.9.10 README as published on docs.rs, at
+# docs.rs/crate/rsa/0.9.10, which is where both sentences were read. The GitHub
+# master README carries the first but not the second, so checking there will not
+# find the num-bigint-dig advice.
+#
+#   "If you encounter unusually slow key generation time while using
+#    `RsaPrivateKey::new` you can try to compile in release mode"
+#
+#   "If you don't want to turn on optimizations for all dependencies, you can
+#    only optimize the `num-bigint-dig` dependency. This should give most of the
+#    speedups."
+#
+# Per-package overrides cannot set panic, lto or rpath, which is why this is
+# opt-level alone. The test profile inherits dev, which is why this one block
+# covers cargo test as well; that was confirmed by measurement rather than
+# assumed.
 [profile.dev.package.num-bigint-dig]
 opt-level = 3
 
