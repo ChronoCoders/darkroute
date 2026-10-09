@@ -34,6 +34,17 @@ rustls-native-certs = "0.8"
 rustls-pemfile = "2"
 futures-util = "0.3"
 
+# RSA 2048 bit key generation costs about 20 seconds per key in an unoptimised
+# build, measured on this machine, and the integration tests generate one per
+# test. The rsa 0.9.10 README: "If you encounter unusually slow key generation
+# time while using `RsaPrivateKey::new` you can try to compile in release mode",
+# and "If you don't want to turn on optimizations for all dependencies, you can
+# only optimize the `num-bigint-dig` dependency. This should give most of the
+# speedups." Per-package overrides cannot set panic, lto or rpath, which is why
+# this is opt-level alone.
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 lto = true
