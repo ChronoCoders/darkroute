@@ -1600,7 +1600,7 @@ async fn two_backlogged_circuits_on_one_link_both_progress() {
         // one circuit first drains a queue of one frame and looks exactly like
         // one that alternates. Four circuits put about 1.8 MB in flight, which
         // outruns the buffers and leaves a real backlog to choose from.
-        const CIRCUITS: usize = 4;
+        const CIRCUITS: usize = 8;
         let mut client = MultiClient::connect(&connector, &fleet.guard).await;
         for i in 0..CIRCUITS {
             let mut token = [0xA0u8; 32];
@@ -1641,6 +1641,16 @@ async fn two_backlogged_circuits_on_one_link_both_progress() {
         /// The longest a single circuit may hold the writer. Empirical: three
         /// times the worst skew measured under parallel load.
         const MAX_RUN: usize = 200;
+        /// Writer turns across the sends and the reads that must have had more
+        /// than one circuit queued. Measured floor over twelve runs was 1435,
+        /// so this sits about 30 percent under it. A run where no backlog
+        /// formed shows near zero (docs/DECISIONS.md entry 27).
+        const MIN_CONTENDED_TURNS: u64 = 1000;
+        // Sampled here, before the sends. The socket absorbs megabytes, so the
+        // writer pops and orders almost every frame while this client is still
+        // sending; read from after the sends the counter shows zero and the
+        // test looks vacuous when it is not.
+        let contended_before = crate::metrics::writer_turn_count(true);
         let payload = Cell::new(CellType::Data, vec![0x3C; 400]).expect("data cell");
         for _ in 0..PER_CIRCUIT {
             for which in 0..CIRCUITS {
@@ -1676,6 +1686,18 @@ async fn two_backlogged_circuits_on_one_link_both_progress() {
             want,
             "the link stopped delivering before {want} frames: {counts:?}"
         );
+        // The writer has to have had a choice to make, or this proves nothing.
+        // A contended turn is one where the rotation held at least two
+        // circuits, so with one frame queued at a time every writer looks fair
+        // and the bound below is satisfied by a writer that never rotated.
+        let contended = crate::metrics::writer_turn_count(true) - contended_before;
+        assert!(
+            contended >= MIN_CONTENDED_TURNS,
+            "only {contended} of the writer's turns had more than one circuit queued, \
+             under the {MIN_CONTENDED_TURNS} this test needs: no backlog formed, so it \
+             did not measure fairness at all"
+        );
+
         assert!(
             counts.iter().all(|c| *c > 0),
             "a circuit was starved entirely over the window: {counts:?}"

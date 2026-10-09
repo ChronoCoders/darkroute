@@ -1901,6 +1901,111 @@ mod tests {
         );
     }
 
+    /// A writer that takes exactly one frame per tick and records what it took.
+    ///
+    /// The tick is what makes the writer come back for each frame separately,
+    /// as a real socket does, instead of draining the whole queue inside one
+    /// uninterrupted loop. Under a paused clock the ticks cost no wall time.
+    struct OneFramePerTick {
+        taken: Arc<std::sync::Mutex<Vec<u8>>>,
+        gate: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    }
+
+    impl OneFramePerTick {
+        const TICK: Duration = Duration::from_millis(1);
+
+        fn new(taken: Arc<std::sync::Mutex<Vec<u8>>>) -> Self {
+            Self { taken, gate: None }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for OneFramePerTick {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if let Some(gate) = self.gate.as_mut() {
+                match gate.as_mut().poll(cx) {
+                    std::task::Poll::Pending => return std::task::Poll::Pending,
+                    std::task::Poll::Ready(()) => self.gate = None,
+                }
+            }
+            // The first byte of each queued frame is the circuit that owns it,
+            // which is how the service order is read back.
+            self.taken
+                .lock()
+                .expect("recorder mutex")
+                .push(buf.first().copied().unwrap_or(0xFF));
+            self.gate = Some(Box::pin(tokio::time::sleep(Self::TICK)));
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// The writer serves circuits in strict rotation, one frame each per turn.
+    ///
+    /// This is the primary guard for fairness. The end to end test depends on
+    /// socket buffers to build a backlog and on a frame count bound with 1.37
+    /// times margin to a writer that abandons the rotation; this one depends on
+    /// nothing outside the table and the writer, so it fails a drain-one-first
+    /// writer on every run (docs/DECISIONS.md entry 27).
+    #[tokio::test(start_paused = true)]
+    async fn the_writer_serves_circuits_in_strict_rotation() {
+        const CIRCUITS: u8 = 4;
+        const ROTATIONS: usize = 8;
+
+        let shared = Arc::new(LinkShared::new(LinkRole::Responder));
+        let ids: Vec<CircId> = (0..CIRCUITS)
+            .map(|i| CircId::new(0x4000_0100 + i as u32).expect("a nonzero id"))
+            .collect();
+        {
+            let mut st = shared.lock();
+            for id in &ids {
+                st.table
+                    .accept_create(*id, test_transport(), Instant::now())
+                    .expect("room on the link");
+            }
+        }
+
+        // Every queue deep before the writer starts, so every turn it takes is
+        // a turn where it had all four to choose from.
+        for _ in 0..ROTATIONS {
+            for (i, id) in ids.iter().enumerate() {
+                shared
+                    .push_out(*id, vec![i as u8; 4])
+                    .expect("room in the queue");
+            }
+        }
+
+        let taken = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // The writer parks on its queue once drained, so the budget is how this
+        // returns. Paused time means it costs nothing.
+        let _ = tokio::time::timeout(
+            Duration::from_secs(60),
+            run_link_writer(shared.clone(), OneFramePerTick::new(taken.clone())),
+        )
+        .await;
+
+        let order = taken.lock().expect("recorder mutex").clone();
+        let want: Vec<u8> = (0..ROTATIONS).flat_map(|_| 0..CIRCUITS).collect();
+        assert_eq!(
+            order, want,
+            "the writer did not serve the circuits in strict rotation"
+        );
+    }
+
     /// A completed Noise session, so a circuit can occupy a table slot without
     /// a link. Both halves are generated here and the initiator is discarded.
     fn test_transport() -> Transport {

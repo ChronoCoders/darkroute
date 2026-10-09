@@ -330,6 +330,12 @@ impl LinkTable {
     /// large backlog cannot hold the writer while others wait. The id goes to
     /// the back of the rotation if it still has frames.
     pub fn pop_next_out(&mut self) -> Option<(CircId, Vec<u8>)> {
+        // Counted before the pop, because the rotation holds one entry per
+        // circuit with something queued, so its length here is how many
+        // circuits the writer could have chosen between.
+        if !self.rotation.is_empty() {
+            crate::metrics::record_writer_turn(self.rotation.len() > 1);
+        }
         while let Some(id) = self.rotation.pop_front() {
             let Some(c) = self.circuits.get_mut(&id) else {
                 continue;

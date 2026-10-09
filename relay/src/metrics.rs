@@ -74,6 +74,47 @@ fn tokens_rejected() -> &'static IntCounterVec {
 }
 
 static FRAMES_DROPPED: OnceLock<IntCounterVec> = OnceLock::new();
+static WRITER_TURNS: OnceLock<IntCounterVec> = OnceLock::new();
+
+/// Turns the link writer took, split by whether more than one circuit had a
+/// frame waiting at that moment.
+///
+/// A contended turn is one where the rotation held at least two circuits, so
+/// the writer had a real choice of which to serve. It is the only way to tell a
+/// fair writer from a writer that was never tested: with one circuit queued at
+/// a time, every writer looks fair. The fairness test asserts this rose, so a
+/// run where no backlog formed fails rather than passing on nothing
+/// (docs/DECISIONS.md entry 27).
+fn writer_turns() -> &'static IntCounterVec {
+    WRITER_TURNS.get_or_init(|| {
+        let opts = Opts::new(
+            "quiethop_link_writer_turns_total",
+            "Link writer turns since startup, labelled by whether the choice was contended",
+        );
+        let c = IntCounterVec::new(opts, &["contended"])
+            .expect("static counter vec name and labels are valid");
+        registry()
+            .register(Box::new(c.clone()))
+            .expect("static counter vec registration is unique");
+        for v in ["true", "false"] {
+            c.with_label_values(&[v]);
+        }
+        c
+    })
+}
+
+/// One writer turn. `contended` means another circuit also had a frame waiting.
+pub fn record_writer_turn(contended: bool) {
+    let label = if contended { "true" } else { "false" };
+    writer_turns().with_label_values(&[label]).inc();
+}
+
+/// Current value of the writer turn counter. Test only.
+#[cfg(test)]
+pub fn writer_turn_count(contended: bool) -> u64 {
+    let label = if contended { "true" } else { "false" };
+    writer_turns().with_label_values(&[label]).get()
+}
 
 /// Link frames dropped without being delivered, labelled by why.
 ///
