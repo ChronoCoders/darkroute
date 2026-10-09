@@ -36,6 +36,7 @@ use quiethop_crypto::cell::{self, Cell, CellType, ConnectPayload, ExtendForward}
 use quiethop_crypto::circid::{CircId, LinkRole};
 use quiethop_crypto::flow::{AfterDelivery, FlowError};
 use quiethop_crypto::layer;
+use quiethop_crypto::layers::Layers;
 use quiethop_crypto::link::{self as link_frame, DestroyReason};
 use quiethop_crypto::noise::{self, StaticKeypair, Transport, NOISE_MSG_LEN};
 use quiethop_crypto::wire::{M_RAW_LEN, PRESENTATION_LEN, PROTO_CLIENT, PROTO_RELAY};
@@ -566,23 +567,23 @@ async fn handle_relay_connection(
 
 /// How many AEAD layers this role's inbound link carries. The client wraps one
 /// layer per hop, so the guard sees three and the exit one.
-fn inbound_layers(role: Role) -> usize {
+fn inbound_layers(role: Role) -> Layers {
     match role {
-        Role::Guard => 3,
-        Role::Middle => 2,
-        Role::Exit => 1,
+        Role::Guard => Layers::new(3),
+        Role::Middle => Layers::new(2),
+        Role::Exit => Layers::new(1),
     }
 }
 
 /// How many AEAD layers this role's outbound relay link carries, if it has
 /// one. One fewer than inbound, because this role peeled its own.
 ///
-/// A layer count, not a byte count. Both are usize, so passing one where the
-/// other belongs compiles and then writes a frame of the wrong size.
-fn outbound_layers(role: Role) -> Option<usize> {
+/// `Layers` rather than a bare count, so a byte length cannot be passed here
+/// or taken from here (quiethop-crypto `layers`).
+fn outbound_layers(role: Role) -> Option<Layers> {
     match role {
         Role::Exit => None,
-        other => Some(inbound_layers(other) - 1),
+        other => Some(inbound_layers(other).peeled()),
     }
 }
 
@@ -810,7 +811,7 @@ async fn run_link_writer(shared: Arc<LinkShared>, mut w: WriteHalf<InboundStream
 async fn dispatch_frame(
     shared: &Arc<LinkShared>,
     wire: &[u8],
-    layers: usize,
+    layers: Layers,
     peer: SocketAddr,
     role: Role,
     ctx: &ConnCtx,
@@ -900,7 +901,7 @@ async fn open_inbound_circuit(
     shared: &Arc<LinkShared>,
     id: CircId,
     body: &[u8],
-    layers: usize,
+    layers: Layers,
     peer: SocketAddr,
     role: Role,
     ctx: &ConnCtx,
@@ -1001,7 +1002,7 @@ async fn open_inbound_circuit(
 /// both destroy or refuse the circuit immediately afterwards, so a frame left
 /// in the circuit's queue would be discarded with it and the peer would be
 /// told nothing.
-fn send_destroy(shared: &Arc<LinkShared>, id: CircId, layers: usize, reason: DestroyReason) {
+fn send_destroy(shared: &Arc<LinkShared>, id: CircId, layers: Layers, reason: DestroyReason) {
     if let Ok(frame) = link_frame::encode(
         layers,
         id,
@@ -1025,7 +1026,7 @@ fn send_destroy(shared: &Arc<LinkShared>, id: CircId, layers: usize, reason: Des
 }
 
 /// Destroy a circuit this side is ending: tell the peer, end the task.
-fn destroy_circuit(shared: &Arc<LinkShared>, id: CircId, layers: usize, reason: DestroyReason) {
+fn destroy_circuit(shared: &Arc<LinkShared>, id: CircId, layers: Layers, reason: DestroyReason) {
     send_destroy(shared, id, layers, reason);
     shared.forget(id);
 }
@@ -1041,7 +1042,7 @@ async fn run_circuit(
     id: CircId,
     mut transport: Transport,
     mut rx: mpsc::Receiver<ToCircuit>,
-    layers: usize,
+    layers: Layers,
     role: Role,
     ctx: ConnCtx,
 ) -> Result<(), HandleError> {
@@ -1269,7 +1270,7 @@ async fn run_circuit(
 fn queue_or_end(
     shared: &Arc<LinkShared>,
     id: CircId,
-    layers: usize,
+    layers: Layers,
     body: Vec<u8>,
 ) -> Result<(), link::QueueFull> {
     let frame = link_frame::encode(layers, id, link_frame::LinkCommand::Data, &body)
@@ -1282,7 +1283,7 @@ fn queue_or_end(
 /// tor-spec: "Reasons in DESTROY cell SHOULD NOT be propagated downward or
 /// upward, due to potential side channel risk", and "An OR receiving a DESTROY
 /// command should use the DESTROYED reason for its next cell."
-async fn forward_destroy(next_link: &mut Option<NextLinkState>, out_layers: Option<usize>) {
+async fn forward_destroy(next_link: &mut Option<NextLinkState>, out_layers: Option<Layers>) {
     let (Some(nl), Some(out)) = (next_link.as_mut(), out_layers) else {
         return;
     };
@@ -1324,7 +1325,7 @@ async fn open_next_link(
     cfg: &RelayConfig,
     registry: &RegistryHandle,
     connector: &TlsConnector,
-    frame_layers: usize,
+    frame_layers: Layers,
 ) -> Result<NextLinkState, HandleError> {
     // The next hop must be published for the role directly downstream of this
     // one, at exactly this address and port, and its SNI is the name the
@@ -1473,21 +1474,24 @@ mod tests {
         assert_eq!(redact_proxy_url("not a url"), "<unparseable>");
     }
 
-    /// A layer count, never a byte count. Passing the byte count built a
-    /// 9817 byte CREATE out of a 552 byte frame and the hop then waited for
-    /// 9817 bytes back, so the whole circuit hung rather than failing.
+    /// The outbound link carries one layer fewer than the inbound one, because
+    /// this hop peeled its own.
+    ///
+    /// This used to also assert the value was not in byte range, which was the
+    /// best a `usize` allowed. `Layers` makes that unrepresentable, so what is
+    /// left to check is the arithmetic.
     #[test]
-    fn outbound_layers_counts_layers_and_not_bytes() {
-        assert_eq!(outbound_layers(Role::Guard), Some(2));
-        assert_eq!(outbound_layers(Role::Middle), Some(1));
-        assert_eq!(outbound_layers(Role::Exit), None);
+    fn an_outbound_link_carries_one_layer_fewer() {
+        assert_eq!(outbound_layers(Role::Guard), Some(Layers::new(2)));
+        assert_eq!(outbound_layers(Role::Middle), Some(Layers::new(1)));
+        assert_eq!(
+            outbound_layers(Role::Exit),
+            None,
+            "an exit has no next hop to carry layers for"
+        );
         for role in [Role::Guard, Role::Middle] {
-            let n = outbound_layers(role).expect("a relay role has a next hop");
-            assert_eq!(n, inbound_layers(role) - 1);
-            assert!(
-                n < cell::link_cell_len(0),
-                "{role} outbound value {n} is in byte range, so it is a length and not a count"
-            );
+            let out = outbound_layers(role).expect("a relay role has a next hop");
+            assert_eq!(out, inbound_layers(role).peeled());
         }
     }
 
@@ -1535,7 +1539,7 @@ mod tests {
             assert!(shared.push_control(vec![i as u8]));
         }
         let before = metrics::dropped_count("control_queue_full");
-        send_destroy(&shared, id, 3, DestroyReason::Protocol);
+        send_destroy(&shared, id, Layers::new(3), DestroyReason::Protocol);
 
         assert!(
             shared.closing(),

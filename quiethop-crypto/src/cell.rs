@@ -14,6 +14,7 @@
 //!
 //! Link sizes come from [`link_cell_len`] and are never written as literals.
 
+use crate::layers::Layers;
 use std::convert::TryFrom;
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
@@ -38,18 +39,18 @@ pub const CELL_PLAINTEXT_LEN: usize = CELL_HEADER_LEN + CELL_PAYLOAD_LEN;
 /// Each hop adds one disposition byte and one AEAD tag, so the client-guard
 /// link (3 layers) is the widest and the middle-exit link (1 layer) the
 /// narrowest. Each link carries this constant in both directions.
-pub const fn link_cell_len(layers: usize) -> usize {
-    CELL_PLAINTEXT_LEN + layers * (DISPOSITION_LEN + NOISE_TAG_LEN)
+pub const fn link_cell_len(layers: Layers) -> usize {
+    CELL_PLAINTEXT_LEN + layers.get() * (DISPOSITION_LEN + NOISE_TAG_LEN)
 }
 
 /// Bytes a relay peels to, one layer in: disposition plus the inner body.
-pub const fn peeled_len(layers: usize) -> usize {
+pub const fn peeled_len(layers: Layers) -> usize {
     link_cell_len(layers) - NOISE_TAG_LEN
 }
 
 /// The body carried inside one layer at this depth. For the innermost layer
 /// this is exactly one cell; further out it is the adjacent link's cell size.
-pub const fn body_len(layers: usize) -> usize {
+pub const fn body_len(layers: Layers) -> usize {
     peeled_len(layers) - DISPOSITION_LEN
 }
 
@@ -282,16 +283,16 @@ mod tests {
     fn link_sizes_match_the_specification() {
         // SECURITY_MODEL §5.10. These are the only places the numbers appear.
         assert_eq!(CELL_PLAINTEXT_LEN, 513);
-        assert_eq!(link_cell_len(1), 530, "middle to exit");
-        assert_eq!(link_cell_len(2), 547, "guard to middle");
-        assert_eq!(link_cell_len(3), 564, "client to guard");
+        assert_eq!(link_cell_len(Layers::new(1)), 530, "middle to exit");
+        assert_eq!(link_cell_len(Layers::new(2)), 547, "guard to middle");
+        assert_eq!(link_cell_len(Layers::new(3)), 564, "client to guard");
     }
 
     #[test]
     fn each_hop_costs_a_disposition_byte_and_a_tag() {
-        for layers in 1..4 {
+        for n in 1..4 {
             assert_eq!(
-                link_cell_len(layers + 1) - link_cell_len(layers),
+                link_cell_len(Layers::new(n + 1)) - link_cell_len(Layers::new(n)),
                 DISPOSITION_LEN + NOISE_TAG_LEN
             );
         }
@@ -300,26 +301,32 @@ mod tests {
     #[test]
     fn body_len_is_the_adjacent_link_size() {
         assert_eq!(
-            body_len(1),
+            body_len(Layers::new(1)),
             CELL_PLAINTEXT_LEN,
             "innermost body is one cell"
         );
         assert_eq!(
-            body_len(2),
-            link_cell_len(1),
+            body_len(Layers::new(2)),
+            link_cell_len(Layers::new(1)),
             "middle body is the exit link cell"
         );
         assert_eq!(
-            body_len(3),
-            link_cell_len(2),
+            body_len(Layers::new(3)),
+            link_cell_len(Layers::new(2)),
             "guard body is the middle link cell"
         );
     }
 
     #[test]
     fn peeled_len_is_one_tag_less_than_the_link() {
-        assert_eq!(peeled_len(3), link_cell_len(3) - NOISE_TAG_LEN);
-        assert_eq!(peeled_len(1), DISPOSITION_LEN + CELL_PLAINTEXT_LEN);
+        assert_eq!(
+            peeled_len(Layers::new(3)),
+            link_cell_len(Layers::new(3)) - NOISE_TAG_LEN
+        );
+        assert_eq!(
+            peeled_len(Layers::new(1)),
+            DISPOSITION_LEN + CELL_PLAINTEXT_LEN
+        );
     }
 
     #[test]

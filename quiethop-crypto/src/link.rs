@@ -21,6 +21,7 @@ use thiserror::Error;
 
 use crate::cell::link_cell_len;
 use crate::circid::{CircId, CircIdError, LinkRole, CIRC_ID_LEN};
+use crate::layers::Layers;
 use crate::noise::NOISE_MSG_LEN;
 use crate::wire::PRESENTATION_LEN;
 
@@ -30,7 +31,7 @@ pub const LINK_HEADER_LEN: usize = CIRC_ID_LEN + LINK_COMMAND_LEN;
 /// Frame size on a link `layers` hops from the innermost cell.
 ///
 /// 569 client to guard, 552 guard to middle, 535 middle to exit.
-pub const fn link_frame_len(layers: usize) -> usize {
+pub const fn link_frame_len(layers: Layers) -> usize {
     LINK_HEADER_LEN + link_cell_len(layers)
 }
 
@@ -136,7 +137,7 @@ pub struct Frame<'a> {
 /// short command cannot leak whatever was in the buffer before.
 pub fn encode_into(
     out: &mut [u8],
-    layers: usize,
+    layers: Layers,
     circ_id: CircId,
     command: LinkCommand,
     payload: &[u8],
@@ -166,7 +167,7 @@ pub fn encode_into(
 
 /// Allocate and write a frame. Convenience over [`encode_into`].
 pub fn encode(
-    layers: usize,
+    layers: Layers,
     circ_id: CircId,
     command: LinkCommand,
     payload: &[u8],
@@ -181,7 +182,7 @@ pub fn encode(
 ///
 /// `peer` is the peer's role on this link, so the id is checked against the half
 /// that peer is allowed to choose from.
-pub fn decode(wire: &[u8], layers: usize, peer: LinkRole) -> Result<Frame<'_>, LinkError> {
+pub fn decode(wire: &[u8], layers: Layers, peer: LinkRole) -> Result<Frame<'_>, LinkError> {
     let want = link_frame_len(layers);
     if wire.len() != want {
         return Err(LinkError::WrongSize {
@@ -238,9 +239,9 @@ mod tests {
     use crate::noise::NOISE_TAG_LEN;
     use crate::wire::DISPOSITION_LEN;
 
-    const CLIENT_GUARD: usize = 3;
-    const GUARD_MIDDLE: usize = 2;
-    const MIDDLE_EXIT: usize = 1;
+    const CLIENT_GUARD: Layers = Layers::new(3);
+    const GUARD_MIDDLE: Layers = Layers::new(2);
+    const MIDDLE_EXIT: Layers = Layers::new(1);
 
     fn id() -> CircId {
         CircId::new(0x8000_00ab).unwrap()

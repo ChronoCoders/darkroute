@@ -43,6 +43,7 @@ use quiethop_crypto::cell::{
 };
 use quiethop_crypto::circid::{CircId, LinkRole};
 use quiethop_crypto::layer::{peel, seal_forward, seal_to_me, Peeled};
+use quiethop_crypto::layers::Layers;
 use quiethop_crypto::link::{self as link_frame, DestroyReason};
 use quiethop_crypto::noise::{
     generate_static_keypair, respond, Initiator, Transport, NOISE_MSG_LEN, STATIC_KEY_LEN,
@@ -447,7 +448,7 @@ struct MockClient {
 }
 
 /// The client-guard link carries three layers.
-const CLIENT_LAYERS: usize = 3;
+const CLIENT_LAYERS: Layers = Layers::new(3);
 
 impl MockClient {
     /// Connect, present the token, and handshake with the guard.
@@ -552,7 +553,7 @@ impl MockClient {
     /// Seal `cell` for hop number `depth` (1 = guard, 2 = middle, 3 = exit).
     fn seal_for_depth(&mut self, cell: &Cell, depth: usize) -> Vec<u8> {
         // layers counts from the innermost hop outward: the exit is 1.
-        let layers = CLIENT_LAYERS - (depth - 1);
+        let layers = Layers::new(CLIENT_LAYERS.get() - (depth - 1));
         let mut buf = match depth {
             1 => seal_to_me(&mut self.guard, cell, layers).expect("seal guard"),
             2 => seal_to_me(self.middle.as_mut().expect("middle"), cell, layers)
@@ -565,7 +566,7 @@ impl MockClient {
             buf = seal_forward(
                 self.middle.as_mut().expect("middle"),
                 &buf,
-                CLIENT_LAYERS - 1,
+                CLIENT_LAYERS.peeled(),
             )
             .expect("wrap middle");
         }
@@ -631,7 +632,7 @@ impl MockClient {
             Peeled::Forward(b) => b,
         };
         if let Some(mid) = self.middle.as_mut() {
-            blob = match peel(mid, &blob, CLIENT_LAYERS - 1).expect("peel middle") {
+            blob = match peel(mid, &blob, CLIENT_LAYERS.peeled()).expect("peel middle") {
                 Peeled::ToMe(cell) => return cell,
                 Peeled::Forward(b) => b,
             };
@@ -640,7 +641,7 @@ impl MockClient {
             .exit
             .as_mut()
             .expect("exit transport for innermost peel");
-        match peel(exit, &blob, 1).expect("peel exit") {
+        match peel(exit, &blob, Layers::new(1)).expect("peel exit") {
             Peeled::ToMe(cell) => cell,
             Peeled::Forward(_) => panic!("FORWARD arrived at the innermost layer"),
         }
@@ -844,9 +845,9 @@ async fn on_wire_cells_are_constant_size_whatever_the_payload() {
             );
             client.write_frame(&wire).await;
         }
-        assert_eq!(link_cell_len(3), 564);
-        assert_eq!(link_cell_len(2), 547);
-        assert_eq!(link_cell_len(1), 530);
+        assert_eq!(link_cell_len(Layers::new(3)), 564);
+        assert_eq!(link_cell_len(Layers::new(2)), 547);
+        assert_eq!(link_cell_len(Layers::new(1)), 530);
     })
     .await
     .expect("test timed out");
@@ -1015,7 +1016,7 @@ struct RecordingMiddle {
 }
 
 impl RecordingMiddle {
-    const LAYERS: usize = CLIENT_LAYERS - 1;
+    const LAYERS: Layers = CLIENT_LAYERS.peeled();
 
     async fn spawn(server_config: Arc<ServerConfig>) -> Self {
         let keypair = generate_static_keypair().expect("keygen");
@@ -2020,11 +2021,11 @@ async fn relay_link_is_served(connector: &TlsConnector, target: &SpawnedRelay) -
 
 /// Layers on the inbound link of a relay in this role, which fixes its frame
 /// size: a middle sees two and an exit one.
-fn relay_link_layers(role: Role) -> usize {
+fn relay_link_layers(role: Role) -> Layers {
     match role {
-        Role::Guard => 3,
-        Role::Middle => 2,
-        Role::Exit => 1,
+        Role::Guard => Layers::new(3),
+        Role::Middle => Layers::new(2),
+        Role::Exit => Layers::new(1),
     }
 }
 

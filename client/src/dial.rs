@@ -20,6 +20,7 @@ use quiethop_crypto::cell::{
 };
 use quiethop_crypto::circid::{self, CircId, LinkRole};
 use quiethop_crypto::layer::{peel, seal_forward, seal_to_me, FrameReader, Peeled};
+use quiethop_crypto::layers::Layers;
 use quiethop_crypto::link::{self as link_frame, LinkCommand};
 use quiethop_crypto::noise::{Initiator, Transport, NOISE_MSG_LEN};
 use quiethop_crypto::wire::PROTO_CLIENT;
@@ -30,7 +31,7 @@ use crate::tls;
 use quiethop_crypto::registry::RelayEntry;
 
 /// The client-guard link carries one layer per hop.
-const CLIENT_LAYERS: usize = 3;
+const CLIENT_LAYERS: Layers = Layers::new(3);
 
 /// Size of every frame on the client-guard link, both directions.
 const LINK_FRAME_LEN: usize = link_frame::link_frame_len(CLIENT_LAYERS);
@@ -63,17 +64,17 @@ pub struct CircuitStream {
 }
 
 /// The three per-hop transports, outermost first.
-struct Layers {
+struct Hops {
     guard: Transport,
     middle: Transport,
     exit: Transport,
 }
 
-impl Layers {
+impl Hops {
     /// Seal a cell for the exit and wrap it for the middle and the guard.
     fn seal_for_exit(&mut self, cell: &Cell) -> Result<Vec<u8>, ClientError> {
-        let inner = seal_to_me(&mut self.exit, cell, 1)?;
-        let mid = seal_forward(&mut self.middle, &inner, CLIENT_LAYERS - 1)?;
+        let inner = seal_to_me(&mut self.exit, cell, Layers::new(1))?;
+        let mid = seal_forward(&mut self.middle, &inner, CLIENT_LAYERS.peeled())?;
         Ok(seal_forward(&mut self.guard, &mid, CLIENT_LAYERS)?)
     }
 
@@ -83,11 +84,11 @@ impl Layers {
             Peeled::ToMe(cell) => return Ok(cell),
             Peeled::Forward(b) => b,
         };
-        blob = match peel(&mut self.middle, &blob, CLIENT_LAYERS - 1)? {
+        blob = match peel(&mut self.middle, &blob, CLIENT_LAYERS.peeled())? {
             Peeled::ToMe(cell) => return Ok(cell),
             Peeled::Forward(b) => b,
         };
-        match peel(&mut self.exit, &blob, 1)? {
+        match peel(&mut self.exit, &blob, Layers::new(1))? {
             Peeled::ToMe(cell) => Ok(cell),
             Peeled::Forward(_) => Err(ClientError::UnexpectedCell(CellType::Data)),
         }
@@ -150,7 +151,7 @@ pub async fn dial(
     )
     .await?;
 
-    let mut layers = Layers {
+    let mut hops = Hops {
         guard: guard_tx,
         middle: middle_tx,
         exit: exit_tx,
@@ -162,13 +163,13 @@ pub async fn dial(
         port: dest_port,
     };
     let cell = Cell::new(CellType::Connect, connect.encode()?)?;
-    let wire = layers.seal_for_exit(&cell)?;
+    let wire = hops.seal_for_exit(&cell)?;
     let frame = link_frame::encode(CLIENT_LAYERS, circ_id, LinkCommand::Data, &wire)?;
     tls.write_all(&frame).await?;
     tls.flush().await?;
 
     let (user_side, internal_side) = tokio::io::duplex(DUPLEX_BUF);
-    tokio::spawn(circuit_task(tls, layers, internal_side, circ_id));
+    tokio::spawn(circuit_task(tls, hops, internal_side, circ_id));
     Ok(CircuitStream { inner: user_side })
 }
 
@@ -194,7 +195,7 @@ async fn extend_hop(
     let (wire, middle) = match middle {
         None => (seal_to_me(guard, &cell, CLIENT_LAYERS)?, None),
         Some(mid) => {
-            let inner = seal_to_me(mid, &cell, CLIENT_LAYERS - 1)?;
+            let inner = seal_to_me(mid, &cell, CLIENT_LAYERS.peeled())?;
             (seal_forward(guard, &inner, CLIENT_LAYERS)?, Some(mid))
         }
     };
@@ -208,7 +209,7 @@ async fn extend_hop(
 
     let reply = match (peel(guard, body, CLIENT_LAYERS)?, middle) {
         (Peeled::ToMe(c), None) => c,
-        (Peeled::Forward(blob), Some(mid)) => match peel(mid, &blob, CLIENT_LAYERS - 1)? {
+        (Peeled::Forward(blob), Some(mid)) => match peel(mid, &blob, CLIENT_LAYERS.peeled())? {
             Peeled::ToMe(c) => c,
             Peeled::Forward(_) => return Err(ClientError::UnexpectedCell(CellType::Extend)),
         },
@@ -229,7 +230,7 @@ async fn extend_hop(
 /// work across tasks would mean sharing it behind a lock for no gain.
 async fn circuit_task(
     tls: TlsStream<TcpStream>,
-    mut layers: Layers,
+    mut hops: Hops,
     internal: tokio::io::DuplexStream,
     circ_id: CircId,
 ) {
@@ -257,7 +258,7 @@ async fn circuit_task(
                         Ok(c) => c,
                         Err(_) => { failed = true; break; }
                     };
-                    let wire = match layers.seal_for_exit(&cell) {
+                    let wire = match hops.seal_for_exit(&cell) {
                         Ok(w) => w,
                         Err(_) => { failed = true; break; }
                     };
@@ -286,7 +287,7 @@ async fn circuit_task(
                 let Ok(body) = inbound_body(&frame, circ_id) else {
                     break;
                 };
-                let cell = match layers.peel_inbound(body) {
+                let cell = match hops.peel_inbound(body) {
                     Ok(c) => c,
                     Err(_) => break,
                 };
@@ -309,7 +310,7 @@ async fn circuit_task(
 
     // Best effort teardown: ask the exit to close, then drop everything.
     if let Ok(cell) = Cell::new(CellType::CloseRequest, Vec::new()) {
-        if let Ok(wire) = layers.seal_for_exit(&cell) {
+        if let Ok(wire) = hops.seal_for_exit(&cell) {
             if let Ok(frame) = link_frame::encode(CLIENT_LAYERS, circ_id, LinkCommand::Data, &wire)
             {
                 let _ = tls_write.write_all(&frame).await;
