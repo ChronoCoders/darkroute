@@ -27,6 +27,9 @@ cd "$ROOT" || exit 1
 export PATH="$PATH:$(go env GOPATH 2>/dev/null)/bin:$HOME/.cargo/bin"
 
 echo "gate: $(git rev-parse --short HEAD 2>/dev/null || echo 'no HEAD') on $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '?')"
+# Two Go toolchains on purpose, see docs/DECISIONS.md entry 21 and the label on
+# each Go step below.
+echo "go: $(ck_go_toolchain) for every Go step except staticcheck, which runs under $(ck_staticcheck_toolchain)"
 echo
 
 ck_step "control: the dash class matches dashes and nothing else" ck_dash_self_test
@@ -51,11 +54,11 @@ ck_step "cargo audit"    ck_cargo_audit
 ck_step "go build"       ck_run_in authority go build ./...
 ck_step "go vet"         ck_run_in authority go vet ./...
 ck_step "gofmt"          ck_gofmt
-ck_step "staticcheck"    ck_run_in authority staticcheck ./...
+ck_step "staticcheck ($(ck_staticcheck_toolchain))" ck_staticcheck
 ck_step "control: the database check fails with no server" ck_test_db_control
 ck_step "the test database is reachable with a complete schema" ck_test_db
 ck_step "go test"        ck_go_test
-ck_step "govulncheck"    ck_run_in authority govulncheck ./...
+ck_step "govulncheck ($(ck_go_toolchain))"          ck_govulncheck
 
 ck_step "tsc"            ck_run_in dashboard npx --no-install tsc --noEmit
 ck_step "eslint"         ck_run_in dashboard npx --no-install eslint . --max-warnings=0

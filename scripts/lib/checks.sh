@@ -85,6 +85,52 @@ ck_run_in() {
 	"$@"
 }
 
+# The toolchain staticcheck runs under.
+#
+# authority/go.mod pins go1.27.2, because six Go standard library advisories
+# (GO-2026-6603, 6607, 6611, 6612, 6613, 6617) are fixed there and govulncheck
+# fails on 1.27.0. staticcheck 2026.2.1 (v0.8.1) cannot read 1.27.2 export data,
+# which is go-tools issue 1832 with PR 1834 open and no release yet, so that one
+# step is forced back to 1.27.0. Per go.dev/doc/toolchain a GOTOOLCHAIN name
+# overrides both the go and toolchain lines, and 1.27.0 is newer than the go
+# 1.25.0 line, so the override is valid. Remove it when a released staticcheck
+# reads 1.27.2 export data, and pin that release (docs/DECISIONS.md entry 21).
+CK_STATICCHECK_TOOLCHAIN='go1.27.0'
+
+# The toolchain every other Go step runs under: whatever go.mod names.
+ck_go_toolchain() {
+	(cd "$CK_ROOT/authority" && go version 2>/dev/null | awk '{print $3}')
+}
+
+# The toolchain the staticcheck step runs under, resolved in its own environment.
+ck_staticcheck_toolchain() {
+	(cd "$CK_ROOT/authority" && GOTOOLCHAIN="$CK_STATICCHECK_TOOLCHAIN" go version 2>/dev/null | awk '{print $3}')
+}
+
+# staticcheck under the forced toolchain.
+#
+# The override is asserted rather than assumed. A GOTOOLCHAIN that silently did
+# not take effect would run staticcheck against 1.27.2 export data again, and the
+# step would fail with an import error that looks nothing like the cause.
+ck_staticcheck() {
+	ck_require staticcheck go || return 1
+	local got
+	got=$(ck_staticcheck_toolchain)
+	if [ "$got" != "$CK_STATICCHECK_TOOLCHAIN" ]; then
+		echo "GOTOOLCHAIN=$CK_STATICCHECK_TOOLCHAIN did not take effect: go reports ${got:-nothing}" >&2
+		return 1
+	fi
+	echo "go version as resolved for this step: $got"
+	(cd "$CK_ROOT/authority" && GOTOOLCHAIN="$CK_STATICCHECK_TOOLCHAIN" staticcheck ./...)
+}
+
+# govulncheck under the go.mod toolchain.
+ck_govulncheck() {
+	ck_require govulncheck go || return 1
+	echo "go version as resolved for this step: $(ck_go_toolchain)"
+	(cd "$CK_ROOT/authority" && govulncheck ./...)
+}
+
 ck_gofmt() {
 	ck_require gofmt || return 1
 	local out
