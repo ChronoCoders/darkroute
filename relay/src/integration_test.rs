@@ -42,6 +42,7 @@ use quiethop_crypto::cell::{
     CELL_PAYLOAD_LEN,
 };
 use quiethop_crypto::circid::{CircId, LinkRole};
+use quiethop_crypto::flow;
 use quiethop_crypto::layer::{peel, seal_forward, seal_to_me, Peeled};
 use quiethop_crypto::layers::Layers;
 use quiethop_crypto::link::{self as link_frame, DestroyReason};
@@ -1013,24 +1014,41 @@ struct RecordingMiddle {
     addr: SocketAddr,
     static_pubkey: [u8; STATIC_KEY_LEN],
     frames: mpsc::UnboundedReceiver<Vec<u8>>,
+    /// Held closed until the test opens it. The handshake completes either
+    /// way; what waits is the frame loop, so an upstream relay writing to this
+    /// hop fills its socket buffer and then blocks. That is the smallest piece
+    /// of the stalling harness that a full per-circuit queue needs, and it is
+    /// the part commit (a2) will build out.
+    gate: Arc<Notify>,
 }
 
 impl RecordingMiddle {
     const LAYERS: Layers = CLIENT_LAYERS.peeled();
 
+    /// Reads as soon as it is connected.
     async fn spawn(server_config: Arc<ServerConfig>) -> Self {
+        let m = Self::spawn_gated(server_config).await;
+        m.open();
+        m
+    }
+
+    /// Completes the handshake and then reads nothing until `open` is called.
+    async fn spawn_gated(server_config: Arc<ServerConfig>) -> Self {
         let keypair = generate_static_keypair().expect("keygen");
         let static_pubkey = keypair.public;
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let addr = listener.local_addr().expect("addr");
         let (tx, frames) = mpsc::unbounded_channel();
         let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
+        let gate = Arc::new(Notify::new());
+        let task_gate = gate.clone();
 
         tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
                 let acceptor = acceptor.clone();
                 let tx = tx.clone();
                 let private = keypair.private().to_owned();
+                let gate = task_gate.clone();
                 tokio::spawn(async move {
                     let Ok(mut sock) = acceptor.accept(tcp).await else {
                         return;
@@ -1073,6 +1091,10 @@ impl RecordingMiddle {
                         return;
                     }
 
+                    // Nothing is read past the handshake until the test says
+                    // so, which is what lets a queue upstream of here fill.
+                    gate.notified().await;
+
                     // Everything after the handshake goes to the test as it is.
                     loop {
                         let mut buf = vec![0u8; frame_len];
@@ -1091,7 +1113,22 @@ impl RecordingMiddle {
             addr,
             static_pubkey,
             frames,
+            gate,
         }
+    }
+
+    /// Let the frame loop run. A permit left here before the task reaches the
+    /// wait is kept, so opening early is safe.
+    fn open(&self) {
+        self.gate.notify_one();
+    }
+
+    /// Next frame, or None if nothing arrives inside `budget`.
+    async fn next_frame_within(&mut self, budget: Duration) -> Option<Vec<u8>> {
+        tokio::time::timeout(budget, self.frames.recv())
+            .await
+            .ok()
+            .flatten()
     }
 
     async fn next_frame(&mut self) -> Vec<u8> {
@@ -1197,6 +1234,225 @@ async fn a_forwarded_destroy_carries_destroyed_and_not_the_reason_received() {
             "the reason the client chose crossed the relay, which is the side channel \
              tor-spec forbids"
         );
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// A DESTROY from the peer is not answered back to that peer.
+///
+/// The peer already knows it destroyed the circuit, so a DESTROY in reply tells
+/// it nothing it does not have and names a reason it did not ask for
+/// (SECURITY_MODEL 6.3). What the relay does instead is forward DESTROYED to
+/// the next hop and go quiet upstream.
+#[tokio::test]
+async fn a_peer_destroy_is_not_answered_upstream() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        ensure_crypto_provider();
+        let keydir = tempfile::tempdir().expect("keydir");
+        let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let pki = make_pki();
+        let server_config = make_server_config(&pki);
+        let connector = Arc::new(make_connector(&pki));
+        let over = default_override();
+        let fleet = spawn_fleet(
+            &auth_priv,
+            &over,
+            server_config.clone(),
+            connector.clone(),
+            keydir.path(),
+        )
+        .await;
+
+        let mut middle = RecordingMiddle::spawn(server_config).await;
+        let (after, fresh, until) = current_window();
+        fleet.publish(document_from(
+            &[
+                ("guard", fleet.guard.addr, fleet.guard.static_pubkey),
+                ("middle", middle.addr, middle.static_pubkey),
+                ("exit", fleet.exit.addr, fleet.exit.static_pubkey),
+            ],
+            &after,
+            &fresh,
+            &until,
+        ));
+
+        let mut client =
+            MockClient::connect_with_token(&connector, &fleet.guard, &auth_priv, [0xE3; 32]).await;
+        assert!(
+            client
+                .try_extend_to(middle.addr, middle.static_pubkey)
+                .await,
+            "the recorder is published as the middle, so the extend must complete"
+        );
+
+        let destroy = link_frame::encode(
+            CLIENT_LAYERS,
+            client.circ_id,
+            link_frame::LinkCommand::Destroy,
+            &[DestroyReason::Protocol as u8],
+        )
+        .expect("encode destroy");
+        client
+            .sock
+            .write_all(&destroy)
+            .await
+            .expect("write destroy");
+        client.sock.flush().await.expect("flush");
+
+        // Control: the relay did act on it, so the silence below is a choice
+        // and not the DESTROY being ignored.
+        let forwarded = middle
+            .next_frame_within(Duration::from_secs(10))
+            .await
+            .expect("the guard forwarded nothing to the next hop");
+        let fwd = link_frame::decode(&forwarded, RecordingMiddle::LAYERS, LinkRole::Initiator)
+            .expect("decode forwarded frame");
+        assert_eq!(fwd.command, link_frame::LinkCommand::Destroy);
+
+        // Nothing comes back on the link the DESTROY arrived on.
+        let mut buf = vec![0u8; link_frame::link_frame_len(CLIENT_LAYERS)];
+        match tokio::time::timeout(Duration::from_secs(3), client.sock.read_exact(&mut buf)).await {
+            Err(_) => {}
+            Ok(Err(_)) => {}
+            Ok(Ok(_)) => {
+                let back = link_frame::decode(&buf, CLIENT_LAYERS, LinkRole::Responder)
+                    .expect("decode answer");
+                panic!(
+                    "the relay answered a peer DESTROY with {:?} for circuit {:#010x}",
+                    back.command,
+                    back.circ_id.raw()
+                );
+            }
+        }
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// A DESTROY overtakes queued DATA rather than waiting behind it.
+///
+/// The destroy signal used to travel on the same bounded channel as the frames,
+/// so it waited behind every frame already queued and the circuit went on
+/// forwarding data the peer had already destroyed.
+///
+/// The next hop here stops reading after the handshake, which is what makes the
+/// upstream relay's write block and its queue fill. A full window of DATA goes
+/// out and the socket buffers absorb some of it: measured at this commit, 448
+/// frames reach the next hop and the remaining 552 sit in the per-circuit
+/// queue, which is the deepest backlog a peer inside its window can build. It
+/// cannot reach MAX_CIRCUIT_QUEUE, because the 1000 cell window is deliberately
+/// smaller than the 1024 slot queue.
+///
+/// The deadline is the assertion: nothing here may wait on a hang.
+#[tokio::test]
+async fn a_destroy_overtakes_queued_data() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        ensure_crypto_provider();
+        let keydir = tempfile::tempdir().expect("keydir");
+        let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let pki = make_pki();
+        let server_config = make_server_config(&pki);
+        let connector = Arc::new(make_connector(&pki));
+        let over = default_override();
+        let fleet = spawn_fleet(
+            &auth_priv,
+            &over,
+            server_config.clone(),
+            connector.clone(),
+            keydir.path(),
+        )
+        .await;
+
+        // Gated: the handshake completes, then it reads nothing until told.
+        let mut middle = RecordingMiddle::spawn_gated(server_config).await;
+        let (after, fresh, until) = current_window();
+        fleet.publish(document_from(
+            &[
+                ("guard", fleet.guard.addr, fleet.guard.static_pubkey),
+                ("middle", middle.addr, middle.static_pubkey),
+                ("exit", fleet.exit.addr, fleet.exit.static_pubkey),
+            ],
+            &after,
+            &fresh,
+            &until,
+        ));
+
+        let mut client =
+            MockClient::connect_with_token(&connector, &fleet.guard, &auth_priv, [0xE4; 32]).await;
+        assert!(
+            client
+                .try_extend_to(middle.addr, middle.static_pubkey)
+                .await,
+            "the handshake runs ahead of the gate, so the extend must complete"
+        );
+
+        // A full window of DATA, every frame of it legitimate. The guard
+        // forwards until the next hop's socket stops taking bytes, then its
+        // task stops consuming and the link reader fills the queue behind it.
+        const SENT: usize = flow::WINDOW_START as usize;
+        for _ in 0..SENT {
+            let cell = Cell::new(CellType::Data, vec![0x7E; 64]).expect("cell");
+            let wire = client.seal_for_depth(&cell, 2);
+            client.write_frame(&wire).await;
+        }
+
+        let destroy = link_frame::encode(
+            CLIENT_LAYERS,
+            client.circ_id,
+            link_frame::LinkCommand::Destroy,
+            &[DestroyReason::Protocol as u8],
+        )
+        .expect("encode destroy");
+        client
+            .sock
+            .write_all(&destroy)
+            .await
+            .expect("write destroy");
+        client.sock.flush().await.expect("flush");
+
+        // Let it read. Count the DATA that arrives before the DESTROY.
+        middle.open();
+        let mut data_before = 0usize;
+        let mut reason = None;
+        while let Some(wire) = middle.next_frame_within(Duration::from_secs(20)).await {
+            let f = link_frame::decode(&wire, RecordingMiddle::LAYERS, LinkRole::Initiator)
+                .expect("decode forwarded frame");
+            match f.command {
+                link_frame::LinkCommand::Data => data_before += 1,
+                link_frame::LinkCommand::Destroy => {
+                    let body = link_frame::payload(f.body, link_frame::DESTROY_BODY_LEN)
+                        .expect("destroy body");
+                    reason = Some(body[0]);
+                    break;
+                }
+                other => panic!("unexpected {other:?} on the relay link"),
+            }
+        }
+
+        let reason = reason.expect("the DESTROY never reached the next hop");
+        assert_eq!(
+            reason,
+            DestroyReason::Destroyed as u8,
+            "the forwarded reason was {reason:#04x}, not DESTROYED"
+        );
+        assert!(
+            data_before < SENT,
+            "all {SENT} DATA frames were forwarded before the DESTROY, so the signal \
+             waited behind the queue instead of overtaking it"
+        );
+        assert!(
+            data_before > 0,
+            "no DATA reached the next hop at all, so nothing was ever queued and this \
+             test did not exercise a backlog"
+        );
+
+        // Nothing queued may be forwarded after the circuit is destroyed.
+        if let Some(extra) = middle.next_frame_within(Duration::from_secs(2)).await {
+            let f = link_frame::decode(&extra, RecordingMiddle::LAYERS, LinkRole::Initiator)
+                .expect("decode trailing frame");
+            panic!("{:?} was forwarded after the DESTROY", f.command);
+        }
     })
     .await
     .expect("test timed out");

@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::signal;
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, watch, Notify};
 use tokio_rustls::client::TlsStream as ClientTlsStream;
 use tokio_rustls::server::TlsStream as ServerTlsStream;
 use tokio_rustls::TlsConnector;
@@ -459,6 +459,10 @@ fn run_keygen(path_arg: Option<&str>) -> ExitCode {
 enum HandleError {
     #[error("the link control queue filled, so the link was closed")]
     ControlQueueFull,
+    #[error("the peer destroyed this circuit")]
+    DestroyedByPeer,
+    #[error("the next hop destroyed this circuit")]
+    DestroyedByNextHop,
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("read timeout")]
@@ -594,7 +598,7 @@ fn outbound_layers(role: Role) -> Option<Layers> {
 /// inside it (ARCHITECTURE 5.4, 5.5).
 struct LinkState {
     table: link::LinkTable,
-    senders: HashMap<CircId, mpsc::Sender<ToCircuit>>,
+    handles: HashMap<CircId, CircuitHandle>,
     /// Link level frames, ahead of circuit data in the writer.
     ///
     /// DESTROY lives here rather than in the named circuit's queue, because it
@@ -616,14 +620,19 @@ struct LinkShared {
     closing: AtomicBool,
 }
 
-/// What the link reader sends a circuit task.
-enum ToCircuit {
-    /// A DATA frame's body, still sealed.
-    Frame(Vec<u8>),
-    /// The peer destroyed this circuit. The task forwards DESTROY onward with
-    /// DestroyReason::Destroyed and does not answer upstream, because the peer
-    /// already knows.
-    Destroyed,
+/// What the link reader holds for one circuit.
+///
+/// The destroy signal is deliberately not a message on `frames`. On that
+/// channel it would be dropped whenever the queue is full, which a peer inside
+/// its 1000 cell window can legitimately cause against a 1024 slot queue, and
+/// even when it fit it would wait behind every frame already queued while the
+/// circuit went on forwarding data the peer had already destroyed.
+///
+/// A `watch` keeps the signal after its sender is dropped, so removing the
+/// circuit from the table cannot lose a signal already sent.
+struct CircuitHandle {
+    frames: mpsc::Sender<Vec<u8>>,
+    destroy: watch::Sender<bool>,
 }
 
 impl LinkShared {
@@ -631,7 +640,7 @@ impl LinkShared {
         Self {
             state: std::sync::Mutex::new(LinkState {
                 table: link::LinkTable::new(role),
-                senders: HashMap::new(),
+                handles: HashMap::new(),
                 control: VecDeque::new(),
             }),
             wake: Notify::new(),
@@ -658,7 +667,7 @@ impl LinkShared {
     /// many were released.
     fn release_all(&self) -> usize {
         let mut st = self.lock();
-        st.senders.clear();
+        st.handles.clear();
         st.table.destroy_all(Instant::now())
     }
 
@@ -728,7 +737,7 @@ impl LinkShared {
     /// Remove a circuit and quarantine its id. Returns whether it was there.
     fn forget(&self, id: CircId) -> bool {
         let mut st = self.lock();
-        st.senders.remove(&id);
+        st.handles.remove(&id);
         st.table.destroy(id, Instant::now())
     }
 }
@@ -827,7 +836,7 @@ async fn dispatch_frame(
                 let st = shared.lock();
                 (
                     st.table.disposition_for_data(id),
-                    st.senders.get(&id).cloned(),
+                    st.handles.get(&id).map(|h| h.frames.clone()),
                 )
             };
             match disposition {
@@ -847,7 +856,7 @@ async fn dispatch_frame(
                     // try_send only. Waiting here would stall every circuit on
                     // the link behind one slow circuit, which is the head of
                     // line blocking multiplexing exists to remove.
-                    match tx.try_send(ToCircuit::Frame(frame.body.to_vec())) {
+                    match tx.try_send(frame.body.to_vec()) {
                         Ok(()) => Ok(()),
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             metrics::record_frame_dropped(metrics::DropReason::NotOpen);
@@ -867,15 +876,18 @@ async fn dispatch_frame(
             }
         }
         link_frame::LinkCommand::Destroy => {
-            let sender = {
+            let signalled = {
                 let st = shared.lock();
-                st.senders.get(&id).cloned()
+                // send only fails when every receiver is gone, which means the
+                // task has already ended and the circuit with it.
+                st.handles.get(&id).map(|h| h.destroy.send(true).is_ok())
             };
-            match sender {
-                Some(tx) => {
-                    // Tell the task the peer destroyed it, so it forwards
-                    // DESTROYED downstream and sends nothing back upstream.
-                    let _ = tx.try_send(ToCircuit::Destroyed);
+            match signalled {
+                Some(true) => {
+                    shared.forget(id);
+                }
+                Some(false) => {
+                    metrics::record_frame_dropped(metrics::DropReason::DestroySignalLost);
                     shared.forget(id);
                 }
                 None => metrics::record_frame_dropped(metrics::DropReason::NotOpen),
@@ -930,12 +942,19 @@ async fn open_inbound_circuit(
         Err(_) => return Err(HandleError::Handshake),
     };
 
-    let (tx, rx) = mpsc::channel::<ToCircuit>(link::MAX_CIRCUIT_QUEUE);
+    let (tx, rx) = mpsc::channel::<Vec<u8>>(link::MAX_CIRCUIT_QUEUE);
+    let (destroy_tx, destroy_rx) = watch::channel(false);
     {
         let mut st = shared.lock();
         match st.table.accept_create(id, transport, Instant::now()) {
             Ok(()) => {
-                st.senders.insert(id, tx);
+                st.handles.insert(
+                    id,
+                    CircuitHandle {
+                        frames: tx,
+                        destroy: destroy_tx,
+                    },
+                );
             }
             Err(link::CreateRefusal::Collision) => {
                 // Silence. A DESTROY naming this id would be read as the live
@@ -980,7 +999,18 @@ async fn open_inbound_circuit(
     let task_ctx = ctx.clone();
     tokio::spawn(async move {
         let id_for_log = id.raw();
-        if let Err(e) = run_circuit(&task_shared, id, transport, rx, layers, role, task_ctx).await {
+        if let Err(e) = run_circuit(
+            &task_shared,
+            id,
+            transport,
+            rx,
+            destroy_rx,
+            layers,
+            role,
+            task_ctx,
+        )
+        .await
+        {
             warn!(circ_id = id_for_log, error = %e, "circuit ended with an error");
         }
         task_shared.forget(id);
@@ -1041,7 +1071,8 @@ async fn run_circuit(
     shared: &Arc<LinkShared>,
     id: CircId,
     mut transport: Transport,
-    mut rx: mpsc::Receiver<ToCircuit>,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut destroy_rx: watch::Receiver<bool>,
     layers: Layers,
     role: Role,
     ctx: ConnCtx,
@@ -1058,20 +1089,22 @@ async fn run_circuit(
         loop {
         tokio::select! {
             biased;
+            // First, so a destroyed circuit stops forwarding at the next turn
+            // of the loop rather than after the queue behind it drains.
+            changed = destroy_rx.changed() => {
+                match changed {
+                    // The reader saw a DESTROY for this circuit.
+                    Ok(()) if *destroy_rx.borrow_and_update() => {
+                        break Err(HandleError::DestroyedByPeer);
+                    }
+                    // Every handle went, so the link did.
+                    _ => break Err(HandleError::PeerClosed),
+                }
+            }
             msg = rx.recv() => {
-                let Some(msg) = msg else {
+                let Some(wire) = msg else {
                     // The link went or the reader dropped the sender.
                     break Err(HandleError::PeerClosed);
-                };
-                let wire = match msg {
-                    ToCircuit::Frame(w) => w,
-                    ToCircuit::Destroyed => {
-                        // The peer destroyed this circuit. Forward onward with
-                        // DESTROYED, never the reason received, and say nothing
-                        // back upstream (SECURITY_MODEL 6.3).
-                        forward_destroy(&mut next_link, out_layers).await;
-                        return Ok(());
-                    }
                 };
                 match layer::peel(&mut transport, &wire, layers)? {
                     layer::Peeled::Forward(blob) => {
@@ -1200,9 +1233,10 @@ async fn run_circuit(
                         }
                     }
                     link_frame::LinkCommand::Destroy => {
-                        // The next hop ended the circuit. Tell the client by
-                        // ending this circuit; the reason is not propagated.
-                        break Err(HandleError::PeerClosed);
+                        // The next hop ended the circuit. Its reason is never
+                        // propagated, so the DESTROY this side sends upstream
+                        // carries DESTROYED like any other forwarded one.
+                        break Err(HandleError::DestroyedByNextHop);
                     }
                     _ => {
                         metrics::record_frame_dropped(metrics::DropReason::NotOpen);
@@ -1251,6 +1285,25 @@ async fn run_circuit(
     // Every violation a peer can cause maps to Protocol: a frame that does not
     // parse, a cell that does not decode, a layer that does not peel, and every
     // FlowError through destroy_reason_for (SECURITY_MODEL 6.4).
+    // The peer destroyed this circuit, so it already knows. Forward DESTROYED
+    // downstream, discard anything still queued by dropping the receiver, and
+    // send nothing back upstream (SECURITY_MODEL 6.3). Before this was its own
+    // outcome, the branch returned Ok and fell through to the send below, which
+    // answered the peer with a DESTROY carrying Requested.
+    if matches!(result, Err(HandleError::DestroyedByPeer)) {
+        forward_destroy(&mut next_link, out_layers).await;
+        return Ok(());
+    }
+
+    // The next hop destroyed it, so the same rule applies in the other
+    // direction: DESTROYED upstream, never the reason that arrived, and nothing
+    // downstream because that link is the one that ended.
+    if matches!(result, Err(HandleError::DestroyedByNextHop)) {
+        send_destroy(shared, id, layers, DestroyReason::Destroyed);
+        drop(next_link.take());
+        return Ok(());
+    }
+
     let reason = match &result {
         Err(HandleError::Flow(e)) => link::destroy_reason_for(e),
         Err(HandleError::Layer(_)) | Err(HandleError::Cell(_)) | Err(HandleError::LinkFrame(_)) => {
@@ -1258,6 +1311,10 @@ async fn run_circuit(
         }
         Err(HandleError::IllegalCellForRole(_, _)) => DestroyReason::Protocol,
         Err(HandleError::PeerClosed) => DestroyReason::Requested,
+        // Both are returned above, before a reason is chosen here.
+        Err(HandleError::DestroyedByPeer) | Err(HandleError::DestroyedByNextHop) => {
+            DestroyReason::Destroyed
+        }
         Err(_) => DestroyReason::Internal,
         Ok(()) => DestroyReason::Requested,
     };
@@ -1577,7 +1634,7 @@ mod tests {
         let now = Instant::now();
         let st = shared.lock();
         assert_eq!(st.table.len(), 0, "a circuit survived the link closing");
-        assert!(st.senders.is_empty());
+        assert!(st.handles.is_empty());
         for id in &ids {
             assert!(
                 st.table.quarantined(*id, now),

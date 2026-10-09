@@ -124,6 +124,9 @@ pub enum DropReason {
     QueueFull,
     /// The link is at MAX_CONTROL_QUEUE, so a DESTROY went unsent.
     ControlQueueFull,
+    /// A peer DESTROY arrived for a circuit whose task had already ended, so
+    /// the signal had no receiver left.
+    DestroySignalLost,
 }
 
 pub fn record_frame_dropped(reason: DropReason) {
@@ -135,6 +138,7 @@ pub fn record_frame_dropped(reason: DropReason) {
         DropReason::LinkFull => "link_full",
         DropReason::QueueFull => "queue_full",
         DropReason::ControlQueueFull => "control_queue_full",
+        DropReason::DestroySignalLost => "destroy_signal_lost",
     };
     frames_dropped().with_label_values(&[label]).inc();
 }
