@@ -176,10 +176,14 @@ fn document_from(
 ) -> Verified {
     let relays = entries
         .iter()
-        .map(|(role, addr, key)| RelayEntry {
-            id: format!("test-{role}"),
-            operator_id: format!("op-{role}"),
-            host_id: format!("host-{role}"),
+        .enumerate()
+        .map(|(i, (role, addr, key))| RelayEntry {
+            // The index keeps these distinct when a role is published twice,
+            // which the stalled circuit test needs: one middle that reads and
+            // one that does not.
+            id: format!("test-{role}-{i}"),
+            operator_id: format!("op-{role}-{i}"),
+            host_id: format!("host-{role}-{i}"),
             role: (*role).to_string(),
             ip: addr.ip().to_string(),
             port: addr.port(),
@@ -436,14 +440,87 @@ async fn spawn_fleet(
 }
 
 /// Mock client holding one Noise transport per hop.
-struct MockClient {
-    sock: ClientTlsStream<TcpStream>,
+/// One circuit's per-hop transports and its id on the link.
+///
+/// Separate from the socket, because a link carries several circuits and each
+/// one has its own keys. `MockClient` holds one of these and `MultiClient`
+/// holds several over the same socket.
+struct CircuitKeys {
+    /// The id the client chose. The client opened the link, so the id carries
+    /// the top bit set.
+    id: CircId,
     guard: Transport,
     middle: Option<Transport>,
     exit: Option<Transport>,
-    /// The id this client chose for its circuit on the guard link. The client
-    /// opened the link, so the id carries the top bit set.
-    circ_id: CircId,
+}
+
+impl CircuitKeys {
+    /// Number of hops whose transports are established.
+    fn hops(&self) -> usize {
+        1 + self.middle.is_some() as usize + self.exit.is_some() as usize
+    }
+
+    /// Seal `cell` for hop number `depth` (1 = guard, 2 = middle, 3 = exit),
+    /// wrapping it once per hop nearer the client.
+    fn seal_for_depth(&mut self, cell: &Cell, depth: usize) -> Vec<u8> {
+        // layers counts from the innermost hop outward: the exit is 1.
+        let layers = Layers::new(CLIENT_LAYERS.get() - (depth - 1));
+        let mut buf = match depth {
+            1 => seal_to_me(&mut self.guard, cell, layers).expect("seal guard"),
+            2 => seal_to_me(self.middle.as_mut().expect("middle"), cell, layers)
+                .expect("seal middle"),
+            3 => seal_to_me(self.exit.as_mut().expect("exit"), cell, layers).expect("seal exit"),
+            other => panic!("bad depth {other}"),
+        };
+        if depth >= 3 {
+            buf = seal_forward(
+                self.middle.as_mut().expect("middle"),
+                &buf,
+                CLIENT_LAYERS.peeled(),
+            )
+            .expect("wrap middle");
+        }
+        if depth >= 2 {
+            buf = seal_forward(&mut self.guard, &buf, CLIENT_LAYERS).expect("wrap guard");
+        }
+        buf
+    }
+
+    /// Peel every established layer off a frame body until a cell appears.
+    fn peel_inbound(&mut self, wire: &[u8]) -> Cell {
+        let mut blob = match peel(&mut self.guard, wire, CLIENT_LAYERS).expect("peel guard") {
+            Peeled::ToMe(cell) => return cell,
+            Peeled::Forward(b) => b,
+        };
+        if let Some(mid) = self.middle.as_mut() {
+            blob = match peel(mid, &blob, CLIENT_LAYERS.peeled()).expect("peel middle") {
+                Peeled::ToMe(cell) => return cell,
+                Peeled::Forward(b) => b,
+            };
+        }
+        let exit = self
+            .exit
+            .as_mut()
+            .expect("exit transport for innermost peel");
+        match peel(exit, &blob, Layers::new(1)).expect("peel exit") {
+            Peeled::ToMe(cell) => cell,
+            Peeled::Forward(_) => panic!("FORWARD arrived at the innermost layer"),
+        }
+    }
+
+    /// Record a newly finished hop's transport.
+    fn push_hop(&mut self, tx: Transport) {
+        if self.middle.is_none() {
+            self.middle = Some(tx);
+        } else {
+            self.exit = Some(tx);
+        }
+    }
+}
+
+struct MockClient {
+    sock: ClientTlsStream<TcpStream>,
+    keys: CircuitKeys,
     /// Every frame size observed on the client-guard link, in both directions.
     observed: Vec<usize>,
 }
@@ -494,10 +571,12 @@ impl MockClient {
         let guard_tx = Self::create_on(&mut sock, guard, auth_priv, m_raw, circ_id).await;
         Self {
             sock,
-            guard: guard_tx,
-            middle: None,
-            exit: None,
-            circ_id,
+            keys: CircuitKeys {
+                id: circ_id,
+                guard: guard_tx,
+                middle: None,
+                exit: None,
+            },
             observed: Vec::new(),
         }
     }
@@ -539,9 +618,8 @@ impl MockClient {
         init.finish(&msg2).expect("nk finish")
     }
 
-    /// Number of hops whose transports are established.
     fn hops(&self) -> usize {
-        1 + self.middle.is_some() as usize + self.exit.is_some() as usize
+        self.keys.hops()
     }
 
     /// Seal a cell for the deepest established hop and send it, wrapping it
@@ -551,30 +629,8 @@ impl MockClient {
         self.write_frame(&wire).await;
     }
 
-    /// Seal `cell` for hop number `depth` (1 = guard, 2 = middle, 3 = exit).
     fn seal_for_depth(&mut self, cell: &Cell, depth: usize) -> Vec<u8> {
-        // layers counts from the innermost hop outward: the exit is 1.
-        let layers = Layers::new(CLIENT_LAYERS.get() - (depth - 1));
-        let mut buf = match depth {
-            1 => seal_to_me(&mut self.guard, cell, layers).expect("seal guard"),
-            2 => seal_to_me(self.middle.as_mut().expect("middle"), cell, layers)
-                .expect("seal middle"),
-            3 => seal_to_me(self.exit.as_mut().expect("exit"), cell, layers).expect("seal exit"),
-            other => panic!("bad depth {other}"),
-        };
-        // Wrap once per hop nearer the client.
-        if depth >= 3 {
-            buf = seal_forward(
-                self.middle.as_mut().expect("middle"),
-                &buf,
-                CLIENT_LAYERS.peeled(),
-            )
-            .expect("wrap middle");
-        }
-        if depth >= 2 {
-            buf = seal_forward(&mut self.guard, &buf, CLIENT_LAYERS).expect("wrap guard");
-        }
-        buf
+        self.keys.seal_for_depth(cell, depth)
     }
 
     async fn write_frame(&mut self, wire: &[u8]) {
@@ -585,7 +641,7 @@ impl MockClient {
         );
         let frame = link_frame::encode(
             CLIENT_LAYERS,
-            self.circ_id,
+            self.keys.id,
             link_frame::LinkCommand::Data,
             wire,
         )
@@ -612,11 +668,11 @@ impl MockClient {
         self.observed.push(buf.len());
         let frame = link_frame::decode(&buf, CLIENT_LAYERS, LinkRole::Responder)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        if frame.circ_id != self.circ_id {
+        if frame.circ_id != self.keys.id {
             return Err(std::io::Error::other(format!(
                 "frame for circuit {:#010x} arrived on a client holding {:#010x}",
                 frame.circ_id.raw(),
-                self.circ_id.raw()
+                self.keys.id.raw()
             )));
         }
         match frame.command {
@@ -628,24 +684,7 @@ impl MockClient {
     /// Read one frame and peel every established layer until a cell appears.
     async fn read_cell(&mut self) -> Cell {
         let wire = self.read_frame().await.expect("read frame");
-        let mut blob = match peel(&mut self.guard, &wire, CLIENT_LAYERS).expect("peel guard") {
-            Peeled::ToMe(cell) => return cell,
-            Peeled::Forward(b) => b,
-        };
-        if let Some(mid) = self.middle.as_mut() {
-            blob = match peel(mid, &blob, CLIENT_LAYERS.peeled()).expect("peel middle") {
-                Peeled::ToMe(cell) => return cell,
-                Peeled::Forward(b) => b,
-            };
-        }
-        let exit = self
-            .exit
-            .as_mut()
-            .expect("exit transport for innermost peel");
-        match peel(exit, &blob, Layers::new(1)).expect("peel exit") {
-            Peeled::ToMe(cell) => cell,
-            Peeled::Forward(_) => panic!("FORWARD arrived at the innermost layer"),
-        }
+        self.keys.peel_inbound(&wire)
     }
 
     /// Extend the circuit to `next`, which becomes the new deepest hop.
@@ -665,11 +704,7 @@ impl MockClient {
         assert_eq!(back.cell_type, CellType::Extend, "expected EXTEND backward");
         let msg2 = parse_extend_backward(&back.payload).expect("parse msg2");
         let tx = init.finish(&msg2).expect("nk finish");
-        if self.middle.is_none() {
-            self.middle = Some(tx);
-        } else {
-            self.exit = Some(tx);
-        }
+        self.keys.push_hop(tx);
     }
 
     /// Attempt one EXTEND and report whether the hop served it.
@@ -692,7 +727,7 @@ impl MockClient {
         let wire = self.seal_for_depth(&cell, depth);
         let Ok(frame) = link_frame::encode(
             CLIENT_LAYERS,
-            self.circ_id,
+            self.keys.id,
             link_frame::LinkCommand::Data,
             &wire,
         ) else {
@@ -706,7 +741,7 @@ impl MockClient {
         else {
             return false;
         };
-        let Ok(peeled) = peel(&mut self.guard, &wire, CLIENT_LAYERS) else {
+        let Ok(peeled) = peel(&mut self.keys.guard, &wire, CLIENT_LAYERS) else {
             return false;
         };
         let Peeled::ToMe(back) = peeled else {
@@ -720,11 +755,7 @@ impl MockClient {
         };
         match init.finish(&msg2) {
             Ok(tx) => {
-                if self.middle.is_none() {
-                    self.middle = Some(tx);
-                } else {
-                    self.exit = Some(tx);
-                }
+                self.keys.push_hop(tx);
                 true
             }
             Err(_) => false,
@@ -972,7 +1003,7 @@ async fn a_create_for_an_open_circuit_is_ignored_and_the_circuit_survives() {
         body.extend_from_slice(&msg1);
         let collide = link_frame::encode(
             CLIENT_LAYERS,
-            client.circ_id,
+            client.keys.id,
             link_frame::LinkCommand::Create,
             &body,
         )
@@ -1201,7 +1232,7 @@ async fn a_forwarded_destroy_carries_destroyed_and_not_the_reason_received() {
         assert_ne!(sent as u8, DestroyReason::Destroyed as u8);
         let destroy = link_frame::encode(
             CLIENT_LAYERS,
-            client.circ_id,
+            client.keys.id,
             link_frame::LinkCommand::Destroy,
             &[sent as u8],
         )
@@ -1233,6 +1264,427 @@ async fn a_forwarded_destroy_carries_destroyed_and_not_the_reason_received() {
             body[0], sent as u8,
             "the reason the client chose crossed the relay, which is the side channel \
              tor-spec forbids"
+        );
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Extend one circuit by one hop, over a link that may carry others.
+///
+/// Separate from `MockClient::try_extend_to`, which exists to report a refusal
+/// as `false` and so tolerates a reply it cannot read. This one asserts, because
+/// every caller needs the hop and a reply that will not decrypt means the relay
+/// mixed two circuits up, which is the thing worth a panic.
+///
+/// It assumes no frame for another circuit arrives while it is waiting, which
+/// holds because the tests build their circuits before any data flows.
+async fn extend_circuit(
+    sock: &mut ClientTlsStream<TcpStream>,
+    keys: &mut CircuitKeys,
+    next_addr: SocketAddr,
+    next_key: [u8; STATIC_KEY_LEN],
+) {
+    let (init, msg1) = Initiator::start(&next_key).expect("nk start");
+    let extend = ExtendForward {
+        next_hop: next_addr,
+        noise_msg1: msg1,
+    };
+    let cell = Cell::new(CellType::Extend, extend.encode()).expect("extend cell");
+    let depth = keys.hops();
+    let wire = keys.seal_for_depth(&cell, depth);
+    let frame = link_frame::encode(CLIENT_LAYERS, keys.id, link_frame::LinkCommand::Data, &wire)
+        .expect("encode extend");
+    sock.write_all(&frame).await.expect("write extend");
+    sock.flush().await.expect("flush");
+
+    let mut buf = vec![0u8; link_frame::link_frame_len(CLIENT_LAYERS)];
+    tokio::time::timeout(Duration::from_secs(20), sock.read_exact(&mut buf))
+        .await
+        .expect("the hop never answered the extend")
+        .expect("read extend reply");
+    let back = link_frame::decode(&buf, CLIENT_LAYERS, LinkRole::Responder).expect("decode reply");
+    assert_eq!(
+        back.circ_id, keys.id,
+        "a reply arrived on the wrong circuit"
+    );
+    assert_eq!(back.command, link_frame::LinkCommand::Data);
+    let reply = keys.peel_inbound(back.body);
+    assert_eq!(
+        reply.cell_type,
+        CellType::Extend,
+        "expected EXTEND backward"
+    );
+    let msg2 = parse_extend_backward(&reply.payload).expect("parse msg2");
+    keys.push_hop(init.finish(&msg2).expect("nk finish"));
+}
+
+/// Several circuits riding one link to the guard.
+///
+/// `MockClient` holds one circuit and owns the methods the single-circuit tests
+/// need. This holds the socket and a circuit per id, and reads frames without
+/// caring which circuit they belong to, which is what the fairness and
+/// stalled-circuit tests measure.
+struct MultiClient {
+    sock: ClientTlsStream<TcpStream>,
+    keys: Vec<CircuitKeys>,
+}
+
+impl MultiClient {
+    async fn connect(connector: &TlsConnector, guard: &SpawnedRelay) -> Self {
+        let mut sock = tls_connect(connector, guard.addr).await;
+        sock.write_all(&[super::PROTO_CLIENT]).await.expect("proto");
+        sock.flush().await.expect("flush");
+        Self {
+            sock,
+            keys: Vec::new(),
+        }
+    }
+
+    /// Open one more circuit on this link. Each needs its own token, because
+    /// one token buys one circuit.
+    async fn open(
+        &mut self,
+        guard: &SpawnedRelay,
+        auth_priv: &RsaPrivateKey,
+        m_raw: [u8; 32],
+        raw_id: u32,
+    ) -> usize {
+        let circ_id = CircId::new(raw_id).expect("a nonzero id");
+        let guard_tx =
+            MockClient::create_on(&mut self.sock, guard, auth_priv, m_raw, circ_id).await;
+        self.keys.push(CircuitKeys {
+            id: circ_id,
+            guard: guard_tx,
+            middle: None,
+            exit: None,
+        });
+        self.keys.len() - 1
+    }
+
+    async fn extend(&mut self, which: usize, addr: SocketAddr, key: [u8; STATIC_KEY_LEN]) {
+        let keys = &mut self.keys[which];
+        extend_circuit(&mut self.sock, keys, addr, key).await;
+    }
+
+    /// Send one cell to the deepest established hop of one circuit.
+    async fn send(&mut self, which: usize, cell: &Cell) {
+        let keys = &mut self.keys[which];
+        let depth = keys.hops();
+        let wire = keys.seal_for_depth(cell, depth);
+        let frame =
+            link_frame::encode(CLIENT_LAYERS, keys.id, link_frame::LinkCommand::Data, &wire)
+                .expect("encode frame");
+        self.sock.write_all(&frame).await.expect("write frame");
+        self.sock.flush().await.expect("flush");
+    }
+
+    /// Read one frame, whichever circuit it names.
+    async fn next_frame(
+        &mut self,
+        budget: Duration,
+    ) -> Option<(CircId, link_frame::LinkCommand, Vec<u8>)> {
+        let mut buf = vec![0u8; link_frame::link_frame_len(CLIENT_LAYERS)];
+        match tokio::time::timeout(budget, self.sock.read_exact(&mut buf)).await {
+            Ok(Ok(_)) => {}
+            _ => return None,
+        }
+        let f = link_frame::decode(&buf, CLIENT_LAYERS, LinkRole::Responder).expect("decode frame");
+        Some((f.circ_id, f.command, f.body.to_vec()))
+    }
+
+    fn index_of(&self, id: CircId) -> usize {
+        self.keys
+            .iter()
+            .position(|k| k.id == id)
+            .unwrap_or_else(|| panic!("a frame for {:#010x}, which is not on this link", id.raw()))
+    }
+
+    fn id(&self, which: usize) -> CircId {
+        self.keys[which].id
+    }
+}
+
+/// One stalled circuit does not stall the others on its link.
+///
+/// Circuit A's next hop completes the handshake and then reads nothing, so the
+/// guard's write to it blocks, A's task stops consuming and the link reader
+/// fills A's queue. Circuit B shares the link and must keep carrying data
+/// throughout, which is what `try_send` in the inbound dispatch buys: a reader
+/// that waits on A's channel would stop reading B's frames too, and that is the
+/// head of line blocking multiplexing exists to remove.
+///
+/// Every wait here has a deadline, so the `send().await` mutant fails this test
+/// with a message rather than hanging it.
+#[tokio::test]
+async fn a_stalled_circuit_does_not_stall_the_others_on_its_link() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        ensure_crypto_provider();
+        let keydir = tempfile::tempdir().expect("keydir");
+        let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let pki = make_pki();
+        let server_config = make_server_config(&pki);
+        let connector = Arc::new(make_connector(&pki));
+        let over = default_override();
+        let fleet = spawn_fleet(
+            &auth_priv,
+            &over,
+            server_config.clone(),
+            connector.clone(),
+            keydir.path(),
+        )
+        .await;
+
+        // Two next hops published as middles: one that reads and one that
+        // never does.
+        let mut live = RecordingMiddle::spawn(server_config.clone()).await;
+        let stalled = RecordingMiddle::spawn_gated(server_config).await;
+        let (after, fresh, until) = current_window();
+        fleet.publish(document_from(
+            &[
+                ("guard", fleet.guard.addr, fleet.guard.static_pubkey),
+                ("middle", live.addr, live.static_pubkey),
+                ("middle", stalled.addr, stalled.static_pubkey),
+                ("exit", fleet.exit.addr, fleet.exit.static_pubkey),
+            ],
+            &after,
+            &fresh,
+            &until,
+        ));
+
+        let mut client = MultiClient::connect(&connector, &fleet.guard).await;
+        let a = client
+            .open(&fleet.guard, &auth_priv, [0xF1; 32], 0x8000_0030)
+            .await;
+        let b = client
+            .open(&fleet.guard, &auth_priv, [0xF2; 32], 0x8000_0031)
+            .await;
+        client.extend(a, stalled.addr, stalled.static_pubkey).await;
+        client.extend(b, live.addr, live.static_pubkey).await;
+
+        // Control: B works before A is stalled, so a later failure is about
+        // the stall and not about B.
+        let hello = Cell::new(CellType::Data, b"before".to_vec()).expect("cell");
+        client.send(b, &hello).await;
+        live.next_frame_within(Duration::from_secs(10))
+            .await
+            .expect("B did not carry data even before A stalled");
+
+        // Fill A past its queue. Most of this is absorbed by socket buffers
+        // between the guard and the stalled hop before the guard's write
+        // blocks, and only then does the reader start queueing. The count is
+        // far above MAX_CIRCUIT_QUEUE for that reason: measured here, 6000
+        // frames reaches the cap once and 1624 never does, so FILLER leaves
+        // room for a machine whose buffers are larger.
+        const FILLER: usize = 8000;
+        let queue_full_before = crate::metrics::dropped_count("queue_full");
+        let filler = Cell::new(CellType::Data, vec![0x5C; 64]).expect("cell");
+        for _ in 0..FILLER {
+            client.send(a, &filler).await;
+        }
+
+        // B still carries data while A is stalled and being torn down.
+        let after_stall = Cell::new(CellType::Data, b"during".to_vec()).expect("cell");
+        client.send(b, &after_stall).await;
+        live.next_frame_within(Duration::from_secs(20))
+            .await
+            .expect("B stopped carrying data while A was stalled");
+
+        // A is destroyed for exceeding what its queue can hold, and the frame
+        // naming it says so.
+        // The stall has to have happened, or everything below passes without
+        // exercising anything. No other test fills a circuit queue, so the
+        // counter moving is this test's doing.
+        assert!(
+            crate::metrics::dropped_count("queue_full") > queue_full_before,
+            "{FILLER} frames did not fill the queue, so this run never stalled a circuit \
+             and proves nothing about the ones beside it"
+        );
+
+        let mut a_destroyed = None;
+        for _ in 0..8 {
+            let Some((id, command, body)) = client.next_frame(Duration::from_secs(20)).await else {
+                break;
+            };
+            if id == client.id(a) && command == link_frame::LinkCommand::Destroy {
+                let reason =
+                    link_frame::payload(&body, link_frame::DESTROY_BODY_LEN).expect("destroy body");
+                a_destroyed = Some(reason[0]);
+                break;
+            }
+        }
+        assert_eq!(
+            a_destroyed,
+            Some(DestroyReason::Protocol as u8),
+            "the stalled circuit was not destroyed with Protocol once its queue filled"
+        );
+
+        // The link and B both survived A being destroyed.
+        let after_destroy = Cell::new(CellType::Data, b"after".to_vec()).expect("cell");
+        client.send(b, &after_destroy).await;
+        live.next_frame_within(Duration::from_secs(20))
+            .await
+            .expect("the link or circuit B died with circuit A");
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// Two circuits with sustained backlogs on one link both keep making progress.
+///
+/// The writer takes one frame per circuit per turn (`LinkTable::pop_next_out`),
+/// so while both queues hold something the frames leaving the link alternate.
+/// The socket preserves that order, so the whole stream the client reads is in
+/// the order the writer popped it.
+///
+/// The bound is how long one circuit may hold the writer, and it is empirical,
+/// not derived. That is worth stating plainly.
+///
+/// The derived property is exact: `LinkTable::pop_next_out` takes one frame and
+/// moves that circuit to the back of the rotation, so while every circuit has
+/// something queued the counts stay within one. It is conditional on every
+/// queue being non-empty, and a client cannot see whether they are, so it
+/// cannot be asserted from here. `link::tests::the_writer_alternates_between_two_backlogged_circuits`
+/// asserts it where the queues are visible.
+///
+/// What is left end to end is that no circuit is starved for long. Measured at
+/// this commit, idle: counts 200 each over an 800 frame window with a longest
+/// single circuit run of 2. Under a loaded machine running the suite in
+/// parallel: 184, 184, 184, 248 with a run of 66, because one circuit's echo
+/// arrives late and the other three empty while it catches up. A writer that
+/// drains one circuit before looking at the next: 54, 358, 256, 132 with a run
+/// of 354.
+///
+/// `MAX_RUN` of 200 sits three times above the worst observed skew and well
+/// under what abandoning the rotation produces.
+///
+/// Two tighter bounds were tried and rejected. A share, that no circuit falls
+/// below a third of another, passes the FIFO writer at 132 against 307. A
+/// spread of one missed turn per circuit holds when idle and fails under
+/// parallel load at a spread of 64, because a late circuit misses many turns in
+/// a row rather than one.
+#[tokio::test]
+async fn two_backlogged_circuits_on_one_link_both_progress() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        ensure_crypto_provider();
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.expect("echo bind");
+        let echo_addr = echo_listener.local_addr().expect("echo addr");
+        tokio::spawn(run_echo_server(echo_listener));
+        let socks_listener = TcpListener::bind("127.0.0.1:0").await.expect("socks bind");
+        let socks_addr = socks_listener.local_addr().expect("socks addr");
+        tokio::spawn(run_socks5_stub(socks_listener, echo_addr));
+
+        let keydir = tempfile::tempdir().expect("keydir");
+        let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let pki = make_pki();
+        let server_config = make_server_config(&pki);
+        let connector = Arc::new(make_connector(&pki));
+        let over = RelayOverride {
+            decodo_proxy_url: Some(format!("socks5://user:pass@{socks_addr}")),
+            allowed_exit_ports: vec![echo_addr.port()],
+        };
+        let fleet = spawn_fleet(
+            &auth_priv,
+            &over,
+            server_config,
+            connector.clone(),
+            keydir.path(),
+        )
+        .await;
+
+        // Four full three hop circuits over one link. Two is enough to measure
+        // fairness and not enough to create it: the exit's package window caps
+        // each circuit at 1000 cells, so two circuits put about 1.1 MB in
+        // flight, which the socket buffers between the guard and this client
+        // absorb whole. With nothing waiting in a queue, a writer that drains
+        // one circuit first drains a queue of one frame and looks exactly like
+        // one that alternates. Four circuits put about 1.8 MB in flight, which
+        // outruns the buffers and leaves a real backlog to choose from.
+        const CIRCUITS: usize = 4;
+        let mut client = MultiClient::connect(&connector, &fleet.guard).await;
+        for i in 0..CIRCUITS {
+            let mut token = [0xA0u8; 32];
+            token[0] = 0xA1 + i as u8;
+            client
+                .open(&fleet.guard, &auth_priv, token, 0x8000_0040 + i as u32)
+                .await;
+        }
+        for which in 0..CIRCUITS {
+            client
+                .extend(which, fleet.middle.addr, fleet.middle.static_pubkey)
+                .await;
+            client
+                .extend(which, fleet.exit.addr, fleet.exit.static_pubkey)
+                .await;
+        }
+
+        let connect = ConnectPayload {
+            host: echo_addr.ip().to_string(),
+            port: echo_addr.port(),
+        };
+        let cell = Cell::new(CellType::Connect, connect.encode().expect("encode")).expect("cell");
+        for which in 0..CIRCUITS {
+            client.send(which, &cell).await;
+        }
+
+        // Interleaved, so both echo streams start together and neither builds
+        // a head start that the measurement would read as unfairness.
+        // Enough that the echo coming back outruns the socket buffers while
+        // the client is still sending and reading nothing, so both per-circuit
+        // queues are deep by the time the reading below starts. With a shallow
+        // queue a writer that drains one circuit first is indistinguishable
+        // from one that alternates, because the queue it would drain holds a
+        // single frame. 800 stays inside the exit's 1000 cell package window,
+        // which is what it can send back without a SENDME the mock client
+        // never sends.
+        const PER_CIRCUIT: usize = 800;
+        /// The longest a single circuit may hold the writer. Empirical: three
+        /// times the worst skew measured under parallel load.
+        const MAX_RUN: usize = 200;
+        let payload = Cell::new(CellType::Data, vec![0x3C; 400]).expect("data cell");
+        for _ in 0..PER_CIRCUIT {
+            for which in 0..CIRCUITS {
+                client.send(which, &payload).await;
+            }
+        }
+
+        // Read back and watch the order the writer chose.
+        let mut counts = [0usize; CIRCUITS];
+        let mut run = 0usize;
+        let mut longest_run = 0usize;
+        let mut last: Option<usize> = None;
+        // Half of what is queued, so the window measured sits inside the
+        // backlog rather than running off its end, where one circuit's data
+        // legitimately runs out before the other's.
+        let want = PER_CIRCUIT;
+        while counts.iter().sum::<usize>() < want {
+            let Some((id, command, _)) = client.next_frame(Duration::from_secs(20)).await else {
+                break;
+            };
+            if command != link_frame::LinkCommand::Data {
+                panic!("the link carried {command:?} during the backlog");
+            }
+            let which = client.index_of(id);
+            counts[which] += 1;
+            run = if last == Some(which) { run + 1 } else { 1 };
+            last = Some(which);
+            longest_run = longest_run.max(run);
+        }
+
+        assert_eq!(
+            counts.iter().sum::<usize>(),
+            want,
+            "the link stopped delivering before {want} frames: {counts:?}"
+        );
+        assert!(
+            counts.iter().all(|c| *c > 0),
+            "a circuit was starved entirely over the window: {counts:?}"
+        );
+        assert!(
+            longest_run <= MAX_RUN,
+            "one circuit held the writer for {longest_run} frames in a row, past the \
+             {MAX_RUN} that arrival skew accounts for, so the writer is not rotating: \
+             {counts:?}"
         );
     })
     .await
@@ -1288,7 +1740,7 @@ async fn a_peer_destroy_is_not_answered_upstream() {
 
         let destroy = link_frame::encode(
             CLIENT_LAYERS,
-            client.circ_id,
+            client.keys.id,
             link_frame::LinkCommand::Destroy,
             &[DestroyReason::Protocol as u8],
         )
@@ -1399,7 +1851,7 @@ async fn a_destroy_overtakes_queued_data() {
 
         let destroy = link_frame::encode(
             CLIENT_LAYERS,
-            client.circ_id,
+            client.keys.id,
             link_frame::LinkCommand::Destroy,
             &[DestroyReason::Protocol as u8],
         )
@@ -1501,7 +1953,7 @@ async fn tampered_cell_destroys_only_that_circuit() {
             .expect("read destroy");
         let back =
             link_frame::decode(&buf, CLIENT_LAYERS, LinkRole::Responder).expect("decode destroy");
-        assert_eq!(back.circ_id, client.circ_id);
+        assert_eq!(back.circ_id, client.keys.id);
         assert_eq!(
             back.command,
             link_frame::LinkCommand::Destroy,
@@ -1588,7 +2040,7 @@ async fn replayed_cell_destroys_the_circuit() {
                 Ok(Ok(_)) => {
                     let back = link_frame::decode(&buf, CLIENT_LAYERS, LinkRole::Responder)
                         .expect("decode frame");
-                    assert_eq!(back.circ_id, client.circ_id);
+                    assert_eq!(back.circ_id, client.keys.id);
                     if back.command == link_frame::LinkCommand::Destroy {
                         destroyed = true;
                         break;
@@ -1751,7 +2203,7 @@ async fn wrong_size_cell_tears_down_the_circuit() {
         // blocked waiting for a whole frame and must never process this.
         let frame = link_frame::encode(
             CLIENT_LAYERS,
-            client.circ_id,
+            client.keys.id,
             link_frame::LinkCommand::Data,
             &wire,
         )
