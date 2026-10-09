@@ -16,6 +16,17 @@
 //! Only DATA counts. A SENDME that decremented a window would make the windows
 //! unable to recover, which is why [`Windows`] has no method that takes one.
 //!
+//! A SENDME that was not owed is a protocol violation rather than something to
+//! absorb. Crediting it would take the package window past its starting value,
+//! so instead the window is left untouched and the caller tears the circuit
+//! down with `DestroyReason::Protocol`. Tor does the same:
+//! `sendme_process_circuit_level_impl` is documented as updating the package
+//! window while ensuring it does not exceed the max, returning
+//! `-END_CIRC_REASON_TORPROTOCOL` when it would, and its caller closes the
+//! circuit on that return. An earlier version of this module capped the window
+//! and reported success, which left a peer free to keep probing at no cost and
+//! deleted the only signal that anything was wrong.
+//!
 //! The credit on the receiving side is deliberately not automatic. A SENDME says
 //! "I have consumed 100 cells, send 100 more", so the deliver window is credited
 //! when the caller actually sends one, which it does once the data has been
@@ -44,6 +55,8 @@ pub enum FlowError {
     PackageWindowExhausted,
     #[error("peer sent more DATA than its window allowed, deliver window at {0}")]
     DeliverWindowNegative(i32),
+    #[error("peer sent a SENDME it did not owe, package window already at {0}")]
+    UnexpectedSendme(i32),
 }
 
 /// What to do after delivering a cell.
@@ -109,12 +122,18 @@ impl Windows {
 
     /// Credit the package window on a received SENDME.
     ///
-    /// Capped at the starting value, so a peer that sends more SENDMEs than it
-    /// owes cannot inflate the window without bound. An uncapped window is the
-    /// same cost attack authenticated SENDMEs exist for, reached by a different
-    /// route, so the cap holds whether or not the receipt checks out.
-    pub fn on_sendme_received(&mut self) {
-        self.package = (self.package + WINDOW_INCREMENT).min(WINDOW_START);
+    /// A SENDME that was not owed is refused and the window is left untouched,
+    /// so the caller destroys the circuit with `DestroyReason::Protocol`. This
+    /// does not cap: capping would absorb the violation, leaving a peer free to
+    /// keep sending unowed SENDMEs at no cost and removing the only sign that
+    /// anything is wrong. Tor returns `-END_CIRC_REASON_TORPROTOCOL` in the same
+    /// situation and its caller closes the circuit (SECURITY_MODEL 6.4).
+    pub fn on_sendme_received(&mut self) -> Result<(), FlowError> {
+        if self.package + WINDOW_INCREMENT > WINDOW_START {
+            return Err(FlowError::UnexpectedSendme(self.package));
+        }
+        self.package += WINDOW_INCREMENT;
+        Ok(())
     }
 
     /// Account for delivering one DATA cell, and say whether a SENDME is owed.
@@ -177,7 +196,8 @@ mod tests {
         assert!(!w.may_send(), "did not stop at the window");
         assert_eq!(w.on_data_sent(), Err(FlowError::PackageWindowExhausted));
 
-        w.on_sendme_received();
+        w.on_sendme_received()
+            .expect("a SENDME at an exhausted window is owed");
         assert_eq!(w.package(), WINDOW_INCREMENT);
         assert!(w.may_send());
         for _ in 0..WINDOW_INCREMENT {
@@ -186,14 +206,63 @@ mod tests {
         assert!(!w.may_send(), "did not stop again after the credit ran out");
     }
 
-    /// A peer that over-credits cannot inflate the window past its start.
+    /// A SENDME the peer did not owe is a protocol violation: the window is
+    /// left untouched and the caller tears the circuit down. Capping instead
+    /// would absorb the violation (SECURITY_MODEL 6.4).
     #[test]
-    fn the_package_window_is_capped_at_its_start() {
+    fn an_unowed_sendme_at_a_full_window_is_refused() {
         let mut w = Windows::new();
-        for _ in 0..100 {
-            w.on_sendme_received();
-        }
         assert_eq!(w.package(), WINDOW_START);
+        assert_eq!(
+            w.on_sendme_received(),
+            Err(FlowError::UnexpectedSendme(WINDOW_START))
+        );
+        assert_eq!(
+            w.package(),
+            WINDOW_START,
+            "the window must be untouched when the SENDME is refused"
+        );
+        // Still refused on a second try, so the first refusal did not move the
+        // window part way toward accepting one.
+        assert!(w.on_sendme_received().is_err());
+        assert_eq!(w.package(), WINDOW_START);
+    }
+
+    /// Control for the case above: an owed SENDME credits exactly one
+    /// increment, so the refusal is attributable to the window being full
+    /// rather than to SENDMEs never being credited.
+    #[test]
+    fn an_owed_sendme_credits_exactly_one_increment() {
+        let mut w = Windows::new();
+        for _ in 0..WINDOW_INCREMENT {
+            w.on_data_sent().expect("within the window");
+        }
+        assert_eq!(w.package(), WINDOW_START - WINDOW_INCREMENT);
+        w.on_sendme_received()
+            .expect("exactly one increment is owed");
+        assert_eq!(w.package(), WINDOW_START);
+
+        // One more is not owed.
+        assert!(w.on_sendme_received().is_err());
+        assert_eq!(w.package(), WINDOW_START);
+    }
+
+    /// The boundary: one cell short of a full increment, a SENDME would
+    /// overshoot and is refused.
+    #[test]
+    fn a_sendme_that_would_overshoot_the_start_is_refused() {
+        let mut w = Windows::new();
+        for _ in 0..(WINDOW_INCREMENT - 1) {
+            w.on_data_sent().expect("within the window");
+        }
+        assert_eq!(w.package(), WINDOW_START - WINDOW_INCREMENT + 1);
+        assert_eq!(
+            w.on_sendme_received(),
+            Err(FlowError::UnexpectedSendme(
+                WINDOW_START - WINDOW_INCREMENT + 1
+            ))
+        );
+        assert_eq!(w.package(), WINDOW_START - WINDOW_INCREMENT + 1);
     }
 
     /// A SENDME is owed every 100 delivered cells, and the window is credited

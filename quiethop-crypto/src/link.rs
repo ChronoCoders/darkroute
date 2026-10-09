@@ -59,6 +59,8 @@ pub enum LinkError {
     CircId(#[from] CircIdError),
     #[error("body for this command is {want} bytes but the frame carries {got} of payload")]
     BodyTooShort { got: usize, want: usize },
+    #[error("payload is {got} bytes, more than the {max} byte body of this link's frame")]
+    PayloadTooLong { got: usize, max: usize },
     #[error("padding after a {0} byte body is not zero")]
     DirtyPadding(usize),
 }
@@ -71,7 +73,11 @@ pub enum LinkCommand {
     Data = 0x03,
     Destroy = 0x04,
     /// Reserved so link padding can be added later without a wire change.
-    /// Nothing sends it in this step; a receiver accepts and ignores it.
+    ///
+    /// Nothing sends it in this step. A receiver accepts it and ignores it, but
+    /// its body must be entirely zero: an unchecked body on a command every hop
+    /// forwards is a covert channel, which is the same reason [`payload`]
+    /// checks the padding after a short control body.
     Padding = 0x05,
 }
 
@@ -131,9 +137,9 @@ pub fn encode_into(
     }
     let body = link_cell_len(layers);
     if payload.len() > body {
-        return Err(LinkError::BodyTooShort {
+        return Err(LinkError::PayloadTooLong {
             got: payload.len(),
-            want: body,
+            max: body,
         });
     }
     out[..CIRC_ID_LEN].copy_from_slice(&circ_id.to_bytes());
@@ -179,10 +185,18 @@ pub fn decode(wire: &[u8], layers: usize, peer: LinkRole) -> Result<Frame<'_>, L
         LinkCommand::Create => CircId::from_peer(raw, peer)?,
         _ => CircId::new(raw)?,
     };
+    let body = &wire[LINK_HEADER_LEN..];
+    // A PADDING frame carries nothing, so its whole body must be zero. Checked
+    // here rather than left to the caller, because the one thing a caller does
+    // with PADDING is ignore it, and an ignored frame is exactly where an
+    // unchecked body would go unnoticed.
+    if command == LinkCommand::Padding {
+        payload(body, 0)?;
+    }
     Ok(Frame {
         circ_id,
         command,
-        body: &wire[LINK_HEADER_LEN..],
+        body,
     })
 }
 
@@ -372,12 +386,50 @@ mod tests {
         );
     }
 
+    /// An over-long payload on encode is its own error, kept distinct from the
+    /// decode-side BodyTooShort so a failure says which side was wrong.
     #[test]
     fn a_payload_longer_than_the_body_is_refused() {
-        let too_long = vec![0u8; link_cell_len(MIDDLE_EXIT) + 1];
-        assert!(matches!(
+        let body = link_cell_len(MIDDLE_EXIT);
+        let too_long = vec![0u8; body + 1];
+        assert_eq!(
             encode(MIDDLE_EXIT, id(), LinkCommand::Data, &too_long),
-            Err(LinkError::BodyTooShort { .. })
-        ));
+            Err(LinkError::PayloadTooLong {
+                got: body + 1,
+                max: body
+            })
+        );
+        // Exactly the body length is fine, so the refusal is the extra byte.
+        assert!(encode(MIDDLE_EXIT, id(), LinkCommand::Data, &too_long[..body]).is_ok());
+    }
+
+    /// A PADDING frame carries nothing, so a non-zero body is refused. Without
+    /// the check it would be a covert channel through a command every hop
+    /// forwards and every receiver ignores.
+    #[test]
+    fn a_padding_frame_with_a_non_zero_body_is_refused() {
+        let clean = encode(MIDDLE_EXIT, id(), LinkCommand::Padding, &[]).unwrap();
+        assert!(
+            decode(&clean, MIDDLE_EXIT, LinkRole::Initiator).is_ok(),
+            "an all zero PADDING frame must be accepted"
+        );
+
+        // One non-zero byte anywhere in the body is refused, first and last.
+        for pos in [LINK_HEADER_LEN, clean.len() - 1] {
+            let mut dirty = clean.clone();
+            dirty[pos] = 0x01;
+            assert_eq!(
+                decode(&dirty, MIDDLE_EXIT, LinkRole::Initiator),
+                Err(LinkError::DirtyPadding(0)),
+                "a non-zero byte at {pos} was accepted"
+            );
+        }
+
+        // And the same byte in a DATA frame is fine, so the refusal is the
+        // command rather than the content.
+        let mut data = encode(MIDDLE_EXIT, id(), LinkCommand::Data, &[]).unwrap();
+        data[CIRC_ID_LEN] = LinkCommand::Data as u8;
+        data[LINK_HEADER_LEN] = 0x01;
+        assert!(decode(&data, MIDDLE_EXIT, LinkRole::Initiator).is_ok());
     }
 }
