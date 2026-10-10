@@ -151,6 +151,60 @@ enum Slot<T> {
     Open(Arc<Shared<T>>),
 }
 
+/// Keeps the map consistent if the elected dialer leaves without publishing.
+///
+/// The normal paths publish Ready or Failed and disarm this. Two paths do not
+/// reach them at all: the dial future being dropped, which is what cancellation
+/// and a task abort do, and a panic inside the dial. Both would leave an
+/// `Opening` slot that nothing will ever resolve, and from then on every
+/// `acquire` for that hop becomes a waiter, finds the channel closed and fails,
+/// for the life of the process.
+///
+/// On drop it removes the slot only if the key still holds this dialer's own
+/// `Opening`, compared by channel identity rather than by key, and publishes
+/// Failed so any waiter already attached errors for its own circuit instead of
+/// hanging.
+struct DialGuard<'a, T> {
+    registry: &'a Registry<T>,
+    key: LinkKey,
+    /// This dialer's own receiver, kept only to recognise its own slot.
+    mine: watch::Receiver<OpenState<T>>,
+    /// Taken once the dialer is ready to publish, which disarms the guard.
+    tx: Option<watch::Sender<OpenState<T>>>,
+}
+
+impl<T> DialGuard<'_, T> {
+    /// Tell the waiters and disarm. A dialer publishes once, so a second call
+    /// does nothing.
+    fn publish(&mut self, state: OpenState<T>) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(state);
+        }
+    }
+
+    /// Give the key back and publish the failure, so the next caller dials
+    /// fresh and the waiters stop waiting. Shared with `Drop`, which is the
+    /// whole point: the cancelled path and the failed path owe the same two
+    /// things.
+    fn fail(&mut self, msg: String) {
+        self.registry.remove_if_mine(&self.key, &self.mine);
+        self.publish(OpenState::Failed(msg));
+    }
+}
+
+impl<T> Drop for DialGuard<'_, T> {
+    fn drop(&mut self) {
+        if self.tx.is_none() {
+            return;
+        }
+        warn!(
+            addr = %self.key.addr,
+            "a dial to the next hop was abandoned before it published"
+        );
+        self.fail("the dial was abandoned before it opened the link".to_string());
+    }
+}
+
 /// The links this relay holds, one per next hop.
 pub struct Registry<T> {
     links: Mutex<HashMap<LinkKey, Slot<T>>>,
@@ -196,7 +250,7 @@ impl<T> Registry<T> {
         E: fmt::Display,
     {
         enum Role<T> {
-            Dial(watch::Sender<OpenState<T>>),
+            Dial(watch::Sender<OpenState<T>>, watch::Receiver<OpenState<T>>),
             Wait(watch::Receiver<OpenState<T>>),
             Have(Arc<Shared<T>>, Reservation<T>),
         }
@@ -217,8 +271,8 @@ impl<T> Registry<T> {
                 // Absent, or present and closing: this caller dials.
                 _ => {
                     let (tx, rx) = watch::channel(OpenState::Pending);
-                    links.insert(key.clone(), Slot::Opening(rx));
-                    Role::Dial(tx)
+                    links.insert(key.clone(), Slot::Opening(rx.clone()));
+                    Role::Dial(tx, rx)
                 }
             }
         };
@@ -229,7 +283,7 @@ impl<T> Registry<T> {
                 reservation,
                 dialed: false,
             }),
-            Role::Dial(tx) => self.dial_and_publish(key, cap, dial, tx).await,
+            Role::Dial(tx, rx) => self.dial_and_publish(key, cap, dial, tx, rx).await,
             Role::Wait(mut rx) => {
                 loop {
                     let state = rx.borrow_and_update().clone();
@@ -239,8 +293,11 @@ impl<T> Registry<T> {
                         OpenState::Pending => {}
                     }
                     if rx.changed().await.is_err() {
-                        // The dialer went without publishing, which it does not
-                        // do, so treat it as the link being gone.
+                        // Every dialer publishes before it goes, on its normal
+                        // paths and through DialGuard on cancellation and panic,
+                        // so reaching here means the sender went after a value
+                        // this loop had already read. Report it rather than wait
+                        // on a channel nothing will touch again.
                         return Err(AcquireError::Raced);
                     }
                 }
@@ -254,12 +311,21 @@ impl<T> Registry<T> {
         cap: usize,
         dial: F,
         tx: watch::Sender<OpenState<T>>,
+        mine: watch::Receiver<OpenState<T>>,
     ) -> Result<Acquired<T>, AcquireError>
     where
         F: FnOnce() -> Fut,
         Fut: Future<Output = Result<T, E>>,
         E: fmt::Display,
     {
+        // Armed across the dial, so an abandoned dial does not leave the key
+        // pointing at a slot nothing will resolve.
+        let mut guard = DialGuard {
+            registry: self,
+            key: key.clone(),
+            mine,
+            tx: Some(tx),
+        };
         match dial().await {
             Ok(payload) => {
                 let link = Arc::new(Shared {
@@ -277,7 +343,7 @@ impl<T> Registry<T> {
                 };
                 // Published after the slot is open, so a waiter that wakes and
                 // takes the lock finds the link there.
-                let _ = tx.send(OpenState::Ready(Arc::clone(&link)));
+                guard.publish(OpenState::Ready(Arc::clone(&link)));
                 Ok(Acquired {
                     link,
                     reservation,
@@ -290,11 +356,24 @@ impl<T> Registry<T> {
                 // errors for its own circuit and the next caller dials fresh.
                 // Nothing retries here: a retry storm against a hop that is
                 // down turns one failing relay into a load problem.
-                self.lock().remove(&key);
-                let _ = tx.send(OpenState::Failed(msg.clone()));
+                guard.fail(msg.clone());
                 warn!(%msg, "dialing the next hop failed");
                 Err(AcquireError::Dial(msg))
             }
+        }
+    }
+
+    /// Drop this key's slot, but only while it is still the `Opening` that
+    /// `mine` belongs to.
+    ///
+    /// By channel identity, never by key alone. A key whose slot has moved on,
+    /// to another dialer's `Opening` or to an open link, belongs to somebody
+    /// else, and removing it would take a live link's entry away from the
+    /// circuits still riding it.
+    fn remove_if_mine(&self, key: &LinkKey, mine: &watch::Receiver<OpenState<T>>) {
+        let mut links = self.lock();
+        if matches!(links.get(key), Some(Slot::Opening(rx)) if rx.same_channel(mine)) {
+            links.remove(key);
         }
     }
 
@@ -409,6 +488,153 @@ mod tests {
         reg.acquire(k, CAP, || async move { Ok::<_, String>(Fake(n)) })
             .await
             .expect("a fresh dial succeeds")
+    }
+
+    /// A dial future dropped before it publishes must leave the key dialable.
+    ///
+    /// The dialer inserts the opening slot and then awaits. Cancellation and a
+    /// task abort both drop that future without running either publish path,
+    /// and without the guard the slot stays for the life of the process and
+    /// every later circuit to that hop fails as a waiter on a dead channel.
+    #[tokio::test]
+    async fn a_dial_dropped_before_it_publishes_leaves_the_key_dialable() {
+        let reg = Registry::<Fake>::new();
+        let k = key(10);
+
+        {
+            let abandoned = reg.acquire(k.clone(), CAP, || async {
+                std::future::pending::<()>().await;
+                Ok::<_, String>(Fake(1))
+            });
+            tokio::pin!(abandoned);
+            // Polled once, so the election has happened and the slot is in.
+            tokio::select! {
+                biased;
+                _ = &mut abandoned => panic!("a dial that never completes returned"),
+                _ = tokio::task::yield_now() => {}
+            }
+            assert_eq!(reg.len(), 1, "the dialer did not take the key");
+        }
+
+        assert_eq!(
+            reg.len(),
+            0,
+            "the abandoned dial left its opening slot behind, so this hop is now \
+             unreachable until the relay restarts"
+        );
+        let fresh = open(&reg, k, 2).await;
+        assert!(fresh.dialed, "the next caller waited instead of dialing");
+        assert_eq!(fresh.link.link.0, 2);
+    }
+
+    /// A waiter already attached when the dialer is abandoned errors for its
+    /// own circuit, inside a deadline, rather than waiting on a channel
+    /// nothing will touch again.
+    #[tokio::test]
+    async fn a_waiter_on_an_abandoned_dial_errors_rather_than_hanging() {
+        let reg = Arc::new(Registry::<Fake>::new());
+        let k = key(11);
+        let dialing = Arc::new(Notify::new());
+
+        let dialer = {
+            let reg = Arc::clone(&reg);
+            let k = k.clone();
+            let started = Arc::clone(&dialing);
+            tokio::spawn(async move {
+                reg.acquire(k, CAP, || async move {
+                    started.notify_one();
+                    std::future::pending::<()>().await;
+                    Ok::<_, String>(Fake(1))
+                })
+                .await
+                .map(|_| ())
+            })
+        };
+        dialing.notified().await;
+
+        let waiter = {
+            let reg = Arc::clone(&reg);
+            let k = k.clone();
+            tokio::spawn(async move {
+                reg.acquire(k, CAP, || async { Ok::<_, String>(Fake(9)) })
+                    .await
+            })
+        };
+        // Let the waiter reach the watch before the dialer is taken away.
+        tokio::task::yield_now().await;
+        assert_eq!(reg.len(), 1);
+
+        dialer.abort();
+
+        let got = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter hung on a dialer that will never publish")
+            .expect("the waiter task panicked");
+        match got {
+            Err(AcquireError::Dial(msg)) => assert!(
+                msg.contains("abandoned"),
+                "the waiter was told {msg:?}, which does not say the dial was abandoned"
+            ),
+            Err(e) => panic!("a waiter on an abandoned dial got {e} instead of a dial failure"),
+            Ok(_) => panic!("a waiter was handed a link by a dialer that never opened one"),
+        }
+    }
+
+    /// An abandoned dialer tidies up its own slot and nobody else's.
+    ///
+    /// Removing by key alone would take the entry away from a link that has
+    /// since taken the key, and its circuits are still riding it.
+    #[tokio::test]
+    async fn an_abandoned_dial_does_not_remove_a_newer_slot_under_its_key() {
+        let reg = Registry::<Fake>::new();
+        let k = key(12);
+
+        for newer_is_open in [true, false] {
+            // The dialer is dropped where this scope ends, which is the whole
+            // point of the scope: a pinned future handed to select! is not
+            // dropped by dropping the pin.
+            let marker = {
+                let abandoned = reg.acquire(k.clone(), CAP, || async {
+                    std::future::pending::<()>().await;
+                    Ok::<_, String>(Fake(1))
+                });
+                tokio::pin!(abandoned);
+                tokio::select! {
+                    biased;
+                    _ = &mut abandoned => panic!("a dial that never completes returned"),
+                    _ = tokio::task::yield_now() => {}
+                }
+
+                // Somebody else's slot takes the key while this dialer is out.
+                if newer_is_open {
+                    let link = Arc::new(Shared {
+                        link: Fake(7),
+                        key: k.clone(),
+                        circuits: AtomicUsize::new(0),
+                        closing: AtomicBool::new(false),
+                        idle: Notify::new(),
+                    });
+                    reg.lock().insert(k.clone(), Slot::Open(Arc::clone(&link)));
+                    Some(link)
+                } else {
+                    let (_tx, rx) = watch::channel(OpenState::<Fake>::Pending);
+                    reg.lock().insert(k.clone(), Slot::Opening(rx));
+                    None
+                }
+            };
+
+            match marker {
+                Some(link) => assert!(
+                    matches!(reg.lock().get(&k), Some(Slot::Open(cur)) if Arc::ptr_eq(cur, &link)),
+                    "the older dialer removed a newer link's slot"
+                ),
+                None => assert!(
+                    matches!(reg.lock().get(&k), Some(Slot::Opening(_))),
+                    "the older dialer removed a newer dialer's slot"
+                ),
+            }
+            reg.lock().remove(&k);
+        }
     }
 
     /// A link closing late must not delete the slot of a newer link that has
