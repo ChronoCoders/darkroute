@@ -2238,8 +2238,12 @@ async fn the_real_sdk_carries_a_full_window_in_both_directions() {
 
         assert!(
             read_all.is_ok(),
-            "the circuit stalled before returning {TOTAL} bytes, which is what a client \
-             that never sends a SENDME does at 509,000"
+            "the circuit stalled before returning {TOTAL} bytes. Both halves of the \
+             window fail here and the stall alone does not say which: a client that \
+             never sends a SENDME leaves the exit's package window at zero and the \
+             download stops at 509,000, and a client that never credits a received one \
+             leaves its own at zero and the upload stops there, after which the echo \
+             has nothing left to return. The SENDME counts below tell the two apart"
         );
         assert_eq!(
             read_all.expect("checked above").expect("read"),
