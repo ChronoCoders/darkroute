@@ -170,6 +170,8 @@ pub enum DropReason {
     DestroySignalLost,
     /// A socket write made no progress inside CELL_WRITE_TIMEOUT.
     WriteTimeout,
+    /// A CREATE refused because the relay-wide link buffer budget was reached.
+    BufferBudget,
 }
 
 pub fn record_frame_dropped(reason: DropReason) {
@@ -183,6 +185,7 @@ pub fn record_frame_dropped(reason: DropReason) {
         DropReason::ControlQueueFull => "control_queue_full",
         DropReason::DestroySignalLost => "destroy_signal_lost",
         DropReason::WriteTimeout => "write_timeout",
+        DropReason::BufferBudget => "buffer_budget",
     };
     frames_dropped().with_label_values(&[label]).inc();
 }

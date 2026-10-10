@@ -304,6 +304,7 @@ async fn main() -> ExitCode {
         outbound_connector.clone(),
         static_key.clone(),
         registry.clone(),
+        link::Budget::new(),
     ));
     let metrics_handle = tokio::spawn(metrics_accept_loop(metrics_listener, shutdown.clone()));
     let port80_handle = tokio::spawn(port80::redirect_loop(
@@ -365,6 +366,7 @@ async fn accept_loop(
     connector: Arc<TlsConnector>,
     static_key: Arc<StaticKeypair>,
     registry: RegistryHandle,
+    budget: link::Budget,
 ) {
     loop {
         tokio::select! {
@@ -376,6 +378,7 @@ async fn accept_loop(
                 Ok((tcp, peer)) => {
                     let ctx = ConnCtx {
                         cfg: cfg.clone(),
+                        budget: budget.clone(),
                         authority: authority.clone(),
                         replay: replay.clone(),
                         connector: connector.clone(),
@@ -427,6 +430,8 @@ async fn accept_loop(
 #[derive(Clone)]
 struct ConnCtx {
     cfg: Arc<RelayConfig>,
+    /// One per relay process, shared by every link (ARCHITECTURE 5.9).
+    budget: link::Budget,
     authority: Arc<AuthorityClient>,
     replay: Arc<ReplayWindow>,
     connector: Arc<TlsConnector>,
@@ -628,6 +633,12 @@ struct LinkShared {
     /// so it asks the reader to, and the reader owns the teardown.
     close: Notify,
     closing: AtomicBool,
+    /// Whether this link is currently admitting circuits. Kept so the budget's
+    /// resume mark is remembered between creates rather than recomputed from
+    /// the ceiling alone, which is what makes the hysteresis work.
+    admitting: AtomicBool,
+    /// Shared with every other link on this relay.
+    budget: link::Budget,
 }
 
 /// What the link reader holds for one circuit.
@@ -641,22 +652,42 @@ struct LinkShared {
 /// A `watch` keeps the signal after its sender is dropped, so removing the
 /// circuit from the table cannot lose a signal already sent.
 struct CircuitHandle {
-    frames: mpsc::Sender<Vec<u8>>,
+    frames: mpsc::Sender<link::Queued>,
     destroy: watch::Sender<bool>,
 }
 
 impl LinkShared {
-    fn new(role: LinkRole) -> Self {
+    fn new(role: LinkRole, budget: link::Budget) -> Self {
         Self {
             state: std::sync::Mutex::new(LinkState {
-                table: link::LinkTable::new(role),
+                table: link::LinkTable::new(role, budget.clone()),
                 handles: HashMap::new(),
                 control: VecDeque::new(),
             }),
             wake: Notify::new(),
             close: Notify::new(),
             closing: AtomicBool::new(false),
+            admitting: AtomicBool::new(true),
+            budget,
         }
+    }
+
+    /// Whether a CREATE may be admitted under the relay-wide byte budget.
+    fn may_admit(&self, ceiling: u64) -> bool {
+        let was = self.admitting.load(Ordering::Relaxed);
+        let now = self.budget.may_admit(ceiling, was);
+        if now != was {
+            self.admitting.store(now, Ordering::Relaxed);
+            if now {
+                info!(held = self.budget.held(), "admitting circuits again");
+            } else {
+                warn!(
+                    held = self.budget.held(),
+                    ceiling, "link buffer budget reached, refusing new circuits"
+                );
+            }
+        }
+        now
     }
 
     /// Ask the link to end. Idempotent, and safe from any circuit task.
@@ -766,7 +797,7 @@ async fn run_link(
     let frame_len = link_frame::link_frame_len(layers);
     // This side did not open the inbound link, so the peer owns the half of the
     // id space with the top bit set and this side validates creates against it.
-    let shared = Arc::new(LinkShared::new(LinkRole::Responder));
+    let shared = Arc::new(LinkShared::new(LinkRole::Responder, ctx.budget.clone()));
 
     let writer = tokio::spawn(run_link_writer(shared.clone(), w));
 
@@ -881,7 +912,7 @@ async fn dispatch_frame(
                     // try_send only. Waiting here would stall every circuit on
                     // the link behind one slow circuit, which is the head of
                     // line blocking multiplexing exists to remove.
-                    match tx.try_send(frame.body.to_vec()) {
+                    match tx.try_send(link::Queued::new(frame.body.to_vec(), &shared.budget)) {
                         Ok(()) => Ok(()),
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             metrics::record_frame_dropped(metrics::DropReason::NotOpen);
@@ -967,7 +998,16 @@ async fn open_inbound_circuit(
         Err(_) => return Err(HandleError::Handshake),
     };
 
-    let (tx, rx) = mpsc::channel::<Vec<u8>>(link::MAX_CIRCUIT_QUEUE);
+    // The relay-wide budget is checked here and nowhere else. A circuit
+    // already open keeps its full queue allowance whatever the total reaches,
+    // so what this bounds is growth (ARCHITECTURE 5.9).
+    if !shared.may_admit(ctx.cfg.max_link_buffer_bytes) {
+        metrics::record_frame_dropped(metrics::DropReason::BufferBudget);
+        send_destroy(shared, id, layers, DestroyReason::Resource);
+        return Ok(());
+    }
+
+    let (tx, rx) = mpsc::channel::<link::Queued>(link::MAX_CIRCUIT_QUEUE);
     let (destroy_tx, destroy_rx) = watch::channel(false);
     {
         let mut st = shared.lock();
@@ -1096,7 +1136,7 @@ async fn run_circuit(
     shared: &Arc<LinkShared>,
     id: CircId,
     mut transport: Transport,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::Receiver<link::Queued>,
     mut destroy_rx: watch::Receiver<bool>,
     layers: Layers,
     role: Role,
@@ -1131,6 +1171,7 @@ async fn run_circuit(
                     // The link went or the reader dropped the sender.
                     break Err(HandleError::PeerClosed);
                 };
+                let wire = wire.take();
                 match layer::peel(&mut transport, &wire, layers)? {
                     layer::Peeled::Forward(blob) => {
                         let nl = next_link
@@ -1155,7 +1196,12 @@ async fn run_circuit(
                                 HandleError::IllegalCellForRole(CellType::Extend, role),
                             )?;
                             let nl = open_next_link(
-                                &extend, &ctx.cfg, &ctx.registry, &ctx.connector, out,
+                                &extend,
+                                &ctx.cfg,
+                                &ctx.registry,
+                                &ctx.connector,
+                                out,
+                                &ctx.budget,
                             )
                             .await?;
                             let reply = Cell::new(
@@ -1434,6 +1480,7 @@ async fn open_next_link(
     registry: &RegistryHandle,
     connector: &TlsConnector,
     frame_layers: Layers,
+    budget: &link::Budget,
 ) -> Result<NextLinkState, HandleError> {
     // The next hop must be published for the role directly downstream of this
     // one, at exactly this address and port, and its SNI is the name the
@@ -1447,7 +1494,7 @@ async fn open_next_link(
     // Allocated through the same table the inbound side uses, so the id rules
     // and the quarantine are one implementation rather than two. The table is
     // empty here because the link is new.
-    let mut table = link::LinkTable::new(LinkRole::Initiator);
+    let mut table = link::LinkTable::new(LinkRole::Initiator, budget.clone());
     let circ_id = table
         .allocate(&mut rand::rngs::OsRng, Instant::now())
         .map_err(|_| HandleError::Handshake)?;
@@ -1607,7 +1654,7 @@ mod tests {
     /// full queue can do is refuse, and the caller counts the refusal.
     #[test]
     fn the_control_queue_fills_at_its_bound_and_refuses_past_it() {
-        let shared = Arc::new(LinkShared::new(LinkRole::Responder));
+        let shared = Arc::new(LinkShared::new(LinkRole::Responder, link::Budget::new()));
         for i in 0..link::MAX_CONTROL_QUEUE {
             assert!(
                 shared.push_control(vec![i as u8]),
@@ -1625,7 +1672,7 @@ mod tests {
     /// control frames queued is a peer that is behind, not a peer that is gone.
     #[test]
     fn the_control_queue_at_its_bound_does_not_close_the_link() {
-        let shared = Arc::new(LinkShared::new(LinkRole::Responder));
+        let shared = Arc::new(LinkShared::new(LinkRole::Responder, link::Budget::new()));
         for i in 0..link::MAX_CONTROL_QUEUE {
             assert!(shared.push_control(vec![i as u8]));
         }
@@ -1640,7 +1687,7 @@ mod tests {
     /// circuits those frames name are still alive (DECISIONS 23).
     #[test]
     fn a_refused_destroy_closes_the_link_and_is_counted() {
-        let shared = Arc::new(LinkShared::new(LinkRole::Responder));
+        let shared = Arc::new(LinkShared::new(LinkRole::Responder, link::Budget::new()));
         let id = CircId::new(0x4000_0002).expect("a nonzero id");
         for i in 0..link::MAX_CONTROL_QUEUE {
             assert!(shared.push_control(vec![i as u8]));
@@ -1665,7 +1712,7 @@ mod tests {
     /// reach for an id this side has just let go.
     #[test]
     fn closing_the_link_releases_every_circuit_and_quarantines_its_id() {
-        let shared = Arc::new(LinkShared::new(LinkRole::Responder));
+        let shared = Arc::new(LinkShared::new(LinkRole::Responder, link::Budget::new()));
         let ids: Vec<CircId> = (1..=3)
             .map(|i| CircId::new(0x4000_0010 + i).expect("a nonzero id"))
             .collect();
@@ -1698,7 +1745,7 @@ mod tests {
     /// backpressure rather than a permanent close.
     #[test]
     fn a_drained_control_frame_frees_one_slot() {
-        let shared = Arc::new(LinkShared::new(LinkRole::Responder));
+        let shared = Arc::new(LinkShared::new(LinkRole::Responder, link::Budget::new()));
         for i in 0..link::MAX_CONTROL_QUEUE {
             assert!(shared.push_control(vec![i as u8]));
         }
@@ -1721,7 +1768,7 @@ mod tests {
     /// to the peer while the circuit it names is already gone.
     #[test]
     fn control_frames_precede_circuit_data() {
-        let shared = Arc::new(LinkShared::new(LinkRole::Responder));
+        let shared = Arc::new(LinkShared::new(LinkRole::Responder, link::Budget::new()));
         let id = CircId::new(0x4000_0001).expect("a nonzero id");
         {
             let mut st = shared.lock();
@@ -1813,7 +1860,7 @@ mod tests {
     /// Time is paused, so the 120 seconds are accounted and not waited for.
     #[tokio::test(start_paused = true)]
     async fn a_write_that_never_progresses_closes_the_link() {
-        let shared = Arc::new(LinkShared::new(LinkRole::Responder));
+        let shared = Arc::new(LinkShared::new(LinkRole::Responder, link::Budget::new()));
         assert!(shared.push_control(vec![0xAA; 8]));
         assert!(!shared.closing(), "nothing has stalled yet");
 
@@ -1886,7 +1933,7 @@ mod tests {
     /// A write that lands one second inside the deadline does not close it.
     #[tokio::test(start_paused = true)]
     async fn a_write_that_lands_inside_the_deadline_does_not_close_the_link() {
-        let shared = Arc::new(LinkShared::new(LinkRole::Responder));
+        let shared = Arc::new(LinkShared::new(LinkRole::Responder, link::Budget::new()));
         assert!(shared.push_control(vec![0xBB; 8]));
 
         let w = SlowWriter::after(CELL_WRITE_TIMEOUT - Duration::from_secs(1));
@@ -1966,7 +2013,7 @@ mod tests {
         const CIRCUITS: u8 = 4;
         const ROTATIONS: usize = 8;
 
-        let shared = Arc::new(LinkShared::new(LinkRole::Responder));
+        let shared = Arc::new(LinkShared::new(LinkRole::Responder, link::Budget::new()));
         let ids: Vec<CircId> = (0..CIRCUITS)
             .map(|i| CircId::new(0x4000_0100 + i as u32).expect("a nonzero id"))
             .collect();

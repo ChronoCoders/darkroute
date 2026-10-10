@@ -9,6 +9,8 @@
 //! reasoning behind the id lifecycle is docs/DECISIONS.md entry 22.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use quiethop_crypto::circid::{self, CircId, CircIdError, LinkRole};
@@ -32,6 +34,89 @@ pub const MAX_CIRCUIT_QUEUE: usize = 1024;
 /// Each circuit is destroyed once and a refused CREATE answers once, so one
 /// frame per circuit slot is the ceiling.
 pub const MAX_CONTROL_QUEUE: usize = MAX_CIRCUITS_PER_LINK;
+
+/// Bytes held in per-circuit queues, shared by every link on one relay.
+///
+/// Relay-wide, because every other bound here is per circuit or per link and
+/// nothing bounded their product (ARCHITECTURE 5.9). Control frames are not
+/// counted: there are at most MAX_CONTROL_QUEUE of them per link and they are
+/// bounded separately.
+///
+/// Handed to each link rather than kept in a static, so a test gets its own and
+/// can assert exact byte counts while the rest of the suite runs beside it.
+#[derive(Debug, Clone, Default)]
+pub struct Budget(Arc<AtomicU64>);
+
+impl Budget {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Bytes held in per-circuit queues right now.
+    pub fn held(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// Whether a new circuit may be admitted, given the ceiling and the gap
+    /// that keeps a full relay from admitting and refusing alternately.
+    ///
+    /// `admitting` is the caller's current answer, carried across calls so the
+    /// hysteresis has something to remember.
+    pub fn may_admit(&self, ceiling: u64, admitting: bool) -> bool {
+        let held = self.held();
+        if admitting {
+            held < ceiling
+        } else {
+            // Back under the resume mark, nine tenths of the ceiling, before
+            // admitting again (ARCHITECTURE 5.9).
+            held < ceiling / 10 * 9
+        }
+    }
+
+    fn take(&self, n: usize) {
+        self.0.fetch_add(n as u64, Ordering::Relaxed);
+    }
+
+    fn release(&self, n: usize) {
+        self.0.fetch_sub(n as u64, Ordering::Relaxed);
+    }
+}
+
+/// A frame counted against the relay-wide budget for as long as it is queued.
+///
+/// The count is taken when the frame enters a queue and released when this is
+/// dropped, which includes a queue discarded with frames still in it. That is
+/// why it is a guard and not an add at one site and a subtract at another: a
+/// circuit torn down with a full queue must not leak its bytes, and matched
+/// calls at every site are exactly the shape that eventually misses one.
+#[derive(Debug)]
+pub struct Queued {
+    bytes: Vec<u8>,
+    budget: Budget,
+}
+
+impl Queued {
+    pub fn new(bytes: Vec<u8>, budget: &Budget) -> Self {
+        budget.take(bytes.len());
+        Self {
+            bytes,
+            budget: budget.clone(),
+        }
+    }
+
+    /// Hand the bytes out of the queue and release their count.
+    pub fn take(mut self) -> Vec<u8> {
+        let bytes = std::mem::take(&mut self.bytes);
+        self.budget.release(bytes.len());
+        bytes
+    }
+}
+
+impl Drop for Queued {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes.len());
+    }
+}
 
 /// How long a destroyed id is held before it can be reallocated on that link.
 ///
@@ -68,7 +153,7 @@ pub struct Circuit {
     /// because the responder's message has not arrived to complete it.
     pub transport: Option<Transport>,
     pub windows: Windows,
-    out: VecDeque<Vec<u8>>,
+    out: VecDeque<Queued>,
 }
 
 impl Circuit {
@@ -116,17 +201,20 @@ pub struct LinkTable {
     /// Ids with queued frames, in service order. Round-robin comes from taking
     /// one frame from the front and putting the id back at the back.
     rotation: VecDeque<CircId>,
+    /// Shared with every other link on this relay.
+    budget: Budget,
 }
 
 impl LinkTable {
     /// `role` is this side's role on the link, which fixes the half of the id
     /// space this side allocates from.
-    pub fn new(role: LinkRole) -> Self {
+    pub fn new(role: LinkRole, budget: Budget) -> Self {
         Self {
             role,
             circuits: HashMap::new(),
             quarantine: VecDeque::new(),
             rotation: VecDeque::new(),
+            budget,
         }
     }
 
@@ -283,7 +371,7 @@ impl LinkTable {
             return Err(QueueFull::AtCap);
         }
         let was_empty = c.out.is_empty();
-        c.out.push_back(frame);
+        c.out.push_back(Queued::new(frame, &self.budget));
         if was_empty {
             self.rotation.push_back(id);
         }
@@ -346,7 +434,7 @@ impl LinkTable {
             if !c.out.is_empty() {
                 self.rotation.push_back(id);
             }
-            return Some((id, frame));
+            return Some((id, frame.take()));
         }
         None
     }
@@ -380,7 +468,7 @@ mod tests {
     use quiethop_crypto::noise::{generate_static_keypair, respond, Initiator};
 
     fn table() -> LinkTable {
-        LinkTable::new(LinkRole::Responder)
+        LinkTable::new(LinkRole::Responder, Budget::new())
     }
 
     /// An RNG that returns a scripted sequence of u32 values.
@@ -438,6 +526,89 @@ mod tests {
 
     fn id(raw: u32) -> CircId {
         CircId::new(raw).unwrap()
+    }
+
+    /// The budget refuses at the ceiling and admits again under the resume
+    /// mark, not at the ceiling itself (ARCHITECTURE 5.9).
+    #[test]
+    fn the_budget_refuses_at_its_ceiling_and_resumes_at_ninety_percent() {
+        // A 1000 byte ceiling, so the resume mark is 900.
+        const CEILING: u64 = 1000;
+        let budget = Budget::new();
+        let mut t = LinkTable::new(LinkRole::Responder, budget.clone());
+        let x = id(0x70);
+        t.accept_create(x, transport(), Instant::now())
+            .expect("room on the link");
+
+        assert!(budget.may_admit(CEILING, true), "empty, so there is room");
+
+        t.push_out(x, vec![0u8; 950]).expect("room in the queue");
+        assert_eq!(budget.held(), 950);
+        assert!(
+            budget.may_admit(CEILING, true),
+            "950 under a 1000 ceiling must not refuse while already admitting"
+        );
+        assert!(
+            !budget.may_admit(CEILING, false),
+            "950 is above the 900 resume mark, so admission stays closed"
+        );
+
+        t.push_out(x, vec![0u8; 100]).expect("room in the queue");
+        assert_eq!(budget.held(), 1050);
+        assert!(!budget.may_admit(CEILING, true), "1050 is past the ceiling");
+
+        while t.pop_next_out().is_some() {}
+        assert_eq!(budget.held(), 0, "the queue drained to nothing");
+        assert!(
+            budget.may_admit(CEILING, false),
+            "back under the resume mark, so admission reopens"
+        );
+    }
+
+    /// Every byte a circuit held is released when it is destroyed, including
+    /// frames still queued. A leak here would refuse circuits forever.
+    #[test]
+    fn destroying_a_circuit_releases_the_bytes_it_held() {
+        let budget = Budget::new();
+        let mut t = LinkTable::new(LinkRole::Responder, budget.clone());
+        let x = id(0x71);
+        t.accept_create(x, transport(), Instant::now())
+            .expect("room on the link");
+        for _ in 0..16 {
+            t.push_out(x, vec![0u8; 500]).expect("room in the queue");
+        }
+        assert_eq!(budget.held(), 16 * 500, "queued frames are counted");
+
+        assert!(t.destroy(x, Instant::now()), "the circuit was there");
+        assert_eq!(
+            budget.held(),
+            0,
+            "destroying a circuit with a full queue left bytes counted"
+        );
+    }
+
+    /// The whole table going releases everything too, which is the link loss
+    /// path.
+    #[test]
+    fn releasing_every_circuit_returns_the_counter_to_zero() {
+        let budget = Budget::new();
+        let mut t = LinkTable::new(LinkRole::Responder, budget.clone());
+        for i in 0..8u32 {
+            let c = id(0x80 + i);
+            t.accept_create(c, transport(), Instant::now())
+                .expect("room on the link");
+            for _ in 0..4 {
+                t.push_out(c, vec![0u8; 300]).expect("room in the queue");
+            }
+        }
+        assert_eq!(budget.held(), 8 * 4 * 300);
+
+        assert_eq!(t.destroy_all(Instant::now()), 8);
+        assert_eq!(
+            budget.held(),
+            0,
+            "the counter did not return to zero, so bytes leaked"
+        );
     }
 
     #[test]
@@ -557,7 +728,7 @@ mod tests {
     /// held id, which would let a deleted skip pass unnoticed.
     #[test]
     fn the_allocator_skips_a_quarantined_id() {
-        let mut t = LinkTable::new(LinkRole::Initiator);
+        let mut t = LinkTable::new(LinkRole::Initiator, Budget::new());
         let t0 = Instant::now();
 
         let held = id(0x8000_0005);
@@ -579,7 +750,7 @@ mod tests {
     /// fails the create rather than scanning for a free one.
     #[test]
     fn a_quarantined_id_counts_toward_the_collision_bound() {
-        let mut t = LinkTable::new(LinkRole::Initiator);
+        let mut t = LinkTable::new(LinkRole::Initiator, Budget::new());
         let t0 = Instant::now();
         let held = id(0x8000_0005);
         t.insert_pending(held).unwrap();

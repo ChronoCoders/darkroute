@@ -62,6 +62,9 @@ pub struct RelayConfig {
     pub metrics_bind: SocketAddr,
     pub replay_window_ttl: u64,
     pub max_circuits: u32,
+    /// Relay-wide ceiling on bytes held in per-circuit queues. A soft limit,
+    /// checked only when a CREATE arrives (ARCHITECTURE 5.9).
+    pub max_link_buffer_bytes: u64,
     pub node_id: String,
     /// Required when role == Exit.
     pub decodo_proxy_url: Option<String>,
@@ -117,6 +120,7 @@ impl RelayConfig {
         let metrics_bind = parse_socket_addr(&get, "METRICS_BIND", "127.0.0.1:9091")?;
         let replay_window_ttl = parse_u64(&get, "REPLAY_WINDOW_TTL", 86_400)?;
         let max_circuits = parse_u32_required(&get, "MAX_CIRCUITS")?;
+        let max_link_buffer_bytes = parse_u64_required(&get, "MAX_LINK_BUFFER_BYTES")?;
         let node_id = required(&get, "NODE_ID")?;
 
         let decodo_proxy_url = get("DECODO_PROXY_URL");
@@ -186,6 +190,7 @@ impl RelayConfig {
             metrics_bind,
             replay_window_ttl,
             max_circuits,
+            max_link_buffer_bytes,
             node_id,
             decodo_proxy_url,
             allowed_exit_ports,
@@ -300,6 +305,17 @@ fn parse_u64<F: Fn(&str) -> Option<String>>(
     }
 }
 
+fn parse_u64_required<F: Fn(&str) -> Option<String>>(
+    get: &F,
+    key: &'static str,
+) -> Result<u64, ConfigError> {
+    let raw = required(get, key)?;
+    raw.parse::<u64>().map_err(|e| ConfigError::Invalid {
+        var: key,
+        reason: e.to_string(),
+    })
+}
+
 fn parse_u32_required<F: Fn(&str) -> Option<String>>(
     get: &F,
     key: &'static str,
@@ -370,6 +386,7 @@ mod tests {
         );
         m.insert("RELAY_API_KEY", "key-xyz");
         m.insert("MAX_CIRCUITS", "256");
+        m.insert("MAX_LINK_BUFFER_BYTES", "268435456");
         m.insert("NODE_ID", "relay-001");
         m.insert("RELAY_HOSTNAME", "node01.example");
         m.insert("ACME_CONTACT_EMAIL", "ops@example.com");

@@ -110,12 +110,16 @@ async fn tls_connect(connector: &TlsConnector, addr: SocketAddr) -> ClientTlsStr
 struct RelayOverride {
     decodo_proxy_url: Option<String>,
     allowed_exit_ports: Vec<u16>,
+    /// Ceiling for the relay-wide link buffer budget. Small in the test that
+    /// exercises admission, the production default everywhere else.
+    max_link_buffer_bytes: u64,
 }
 
 fn default_override() -> RelayOverride {
     RelayOverride {
         decodo_proxy_url: None,
         allowed_exit_ports: vec![80, 443],
+        max_link_buffer_bytes: 256 * 1024 * 1024,
     }
 }
 
@@ -134,6 +138,7 @@ fn make_config(
         metrics_bind: "127.0.0.1:0".parse().unwrap(),
         replay_window_ttl: 86_400,
         max_circuits: 16,
+        max_link_buffer_bytes: over.max_link_buffer_bytes,
         node_id: format!("test-relay-{role}"),
         decodo_proxy_url: if role == Role::Exit {
             over.decodo_proxy_url
@@ -261,6 +266,7 @@ async fn spawn_relay(
         connector,
         Arc::new(kp),
         registry,
+        crate::link::Budget::new(),
     ));
     SpawnedRelay {
         addr,
@@ -1582,6 +1588,7 @@ async fn two_backlogged_circuits_on_one_link_both_progress() {
         let over = RelayOverride {
             decodo_proxy_url: Some(format!("socks5://user:pass@{socks_addr}")),
             allowed_exit_ports: vec![echo_addr.port()],
+            max_link_buffer_bytes: 256 * 1024 * 1024,
         };
         let fleet = spawn_fleet(
             &auth_priv,
@@ -1708,6 +1715,140 @@ async fn two_backlogged_circuits_on_one_link_both_progress() {
              {MAX_RUN} that arrival skew accounts for, so the writer is not rotating: \
              {counts:?}"
         );
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// At the budget ceiling a CREATE is refused, the circuits already open keep
+/// carrying data, and admission reopens once the bytes are released.
+///
+/// This is the soft part of the limit made visible. Admission is the only place
+/// the budget is checked, so a circuit accepted before the ceiling keeps its
+/// full queue allowance and keeps working; what the relay stops doing is taking
+/// on more (ARCHITECTURE 5.9).
+///
+/// One hop reads and one does not. The stalled hop is what holds the budget
+/// crossed while the refusal is tested, because frames only stay counted while
+/// they stay queued.
+#[tokio::test]
+async fn at_the_budget_ceiling_creates_are_refused_and_open_circuits_carry_on() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        ensure_crypto_provider();
+        let keydir = tempfile::tempdir().expect("keydir");
+        let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let pki = make_pki();
+        let server_config = make_server_config(&pki);
+        let connector = Arc::new(make_connector(&pki));
+        const CEILING: u64 = 100_000;
+        let over = RelayOverride {
+            max_link_buffer_bytes: CEILING,
+            ..default_override()
+        };
+        let fleet = spawn_fleet(
+            &auth_priv,
+            &over,
+            server_config.clone(),
+            connector.clone(),
+            keydir.path(),
+        )
+        .await;
+
+        let mut live = RecordingMiddle::spawn(server_config.clone()).await;
+        let stalled = RecordingMiddle::spawn_gated(server_config).await;
+        let (after, fresh, until) = current_window();
+        fleet.publish(document_from(
+            &[
+                ("guard", fleet.guard.addr, fleet.guard.static_pubkey),
+                ("middle", live.addr, live.static_pubkey),
+                ("middle", stalled.addr, stalled.static_pubkey),
+                ("exit", fleet.exit.addr, fleet.exit.static_pubkey),
+            ],
+            &after,
+            &fresh,
+            &until,
+        ));
+
+        // Both admitted while the budget is empty.
+        let mut client = MultiClient::connect(&connector, &fleet.guard).await;
+        let keeper = client
+            .open(&fleet.guard, &auth_priv, [0xB1; 32], 0x8000_0050)
+            .await;
+        let filler = client
+            .open(&fleet.guard, &auth_priv, [0xB2; 32], 0x8000_0051)
+            .await;
+        client.extend(keeper, live.addr, live.static_pubkey).await;
+        client
+            .extend(filler, stalled.addr, stalled.static_pubkey)
+            .await;
+
+        // Control: the keeper works before the budget is anywhere near full.
+        let hello = Cell::new(CellType::Data, b"before".to_vec()).expect("cell");
+        client.send(keeper, &hello).await;
+        live.next_frame_within(Duration::from_secs(10))
+            .await
+            .expect("the keeper did not carry data even with an empty budget");
+
+        // Fill the budget through the stalled hop. The socket absorbs the first
+        // few hundred frames; after it blocks they stay queued and counted.
+        let payload = Cell::new(CellType::Data, vec![0x9A; 400]).expect("cell");
+        let refusals_before = crate::metrics::dropped_count("buffer_budget");
+        for _ in 0..900 {
+            client.send(filler, &payload).await;
+        }
+
+        // A CREATE now has to meet a full budget.
+        let m_raw: [u8; 32] = [0xB3; 32];
+        let token = raw_sign(&m_raw, &auth_priv);
+        let (_init, msg1) = Initiator::start(&fleet.guard.static_pubkey).expect("nk start");
+        let refused = CircId::new(0x8000_0052).expect("a nonzero id");
+        let mut body = Vec::with_capacity(super::PRESENTATION_LEN + NOISE_MSG_LEN);
+        body.extend_from_slice(&m_raw);
+        body.extend_from_slice(&token);
+        body.extend_from_slice(&msg1);
+        let create = link_frame::encode(
+            CLIENT_LAYERS,
+            refused,
+            link_frame::LinkCommand::Create,
+            &body,
+        )
+        .expect("encode create");
+        client.sock.write_all(&create).await.expect("write create");
+        client.sock.flush().await.expect("flush");
+
+        // DESTROY with Resource comes back for that id, and the refusal is
+        // counted. Resource is also what MAX_CIRCUITS_PER_LINK answers, so a
+        // peer cannot tell which bound it hit.
+        let mut got = None;
+        for _ in 0..12 {
+            let Some((id, command, frame_body)) = client.next_frame(Duration::from_secs(20)).await
+            else {
+                break;
+            };
+            if id == refused && command == link_frame::LinkCommand::Destroy {
+                let reason = link_frame::payload(&frame_body, link_frame::DESTROY_BODY_LEN)
+                    .expect("destroy body");
+                got = Some(reason[0]);
+                break;
+            }
+        }
+        assert_eq!(
+            got,
+            Some(DestroyReason::Resource as u8),
+            "a CREATE at the ceiling was not refused with Resource"
+        );
+        assert!(
+            crate::metrics::dropped_count("buffer_budget") > refusals_before,
+            "the refusal was not counted"
+        );
+
+        // The circuit admitted before the ceiling still carries data. Nothing
+        // was taken from a circuit the relay had already accepted.
+        let after_full = Cell::new(CellType::Data, b"during".to_vec()).expect("cell");
+        client.send(keeper, &after_full).await;
+        live.next_frame_within(Duration::from_secs(20))
+            .await
+            .expect("a circuit accepted before the ceiling stopped carrying data");
     })
     .await
     .expect("test timed out");
@@ -2275,6 +2416,7 @@ async fn run_data_test() {
     let over = RelayOverride {
         decodo_proxy_url: Some(format!("socks5://user:pass@{socks_addr}")),
         allowed_exit_ports: vec![echo_addr.port()],
+        max_link_buffer_bytes: 256 * 1024 * 1024,
     };
     let fleet = spawn_fleet(
         &auth_priv,
@@ -2404,6 +2546,7 @@ async fn run_adverse_delivery_test() {
     let over = RelayOverride {
         decodo_proxy_url: Some(format!("socks5://user:pass@{socks_addr}")),
         allowed_exit_ports: vec![echo_addr.port()],
+        max_link_buffer_bytes: 256 * 1024 * 1024,
     };
 
     // Each hop reaches the next through a chunking proxy, so all three links
