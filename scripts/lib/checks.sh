@@ -159,6 +159,42 @@ ck_step() {
 	return 0
 }
 
+# The SDK's low level dialer takes a caller supplied TLS connector, so it can
+# reach a relay no native root vouches for. It is behind the test-util feature
+# and must be absent from a default build, because a customer facing API should
+# not offer a way around the SDK's own trust roots.
+#
+# probes/sdk-default-build names that symbol and nothing else, and sits outside
+# the workspace so it resolves the SDK with default features rather than with
+# the union every member asks for. Both directions run here: the default build
+# must fail on the missing symbol, and the same build with the feature must
+# succeed. Without the second, a probe that stopped naming anything would report
+# a clean tree.
+ck_sdk_dial_gated() {
+	local manifest="probes/sdk-default-build/Cargo.toml"
+	local out rc
+	[ -r "$manifest" ] || { echo "the probe is missing at $manifest" >&2; return 1; }
+
+	out=$(cargo check --manifest-path "$manifest" 2>&1); rc=$?
+	if [ "$rc" -eq 0 ]; then
+		echo "a default build of the SDK exports the low level dial" >&2
+		return 1
+	fi
+	printf '%s\n' "$out" | grep -q "dial" || {
+		echo "the default build failed for a reason other than the absent symbol" >&2
+		printf '%s\n' "$out" | tail -8 >&2
+		return 1
+	}
+
+	out=$(cargo check --manifest-path "$manifest" --features with-test-util 2>&1); rc=$?
+	if [ "$rc" -ne 0 ]; then
+		echo "the probe cannot build even with test-util, so its absence proves nothing" >&2
+		printf '%s\n' "$out" | tail -8 >&2
+		return 1
+	fi
+	return 0
+}
+
 ck_naming_self_test() {
 	local probe probe2
 	probe=$(printf 'c%saude' l)

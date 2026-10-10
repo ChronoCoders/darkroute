@@ -33,7 +33,7 @@ futures-util = { workspace = true }
 # crate elsewhere; a dev dependency is what lets the SDK reach the harness
 # without reaching the shipped binary. No cycle: the SDK does not depend on the
 # relay (STATUS_REPORT, the client design report).
-quiethop-client-sdk = { path = "../client" }
+quiethop-client-sdk = { path = "../client", features = ["test-util"] }
 rcgen = "0.13"
 rand_core = { workspace = true }
 tempfile = "3"

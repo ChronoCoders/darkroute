@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["quiethop-crypto", "relay", "client", "quiethop-client"]
+# Outside the workspace on purpose. It exists to build the SDK with default
+# features and fail, and a member would be built with the features every other
+# member asks for, which includes the one it is checking for the absence of.
+exclude = ["probes/sdk-default-build"]
 
 [workspace.package]
 edition = "2021"

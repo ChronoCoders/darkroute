@@ -50,6 +50,7 @@ ck_step "cargo fmt"      ck_run cargo fmt --all --check
 ck_step "cargo clippy"   ck_run cargo clippy --workspace --all-targets --all-features -- -D warnings
 ck_step "cargo test"     ck_run cargo test --workspace
 ck_step "cargo audit"    ck_cargo_audit
+ck_step "the sdk's low level dial is absent from a default build" ck_sdk_dial_gated
 
 ck_step "go build"       ck_run_in authority go build ./...
 ck_step "go vet"         ck_run_in authority go vet ./...

@@ -1,0 +1,18 @@
+[package]
+name = "sdk-default-build-probe"
+version = "0.1.0"
+edition = "2021"
+license = "BUSL-1.1"
+publish = false
+
+# Deliberately not a workspace member. Built on its own so the SDK resolves with
+# default features only, which is the thing under test.
+
+[features]
+# The positive control: with this on, the symbol must be there. Without it, the
+# probe must fail to compile. A check that only ever looks for an absence
+# reports a clean tree when the probe stops referencing anything.
+with-test-util = ["quiethop-client-sdk/test-util"]
+
+[dependencies]
+quiethop-client-sdk = { path = "../../client" }

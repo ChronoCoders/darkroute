@@ -8,6 +8,14 @@ license.workspace = true
 name = "quiethop_client"
 path = "src/lib.rs"
 
+[features]
+# The low level dialer takes a caller supplied TLS connector, so it can reach a
+# relay whose certificate is not under the host's native roots. That is what a
+# test needs and what the customer facing API must not offer, because it is a
+# way around the SDK's own trust roots. Off by default, and nothing but a dev
+# dependency may turn it on.
+test-util = []
+
 [dependencies]
 quiethop-crypto = { path = "../quiethop-crypto" }
 tokio = { workspace = true }
