@@ -6,6 +6,7 @@ mod config;
 mod exit;
 mod heartbeat;
 mod link;
+mod linkreg;
 mod metrics;
 mod port80;
 mod registry;
@@ -59,6 +60,14 @@ const CELL_READ_TIMEOUT: Duration = Duration::from_secs(120);
 /// made no progress for two minutes, on a connection whose peer is still
 /// sending, is not a slow peer (docs/DECISIONS.md entry 26).
 const CELL_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long the exit may spend writing to its destination.
+///
+/// Shorter than CELL_WRITE_TIMEOUT on purpose. A next hop is a known party in
+/// the signed registry whose link carries many circuits, so patience is right.
+/// A destination is one circuit's own connection to a host the customer chose,
+/// nothing else depends on it, and the failure this bound exists for is a host
+/// that accepts and never reads (SECURITY_MODEL 6.7). Provisional.
+const DEST_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 // Read in whole cells. 32 payloads per read keeps the syscall count near the
 // old 16 KiB buffer while every cell on the wire stays CELL_PAYLOAD_LEN.
 const DEST_READ_BUF: usize = cell::CELL_PAYLOAD_LEN * 32;
@@ -305,6 +314,7 @@ async fn main() -> ExitCode {
         static_key.clone(),
         registry.clone(),
         link::Budget::new(),
+        Arc::new(OutboundRegistry::new()),
     ));
     let metrics_handle = tokio::spawn(metrics_accept_loop(metrics_listener, shutdown.clone()));
     let port80_handle = tokio::spawn(port80::redirect_loop(
@@ -354,6 +364,9 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+// Every argument is a distinct piece of per-process state the accept loop hands
+// to each connection, and a struct wrapping them would be the same list behind
+// one name with nothing checking that a caller filled it correctly.
 #[allow(clippy::too_many_arguments)]
 async fn accept_loop(
     listener: TcpListener,
@@ -367,6 +380,7 @@ async fn accept_loop(
     static_key: Arc<StaticKeypair>,
     registry: RegistryHandle,
     budget: link::Budget,
+    links: Arc<OutboundRegistry>,
 ) {
     loop {
         tokio::select! {
@@ -379,6 +393,7 @@ async fn accept_loop(
                     let ctx = ConnCtx {
                         cfg: cfg.clone(),
                         budget: budget.clone(),
+                        links: links.clone(),
                         authority: authority.clone(),
                         replay: replay.clone(),
                         connector: connector.clone(),
@@ -432,6 +447,9 @@ struct ConnCtx {
     cfg: Arc<RelayConfig>,
     /// One per relay process, shared by every link (ARCHITECTURE 5.9).
     budget: link::Budget,
+    /// The outbound links this relay holds, one per next hop
+    /// (ARCHITECTURE 5.10).
+    links: Arc<OutboundRegistry>,
     authority: Arc<AuthorityClient>,
     replay: Arc<ReplayWindow>,
     connector: Arc<TlsConnector>,
@@ -478,6 +496,12 @@ enum HandleError {
     DestroyedByNextHop,
     #[error("a socket write made no progress inside CELL_WRITE_TIMEOUT")]
     WriteTimeout,
+    #[error("the destination made no progress inside DEST_WRITE_TIMEOUT")]
+    DestWriteTimeout,
+    #[error("next hop: {0}")]
+    NextHop(#[from] linkreg::AcquireError),
+    #[error("the peer sent past its flow-control window")]
+    PeerPastItsWindow,
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("read timeout")]
@@ -534,8 +558,11 @@ async fn handle_connection(
             handle_relay_connection(r, w, peer, ctx).await
         }
         (b, _) => {
-            // Ignore shutdown errors since we're already rejecting.
-            let _ = w.shutdown().await;
+            // bounded: TLS_HANDSHAKE_TIMEOUT. Errors are ignored because the
+            // connection is already being rejected; the bound is so a peer that
+            // never reads cannot hold the task.
+            // bounded: TLS_HANDSHAKE_TIMEOUT
+            let _ = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, w.shutdown()).await;
             Err(HandleError::UnexpectedProtocol(b))
         }
     }
@@ -620,7 +647,7 @@ struct LinkState {
     /// is sent as that circuit is discarded and the queue goes with it. It also
     /// has to carry a DESTROY for a CREATE that was refused, where there is no
     /// circuit to queue against at all.
-    control: VecDeque<Vec<u8>>,
+    control: VecDeque<link::Queued>,
 }
 
 struct LinkShared {
@@ -712,7 +739,11 @@ impl LinkShared {
             if st.control.len() >= link::MAX_CONTROL_QUEUE {
                 return false;
             }
-            st.control.push_back(frame);
+            // Counted like any other queued frame. It is bounded per link at
+            // MAX_CONTROL_QUEUE, and the number of inbound links is not
+            // bounded, so leaving it out would have left the budget covering
+            // the per-circuit queues and not these (ARCHITECTURE 5.9).
+            st.control.push_back(link::Queued::new(frame, &self.budget));
         }
         self.wake.notify_one();
         true
@@ -725,7 +756,7 @@ impl LinkShared {
     fn pop_next_out(&self) -> Option<Vec<u8>> {
         let mut st = self.lock();
         if let Some(frame) = st.control.pop_front() {
-            return Some(frame);
+            return Some(frame.take());
         }
         st.table.pop_next_out().map(|(_, frame)| frame)
     }
@@ -751,6 +782,33 @@ impl LinkShared {
 
     fn on_data_sent(&self, id: CircId) -> Option<Result<(), FlowError>> {
         self.lock().table.on_data_sent(id)
+    }
+
+    /// Take a circuit id on this link and register its channels, all under one
+    /// hold of the link's lock so no other caller can take the same id.
+    fn open_outbound_circuit(
+        &self,
+        cap: usize,
+    ) -> Option<(CircId, mpsc::Receiver<link::Queued>, watch::Receiver<bool>)> {
+        let mut st = self.lock();
+        if st.table.len() >= cap {
+            return None;
+        }
+        let id = st
+            .table
+            .allocate(&mut rand::rngs::OsRng, Instant::now())
+            .ok()?;
+        st.table.insert_pending(id).ok()?;
+        let (tx, rx) = mpsc::channel::<link::Queued>(link::MAX_CIRCUIT_QUEUE);
+        let (dtx, drx) = watch::channel(false);
+        st.handles.insert(
+            id,
+            CircuitHandle {
+                frames: tx,
+                destroy: dtx,
+            },
+        );
+        Some((id, rx, drx))
     }
 
     /// Remove a circuit and quarantine its id. Returns whether it was there.
@@ -821,6 +879,7 @@ async fn run_link_writer<W: AsyncWrite + Unpin>(shared: Arc<LinkShared>, mut w: 
         let mut wrote = false;
         // The lock is taken and released once per frame, never across the write.
         while let Some(frame) = shared.pop_next_out() {
+            // bounded: CELL_WRITE_TIMEOUT
             match tokio::time::timeout(CELL_WRITE_TIMEOUT, w.write_all(&frame)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => return,
@@ -829,6 +888,7 @@ async fn run_link_writer<W: AsyncWrite + Unpin>(shared: Arc<LinkShared>, mut w: 
             wrote = true;
         }
         if wrote {
+            // bounded: CELL_WRITE_TIMEOUT
             match tokio::time::timeout(CELL_WRITE_TIMEOUT, w.flush()).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => return,
@@ -842,12 +902,251 @@ async fn run_link_writer<W: AsyncWrite + Unpin>(shared: Arc<LinkShared>, mut w: 
 }
 
 /// A write that made no progress for CELL_WRITE_TIMEOUT. The peer is not
-/// reading, so the link ends the same way a full control queue ends it: the
-/// reader owns the teardown and releases every circuit.
+/// reading, so the link ends.
+///
+/// `request_close` is what the inbound reader watches. An outbound link has no
+/// such reader waiting on frames from a client, so its own task watches the
+/// same flag, which is why both directions end the same way: every circuit on
+/// the link is released and each forwards DESTROY upstream with LinkLost
+/// (ARCHITECTURE 5.10, 5.11).
 fn stalled_write(shared: &Arc<LinkShared>) {
     metrics::record_frame_dropped(metrics::DropReason::WriteTimeout);
     warn!("a link write made no progress inside the write timeout, closing the link");
     shared.request_close();
+}
+
+/// One shared outbound link to a next hop (ARCHITECTURE 5.10).
+///
+/// It reuses the inbound machinery: `LinkShared` holds the circuit table, the
+/// per-circuit queues, the round-robin writer and the control queue, and the
+/// relay-wide byte budget runs through it the same way.
+struct OutboundLink {
+    shared: Arc<LinkShared>,
+    /// Frames on this link, one layer fewer than the inbound side.
+    layers: Layers,
+    /// Taken once, by whichever caller dialed, to start the link's own task.
+    reader: std::sync::Mutex<Option<layer::FrameReader<ReadHalf<OutboundStream>>>>,
+    /// Aborted when the link ends, so the writer does not outlive the socket.
+    writer: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+type OutboundRegistry = linkreg::Registry<OutboundLink>;
+type OutboundShared = Arc<linkreg::Shared<OutboundLink>>;
+
+/// Dial a next hop and start its writer. The reader is left for the caller
+/// that dialed, because only it may take it.
+async fn dial_outbound_link(
+    connector: &TlsConnector,
+    addr: SocketAddr,
+    tls_name: &str,
+    layers: Layers,
+    budget: &link::Budget,
+) -> Result<OutboundLink, HandleError> {
+    let mut stream = tls::dial_tls(connector, addr, tls_name, TLS_HANDSHAKE_TIMEOUT).await?;
+    // bounded: TLS_HANDSHAKE_TIMEOUT, the same deadline as the dial. One byte,
+    // but a peer that accepts and never reads would hang the dialer and with it
+    // every circuit waiting for this hop (ARCHITECTURE 5.11).
+    match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, async {
+        // bounded: TLS_HANDSHAKE_TIMEOUT, by the block around this
+        stream.write_all(&[PROTO_RELAY]).await?;
+        // bounded: TLS_HANDSHAKE_TIMEOUT
+        stream.flush().await
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => return Err(HandleError::Io(e)),
+        Err(_) => return Err(HandleError::Timeout),
+    }
+    let (read, write) = tokio::io::split(stream);
+
+    let shared = Arc::new(LinkShared::new(LinkRole::Initiator, budget.clone()));
+    let writer = tokio::spawn(run_link_writer(shared.clone(), write));
+    Ok(OutboundLink {
+        shared,
+        layers,
+        reader: std::sync::Mutex::new(Some(layer::FrameReader::new(
+            read,
+            link_frame::link_frame_len(layers),
+        ))),
+        writer: std::sync::Mutex::new(Some(writer)),
+    })
+}
+
+/// Serve one shared outbound link: read frames, dispatch by circuit id, and
+/// close the link once it has been idle for its jittered timeout.
+async fn run_outbound_link(registry: Arc<OutboundRegistry>, link: OutboundShared) {
+    let Some(mut reader) = link
+        .link
+        .reader
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+    else {
+        return;
+    };
+    let layers = link.link.layers;
+    let shared = link.link.shared.clone();
+
+    // Armed only while nothing is on the link, and the draw is fresh each time
+    // so the close does not reveal when the last circuit ended.
+    let mut idle: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+
+    loop {
+        if link.circuits() == 0 {
+            if idle.is_none() {
+                let budget = linkreg::idle_deadline(&mut rand::rngs::OsRng);
+                idle = Some(Box::pin(tokio::time::sleep(budget)));
+            }
+        } else {
+            idle = None;
+        }
+
+        if shared.closing() {
+            // The writer gave up on a stalled peer, so this link ends and
+            // every circuit on it is released (ARCHITECTURE 5.11).
+            break;
+        }
+
+        tokio::select! {
+            biased;
+            // Raised by the writer when a write made no progress, and by a
+            // full control queue.
+            _ = shared.close.notified() => break,
+            () = async {
+                match idle.as_mut() {
+                    Some(s) => s.as_mut().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                if registry.close_if_idle(&link) {
+                    break;
+                }
+                // Either a circuit arrived while the timer was running, in
+                // which case stand down, or this link is no longer the one the
+                // key points at and nothing more will use it.
+                if link.circuits() == 0 {
+                    break;
+                }
+                idle = None;
+            }
+            // The last circuit left, so the next turn arms the timer.
+            _ = link.idle.notified() => {}
+            read = tokio::time::timeout(CELL_READ_TIMEOUT, reader.next_frame()) => {
+                match read {
+                    Ok(Ok(wire)) => dispatch_outbound(&shared, &wire, layers),
+                    _ => break,
+                }
+            }
+        }
+    }
+
+    registry.retire(&link);
+    let released = end_outbound_link(&shared);
+    if let Some(w) = link
+        .link
+        .writer
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+    {
+        w.abort();
+    }
+    info!(
+        key = ?link.key(),
+        released,
+        links = registry.len(),
+        "outbound link closed"
+    );
+}
+
+/// Write one cell's payload to the destination, bounded.
+///
+/// A destination that accepts and never reads would otherwise hold this
+/// circuit for ever, and the customer chooses the destination, so one customer
+/// could point many circuits at such a host and use up an exit's capacity
+/// (SECURITY_MODEL 6.7).
+async fn write_to_destination<W: AsyncWrite + Unpin>(
+    dl: &mut W,
+    payload: &[u8],
+) -> Result<(), HandleError> {
+    // bounded: DEST_WRITE_TIMEOUT
+    match tokio::time::timeout(DEST_WRITE_TIMEOUT, async {
+        // bounded: DEST_WRITE_TIMEOUT, by the block around this
+        dl.write_all(payload).await?;
+        // bounded: DEST_WRITE_TIMEOUT
+        dl.flush().await
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(HandleError::Io(e)),
+        Err(_) => {
+            metrics::record_frame_dropped(metrics::DropReason::WriteTimeout);
+            Err(HandleError::DestWriteTimeout)
+        }
+    }
+}
+
+/// Wind up a shared outbound link: mark it closing, then release its circuits.
+///
+/// The order is the point. A circuit learns its link is gone when its frame
+/// channel closes, and the only way it can tell a stalled link from an ordinary
+/// one is the flag being set by then. Released after, so no circuit can see a
+/// closed channel on a link that is not yet marked (ARCHITECTURE 5.11).
+fn end_outbound_link(shared: &Arc<LinkShared>) -> usize {
+    shared.request_close();
+    shared.release_all()
+}
+
+/// Act on one frame from a next hop.
+///
+/// CREATED and DATA both go to the circuit as whole frames, because the circuit
+/// is the side that knows which it is waiting for. DESTROY is out of band for
+/// the same reason it is on the inbound side: it must not wait behind queued
+/// data (docs/DECISIONS.md entry 25).
+fn dispatch_outbound(shared: &Arc<LinkShared>, wire: &[u8], layers: Layers) {
+    let Ok(frame) = link_frame::decode(wire, layers, LinkRole::Responder) else {
+        metrics::record_frame_dropped(metrics::DropReason::NotOpen);
+        return;
+    };
+    let id = frame.circ_id;
+    match frame.command {
+        link_frame::LinkCommand::Created | link_frame::LinkCommand::Data => {
+            let tx = {
+                let st = shared.lock();
+                st.handles.get(&id).map(|h| h.frames.clone())
+            };
+            let Some(tx) = tx else {
+                metrics::record_frame_dropped(metrics::DropReason::NotOpen);
+                return;
+            };
+            if tx
+                .try_send(link::Queued::new(wire.to_vec(), &shared.budget))
+                .is_err()
+            {
+                metrics::record_frame_dropped(metrics::DropReason::QueueFull);
+            }
+        }
+        link_frame::LinkCommand::Destroy => {
+            let signalled = {
+                let st = shared.lock();
+                st.handles.get(&id).map(|h| h.destroy.send(true).is_ok())
+            };
+            match signalled {
+                Some(true) => {}
+                Some(false) => {
+                    metrics::record_frame_dropped(metrics::DropReason::DestroySignalLost)
+                }
+                None => metrics::record_frame_dropped(metrics::DropReason::NotOpen),
+            }
+        }
+        // A next hop does not create circuits on a link this side opened.
+        link_frame::LinkCommand::Create => {
+            metrics::record_frame_dropped(metrics::DropReason::NotOpen)
+        }
+        link_frame::LinkCommand::Padding => {}
+    }
 }
 
 /// Act on one inbound link frame.
@@ -1104,11 +1403,43 @@ fn destroy_circuit(shared: &Arc<LinkShared>, id: CircId, layers: Layers, reason:
     shared.forget(id);
 }
 
+/// The reason this side names upstream when it ends a circuit.
+///
+/// Separate from the teardown so it can be asserted directly: the mapping is
+/// the part a reader has to trust and the part a mutant would change.
+fn destroy_reason_for_outcome(result: &Result<(), HandleError>) -> DestroyReason {
+    match result {
+        Err(HandleError::Flow(e)) => link::destroy_reason_for(e),
+        Err(HandleError::Layer(_)) | Err(HandleError::Cell(_)) | Err(HandleError::LinkFrame(_)) => {
+            DestroyReason::Protocol
+        }
+        Err(HandleError::IllegalCellForRole(_, _)) => DestroyReason::Protocol,
+        // The next hop stopped reading, which is a link loss toward it.
+        Err(HandleError::WriteTimeout) => DestroyReason::LinkLost,
+        // The destination stopped reading. Not Protocol, the peer did nothing
+        // wrong, and not Resource, which would say the relay is out of capacity
+        // when tearing down is what frees it (ARCHITECTURE 5.11).
+        Err(HandleError::DestWriteTimeout) => DestroyReason::Internal,
+        // A full per-circuit queue means the peer exceeded its window.
+        Err(HandleError::PeerPastItsWindow) => DestroyReason::Protocol,
+        Err(HandleError::PeerClosed) => DestroyReason::Requested,
+        // Both are returned above, before a reason is chosen here.
+        Err(HandleError::DestroyedByPeer) | Err(HandleError::DestroyedByNextHop) => {
+            DestroyReason::Destroyed
+        }
+        Err(_) => DestroyReason::Internal,
+        Ok(()) => DestroyReason::Requested,
+    }
+}
+
 /// One circuit's traffic: inbound frames, the next hop, the destination.
 ///
 /// Replaces run_circuit_io, which held the only circuit on a connection. The
 /// shape is the same three branch select; what changed is that inbound frames
 /// arrive on a channel and outbound frames go to a per-circuit queue.
+// The arguments are this circuit's own state: its id, its transport, its two
+// inbound channels, its layer count and its role. Grouping them into a struct
+// would hide which of them the task takes ownership of.
 #[allow(clippy::too_many_arguments)]
 async fn run_circuit(
     shared: &Arc<LinkShared>,
@@ -1120,6 +1451,17 @@ async fn run_circuit(
     role: Role,
     ctx: ConnCtx,
 ) -> Result<(), HandleError> {
+    /// What the next hop did, so one future covers both of its channels.
+    enum NextEvent {
+        Destroyed,
+        /// The link ended because a write to it made no progress, so this
+        /// circuit forwards DESTROY upstream with LinkLost rather than the
+        /// Requested a normal close would give (ARCHITECTURE 5.11).
+        LinkLost,
+        LinkGone,
+        Frame(link::Queued),
+    }
+
     let mut next_link: Option<NextLinkState> = None;
     let mut dest_link: Option<TcpStream> = None;
     let out_layers = outbound_layers(role);
@@ -1158,11 +1500,19 @@ async fn run_circuit(
                         let out = out_layers.ok_or(HandleError::ForwardWithoutNextLink(role))?;
                         let framed =
                             link_frame::encode(out, nl.circ_id, link_frame::LinkCommand::Data, &blob)?;
-                        // A stalled next hop ends this circuit and nothing
-                        // else. request_close here would take down the inbound
-                        // link and every other circuit riding it, for a hop
-                        // only this circuit uses.
-                        write_with_timeout(&mut nl.write, &framed).await?;
+                        // Onto the shared link's queue for this circuit. The
+                        // link's own writer drains it, bounded by
+                        // CELL_WRITE_TIMEOUT, and a stall there closes the link
+                        // and releases every circuit on it (ARCHITECTURE 5.10).
+                        if nl.link.link.shared.push_out(nl.circ_id, framed).is_err() {
+                            // A per-circuit queue can only fill if the upstream
+                            // peer sent past its window: the end to end window
+                            // allows 1010 frames in steady state against a 1024
+                            // slot queue (docs/DECISIONS.md entry 31). A stalled
+                            // next hop is the other case and is caught by the
+                            // link's write timeout, not here.
+                            break Err(HandleError::PeerPastItsWindow);
+                        }
                     }
                     layer::Peeled::ToMe(cell) => match (cell.cell_type, role) {
                         (CellType::Extend, Role::Guard) | (CellType::Extend, Role::Middle) => {
@@ -1173,18 +1523,11 @@ async fn run_circuit(
                             let out = out_layers.ok_or(
                                 HandleError::IllegalCellForRole(CellType::Extend, role),
                             )?;
-                            let nl = open_next_link(
-                                &extend,
-                                &ctx.cfg,
-                                &ctx.registry,
-                                &ctx.connector,
-                                out,
-                                &ctx.budget,
-                            )
-                            .await?;
+                            let (nl, noise_msg2) =
+                                extend_to_next_hop(&extend, &ctx, out).await?;
                             let reply = Cell::new(
                                 CellType::Extend,
-                                cell::extend_backward_payload(&nl.noise_msg2),
+                                cell::extend_backward_payload(&noise_msg2),
                             )?;
                             let framed = layer::seal_to_me(&mut transport, &reply, layers)?;
                             if queue_or_end(shared, id, layers, framed).is_err() {
@@ -1241,8 +1584,9 @@ async fn run_circuit(
                             let dl = dest_link
                                 .as_mut()
                                 .ok_or(HandleError::IllegalCellForRole(CellType::Data, role))?;
-                            dl.write_all(&cell.payload).await?;
-                            dl.flush().await?;
+                            if let Err(e) = write_to_destination(dl, &cell.payload).await {
+                                break Err(e);
+                            }
                         }
                         (CellType::Sendme, Role::Exit) => {
                             // An unowed SENDME is a protocol violation and the
@@ -1256,7 +1600,7 @@ async fn run_circuit(
                             let ack = Cell::new(CellType::CloseAck, Vec::new())?;
                             let framed = layer::seal_to_me(&mut transport, &ack, layers)?;
                             let _ = queue_or_end(shared, id, layers, framed);
-                            forward_destroy(&mut next_link, out_layers).await;
+                            forward_destroy(&mut next_link);
                             drop(dest_link.take());
                             return Ok(());
                         }
@@ -1266,13 +1610,35 @@ async fn run_circuit(
                 }
             }
 
-            res = async {
-                match next_link.as_mut() {
-                    Some(nl) => nl.read.next_frame().await,
-                    None => std::future::pending().await,
+            // The next hop destroyed this circuit. First, so it does not wait
+            // behind frames already queued for this circuit.
+            // One future over the next hop, so `next_link` is borrowed once.
+            // The destroy signal is first inside it, so it does not wait behind
+            // frames already queued for this circuit.
+            event = async {
+                let Some(nl) = next_link.as_mut() else {
+                    return std::future::pending().await;
+                };
+                tokio::select! {
+                    biased;
+                    changed = nl.destroy.changed() => match changed {
+                        Ok(()) if *nl.destroy.borrow_and_update() => NextEvent::Destroyed,
+                        _ => NextEvent::LinkGone,
+                    },
+                    frame = nl.frames.recv() => match frame {
+                        Some(q) => NextEvent::Frame(q),
+                        None if nl.link.link.shared.closing() => NextEvent::LinkLost,
+                        None => NextEvent::LinkGone,
+                    },
                 }
             } => {
-                let wire = res?;
+                let queued = match event {
+                    NextEvent::Destroyed => break Err(HandleError::DestroyedByNextHop),
+                    NextEvent::LinkLost => break Err(HandleError::WriteTimeout),
+                    NextEvent::LinkGone => break Err(HandleError::PeerClosed),
+                    NextEvent::Frame(q) => q,
+                };
+                let wire = queued.take();
                 let out = out_layers.ok_or(HandleError::ForwardWithoutNextLink(role))?;
                 // This side opened the downstream link, so it is the initiator
                 // there and the peer answers from the other half.
@@ -1343,7 +1709,7 @@ async fn run_circuit(
     // outcome, the branch returned Ok and fell through to the send below, which
     // answered the peer with a DESTROY carrying Requested.
     if matches!(result, Err(HandleError::DestroyedByPeer)) {
-        forward_destroy(&mut next_link, out_layers).await;
+        forward_destroy(&mut next_link);
         return Ok(());
     }
 
@@ -1356,24 +1722,9 @@ async fn run_circuit(
         return Ok(());
     }
 
-    let reason = match &result {
-        Err(HandleError::Flow(e)) => link::destroy_reason_for(e),
-        Err(HandleError::Layer(_)) | Err(HandleError::Cell(_)) | Err(HandleError::LinkFrame(_)) => {
-            DestroyReason::Protocol
-        }
-        Err(HandleError::IllegalCellForRole(_, _)) => DestroyReason::Protocol,
-        // The next hop stopped reading, which is a link loss toward it.
-        Err(HandleError::WriteTimeout) => DestroyReason::LinkLost,
-        Err(HandleError::PeerClosed) => DestroyReason::Requested,
-        // Both are returned above, before a reason is chosen here.
-        Err(HandleError::DestroyedByPeer) | Err(HandleError::DestroyedByNextHop) => {
-            DestroyReason::Destroyed
-        }
-        Err(_) => DestroyReason::Internal,
-        Ok(()) => DestroyReason::Requested,
-    };
+    let reason = destroy_reason_for_outcome(&result);
     send_destroy(shared, id, layers, reason);
-    forward_destroy(&mut next_link, out_layers).await;
+    forward_destroy(&mut next_link);
     result
 }
 
@@ -1389,104 +1740,92 @@ fn queue_or_end(
     shared.push_out(id, frame)
 }
 
-/// Write one frame to the next hop, bounded by CELL_WRITE_TIMEOUT.
-async fn write_with_timeout<W: AsyncWrite + Unpin>(
-    w: &mut W,
-    frame: &[u8],
-) -> Result<(), HandleError> {
-    match tokio::time::timeout(CELL_WRITE_TIMEOUT, async {
-        w.write_all(frame).await?;
-        w.flush().await
-    })
-    .await
-    {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(e)) => Err(HandleError::Io(e)),
-        Err(_) => {
-            metrics::record_frame_dropped(metrics::DropReason::WriteTimeout);
-            Err(HandleError::WriteTimeout)
-        }
-    }
-}
-
 /// Forward DESTROY to the next hop, always with DESTROYED.
 ///
 /// tor-spec: "Reasons in DESTROY cell SHOULD NOT be propagated downward or
 /// upward, due to potential side channel risk", and "An OR receiving a DESTROY
 /// command should use the DESTROYED reason for its next cell."
-async fn forward_destroy(next_link: &mut Option<NextLinkState>, out_layers: Option<Layers>) {
-    let (Some(nl), Some(out)) = (next_link.as_mut(), out_layers) else {
+fn forward_destroy(next_link: &mut Option<NextLinkState>) {
+    let Some(nl) = next_link.take() else {
         return;
     };
-    if let Ok(frame) = link_frame::encode(
-        out,
+    // On the shared link's control queue, not this circuit's, because the
+    // circuit is going and its queue goes with it (docs/DECISIONS.md entry 23).
+    // Dropping nl releases the reservation, so the link can go idle.
+    send_destroy(
+        &nl.link.link.shared,
         nl.circ_id,
-        link_frame::LinkCommand::Destroy,
-        &[DestroyReason::Destroyed as u8],
-    ) {
-        // Best effort, and bounded: a hop that has stopped reading must not
-        // hold this task open while it winds up.
-        let _ = write_with_timeout(&mut nl.write, &frame).await;
-    }
-    drop(next_link.take());
+        nl.link.link.layers,
+        DestroyReason::Destroyed,
+    );
 }
 
 struct NextLinkState {
-    read: layer::FrameReader<ReadHalf<OutboundStream>>,
-    write: WriteHalf<OutboundStream>,
-    noise_msg2: [u8; NOISE_MSG_LEN],
-    /// The id this side chose for the circuit on the downstream link. This side
-    /// opened that link, so the id carries the top bit set.
+    link: OutboundShared,
+    /// Keeps this circuit counted on the shared link. Dropping it releases the
+    /// count, which is how a circuit that ends lets the link go idle.
+    _reservation: linkreg::Reservation<OutboundLink>,
+    /// The id this side chose for the circuit on the shared link.
     circ_id: CircId,
+    /// Frames from the next hop for this circuit, whole, so the circuit decides
+    /// whether it is waiting for CREATED or carrying DATA.
+    frames: mpsc::Receiver<link::Queued>,
+    /// Raised when the next hop destroys this circuit, out of band so it cannot
+    /// wait behind queued data (docs/DECISIONS.md entry 25).
+    destroy: watch::Receiver<bool>,
 }
 
-/// Dial an outbound link to `next_hop` and act as courier for the client's
-/// handshake with that hop: send CREATE carrying the client's Noise message 1,
-/// read CREATED with the hop's message 2 back.
+/// Put this circuit on the shared link to its next hop, opening that link if
+/// nobody has yet, and courier the client's handshake over it.
 ///
 /// This relay is not a party to that handshake. It cannot read either message,
 /// and the next hop authenticates to the client, not to this relay.
-///
-/// The link starts at PROTO_RELAY and then speaks link frames. CIRCUIT_START is
-/// gone: a circuit is named by its id, not by a byte in front of it. In this
-/// commit each circuit still opens its own outbound link, so the id is drawn
-/// from an empty table and no collision is possible; the shared outbound
-/// registry is the next commit.
-async fn open_next_link(
+async fn extend_to_next_hop(
     extend: &ExtendForward,
-    cfg: &RelayConfig,
-    registry: &RegistryHandle,
-    connector: &TlsConnector,
+    ctx: &ConnCtx,
     frame_layers: Layers,
-    budget: &link::Budget,
-) -> Result<NextLinkState, HandleError> {
+) -> Result<(NextLinkState, [u8; NOISE_MSG_LEN]), HandleError> {
     // The next hop must be published for the role directly downstream of this
     // one, at exactly this address and port, and its SNI is the name the
     // registry carries for it. Nothing here comes from configuration.
-    let doc = registry
-        .usable(now_unix())
-        .ok_or(HandleError::PeerHostnameMissing(extend.next_hop))?;
-    let entry = registry::extend_target(&doc, cfg.role, extend.next_hop)
-        .ok_or(HandleError::PeerHostnameMissing(extend.next_hop))?;
+    let (relay_id, addr, tls_name) = {
+        let doc = ctx
+            .registry
+            .usable(now_unix())
+            .ok_or(HandleError::PeerHostnameMissing(extend.next_hop))?;
+        let entry = registry::extend_target(&doc, ctx.cfg.role, extend.next_hop)
+            .ok_or(HandleError::PeerHostnameMissing(extend.next_hop))?;
+        (entry.id.clone(), extend.next_hop, entry.tls_name.clone())
+    };
 
-    // Allocated through the same table the inbound side uses, so the id rules
-    // and the quarantine are one implementation rather than two. The table is
-    // empty here because the link is new.
-    let mut table = link::LinkTable::new(LinkRole::Initiator, budget.clone());
-    let circ_id = table
-        .allocate(&mut rand::rngs::OsRng, Instant::now())
-        .map_err(|_| HandleError::Handshake)?;
-    // Pending until CREATED arrives. On this link that state has nothing to
-    // protect yet, because the link carries one circuit and is new, but the
-    // transition runs through the same code the multiplexed outbound side will
-    // use so there is one implementation of it rather than two.
-    table
-        .insert_pending(circ_id)
-        .map_err(|_| HandleError::Handshake)?;
+    let key = linkreg::LinkKey {
+        relay_id,
+        addr,
+        tls_name: tls_name.clone(),
+    };
+    let cap = ctx.cfg.max_circuits_per_relay_link as usize;
+    let connector = ctx.connector.clone();
+    let budget = ctx.budget.clone();
 
-    let mut stream = tls::dial_tls(connector, extend.next_hop, &entry.tls_name).await?;
-    stream.write_all(&[PROTO_RELAY]).await?;
-    let (read, mut write) = tokio::io::split(stream);
+    let acquired = ctx
+        .links
+        .acquire(key, cap, move || async move {
+            dial_outbound_link(&connector, addr, &tls_name, frame_layers, &budget).await
+        })
+        .await
+        .map_err(HandleError::NextHop)?;
+
+    // Only the caller that dialed may start the link's own task, because only
+    // it can take the read half out of the payload.
+    if acquired.dialed {
+        info!(addr = %addr, links = ctx.links.len(), "outbound link opened");
+        tokio::spawn(run_outbound_link(ctx.links.clone(), acquired.link.clone()));
+    }
+
+    let shared = acquired.link.link.shared.clone();
+    let (circ_id, mut frames, destroy) = shared
+        .open_outbound_circuit(cap)
+        .ok_or(HandleError::NextHop(linkreg::AcquireError::LinkFull))?;
 
     let create = link_frame::encode(
         frame_layers,
@@ -1494,16 +1833,22 @@ async fn open_next_link(
         link_frame::LinkCommand::Create,
         &extend.noise_msg1,
     )?;
-    write_with_timeout(&mut write, &create).await?;
+    if shared.push_out(circ_id, create).is_err() {
+        shared.forget(circ_id);
+        return Err(HandleError::Handshake);
+    }
 
-    let mut reader = layer::FrameReader::new(read, link_frame::link_frame_len(frame_layers));
-    let wire = match tokio::time::timeout(HANDSHAKE_READ_TIMEOUT, reader.next_frame()).await {
-        Ok(Ok(w)) => w,
-        Ok(Err(e)) => return Err(HandleError::Io(e)),
-        Err(_) => return Err(HandleError::Timeout),
+    let wire = match tokio::time::timeout(HANDSHAKE_READ_TIMEOUT, frames.recv()).await {
+        Ok(Some(w)) => w.take(),
+        // The link went, or the hop never answered.
+        _ => {
+            shared.forget(circ_id);
+            return Err(HandleError::Handshake);
+        }
     };
     let back = link_frame::decode(&wire, frame_layers, LinkRole::Responder)?;
     if back.command != link_frame::LinkCommand::Created || back.circ_id != circ_id {
+        shared.forget(circ_id);
         return Err(HandleError::Handshake);
     }
     let mut noise_msg2 = [0u8; NOISE_MSG_LEN];
@@ -1511,14 +1856,18 @@ async fn open_next_link(
 
     // No transport here: this hop's session belongs to the client and this
     // relay only couriers the handshake, so the phase moves to Open with none.
-    table.open_pending(circ_id, None);
+    shared.lock().table.open_pending(circ_id, None);
 
-    Ok(NextLinkState {
-        read: reader,
-        write,
+    Ok((
+        NextLinkState {
+            link: acquired.link,
+            _reservation: acquired.reservation,
+            circ_id,
+            frames,
+            destroy,
+        },
         noise_msg2,
-        circ_id,
-    })
+    ))
 }
 
 #[cfg(test)]
@@ -1861,54 +2210,270 @@ mod tests {
         );
     }
 
-    /// The outbound helper gives up on a write that makes no progress.
+    /// Every byte queued on a shared outbound link is counted, and the count
+    /// returns to zero when the queues drain.
     ///
-    /// This covers the next hop direction, where the two link writer tests
-    /// above cannot reach: a stalled next hop ends the circuit rather than the
-    /// inbound link, so there is no `closing` flag to observe. Both outbound
-    /// write sites go through this helper and nothing writes to a next hop
-    /// without it, which `no_outbound_write_bypasses_the_timeout` holds.
+    /// Both structures a frame can wait in are covered: the per-circuit queue
+    /// and the link level control queue. The control queue was missed on the
+    /// first pass, which would have left the budget covering the per-circuit
+    /// queues and not these, and the number of inbound links is not bounded
+    /// (docs/DECISIONS.md entry 31).
+    #[test]
+    fn every_byte_queued_on_an_outbound_link_is_counted() {
+        const FRAME: usize = 547;
+        const PER_CIRCUIT: usize = 6;
+        const CONTROL: usize = 4;
+
+        let budget = link::Budget::new();
+        let shared = Arc::new(LinkShared::new(LinkRole::Initiator, budget.clone()));
+        let ids: Vec<CircId> = (1..=3)
+            .map(|i| CircId::new(0x8000_0300 + i).expect("a nonzero id"))
+            .collect();
+        {
+            let mut st = shared.lock();
+            for id in &ids {
+                st.table
+                    .accept_create(*id, test_transport(), Instant::now())
+                    .expect("room on the link");
+            }
+        }
+        assert_eq!(budget.held(), 0, "an empty link holds nothing");
+
+        for id in &ids {
+            for _ in 0..PER_CIRCUIT {
+                shared
+                    .push_out(*id, vec![0u8; FRAME])
+                    .expect("room in the queue");
+            }
+        }
+        let circuit_bytes = (ids.len() * PER_CIRCUIT * FRAME) as u64;
+        assert_eq!(
+            budget.held(),
+            circuit_bytes,
+            "the per-circuit queues are not counted exactly"
+        );
+
+        for _ in 0..CONTROL {
+            assert!(shared.push_control(vec![0u8; FRAME]));
+        }
+        assert_eq!(
+            budget.held(),
+            circuit_bytes + (CONTROL * FRAME) as u64,
+            "the control queue is not counted"
+        );
+
+        // Draining hands the bytes out and releases them.
+        let mut drained = 0;
+        while shared.pop_next_out().is_some() {
+            drained += 1;
+        }
+        assert_eq!(drained, ids.len() * PER_CIRCUIT + CONTROL);
+        assert_eq!(
+            budget.held(),
+            0,
+            "the counter did not return to zero, so queued bytes leaked"
+        );
+    }
+
+    /// Winding up an outbound link marks it closing before its circuits see
+    /// their channels close, which is what lets them name LinkLost.
+    ///
+    /// Without the order, a circuit sees a closed channel on a link that is not
+    /// marked and reports Requested, which says the peer asked when the truth
+    /// is the link stalled.
+    #[test]
+    fn ending_an_outbound_link_marks_it_before_releasing_its_circuits() {
+        let shared = Arc::new(LinkShared::new(LinkRole::Initiator, link::Budget::new()));
+        let id = CircId::new(0x8000_0400).expect("a nonzero id");
+        let rx = {
+            let mut st = shared.lock();
+            st.table
+                .accept_create(id, test_transport(), Instant::now())
+                .expect("room on the link");
+            let (tx, rx) = mpsc::channel::<link::Queued>(4);
+            let (dtx, _drx) = watch::channel(false);
+            st.handles.insert(
+                id,
+                CircuitHandle {
+                    frames: tx,
+                    destroy: dtx,
+                },
+            );
+            rx
+        };
+        assert!(!shared.closing());
+
+        let released = end_outbound_link(&shared);
+
+        assert_eq!(released, 1, "the circuit was not released");
+        assert!(
+            shared.closing(),
+            "the link was not marked closing, so its circuits cannot tell a stalled \
+             link from an ordinary close and would report Requested instead of LinkLost"
+        );
+        assert!(
+            rx.is_closed(),
+            "the circuit's channel outlived the link, so it would never notice"
+        );
+    }
+
+    /// A stalled shared outbound link closes and releases every circuit on it.
+    ///
+    /// The writer gives up on a peer that takes no bytes, raises the link's
+    /// close, and the link's own task releases its circuits. Each of those
+    /// circuits then sees its channel close on a link marked closing, which is
+    /// what makes it name LinkLost upstream rather than the Requested an
+    /// ordinary close gives (ARCHITECTURE 5.11).
     #[tokio::test(start_paused = true)]
-    async fn the_outbound_write_helper_gives_up_on_a_stalled_hop() {
-        let mut w = StalledWriter;
+    async fn a_stalled_outbound_link_closes_and_releases_its_circuits() {
+        let shared = Arc::new(LinkShared::new(LinkRole::Initiator, link::Budget::new()));
+        let ids: Vec<CircId> = (1..=3)
+            .map(|i| CircId::new(0x8000_0200 + i).expect("a nonzero id"))
+            .collect();
+        {
+            let mut st = shared.lock();
+            for id in &ids {
+                st.table
+                    .accept_create(*id, test_transport(), Instant::now())
+                    .expect("room on the link");
+            }
+        }
+        // Something to write, so the writer reaches the stalled socket.
+        shared.push_out(ids[0], vec![0xEE; 8]).expect("queue");
+        assert_eq!(shared.lock().table.len(), 3);
+        assert!(!shared.closing());
+
         let ended = tokio::time::timeout(
             CELL_WRITE_TIMEOUT * 3,
-            write_with_timeout(&mut w, &[0u8; 8]),
+            run_link_writer(shared.clone(), StalledWriter),
         )
-        .await
-        .expect("the helper never gave up on a stalled write");
-
+        .await;
+        assert!(ended.is_ok(), "the writer never gave up on a stalled peer");
         assert!(
-            matches!(ended, Err(HandleError::WriteTimeout)),
-            "a stalled outbound write produced {ended:?} rather than WriteTimeout"
+            shared.closing(),
+            "a stalled outbound write left the link open"
         );
+
+        // What the link's own task then does: release everything.
+        let released = shared.release_all();
+        assert_eq!(released, 3, "every circuit on the link must be released");
+        assert_eq!(shared.lock().table.len(), 0);
+        let now = Instant::now();
+        for id in &ids {
+            assert!(
+                shared.lock().table.quarantined(*id, now),
+                "{:#010x} was released without being quarantined",
+                id.raw()
+            );
+        }
     }
 
-    /// Nothing writes to a next hop except through the bounded helper.
+    /// Find every socket write in one source that carries no bounded marker.
     ///
-    /// The helper having a timeout says nothing about whether the write paths
-    /// call it, so the two are checked separately. This reads the source rather
-    /// than the behaviour, which is the only way to see a site that is absent.
+    /// The three tokens are methods of `AsyncWrite` and `AsyncWriteExt`, which
+    /// is why a refactor cannot slip past this: renaming a variable, a field, a
+    /// helper or a type leaves the method name alone, because the name belongs
+    /// to the trait and not to this code. Writing to a socket without one of
+    /// them means implementing `poll_write` by hand.
+    ///
+    /// Shared by the check and its control, so the control exercises the same
+    /// code the check runs (docs/DECISIONS.md entry 30).
+    fn unbounded_writes(name: &str, src: &str) -> Vec<String> {
+        // Assembled at runtime so this never matches its own source.
+        let tokens = [
+            ["write", "_all("].concat(),
+            ["flush", "()"].concat(),
+            ["shutdown", "()"].concat(),
+        ];
+        let marker = ["bounded", ":"].concat();
+
+        // Test code writes freely and bounding it would prove nothing, so the
+        // scan stops where the test module starts.
+        let code = match src.find("\nmod tests {") {
+            Some(at) => &src[..at],
+            None => src,
+        };
+        let lines: Vec<&str> = code.lines().collect();
+        let mut out = Vec::new();
+        for (i, line) in lines.iter().enumerate() {
+            if !tokens.iter().any(|t| line.contains(t.as_str())) {
+                continue;
+            }
+            let above = i.checked_sub(1).map(|j| lines[j]).unwrap_or("");
+            if line.contains(&marker) || above.contains(&marker) {
+                continue;
+            }
+            out.push(format!("{name}:{} {}", i + 1, line.trim()));
+        }
+        out
+    }
+
+    /// No socket write or flush anywhere in the relay is unbounded.
+    ///
+    /// The previous version searched for one literal, `write.write_all`, and
+    /// missed the exit's write to its destination, the protocol byte on a new
+    /// outbound connection, the three writes in the port 80 redirect and the
+    /// unbounded dial. An empty result here is only worth something because of
+    /// the control below.
     #[test]
-    fn no_outbound_write_bypasses_the_timeout() {
-        let src = include_str!("main.rs");
-        // Split so the needle never appears whole in this file, or the check
-        // matches its own source and reports itself.
-        let needle = ["write.write", "_all"].concat();
-        let guard = ["write_with", "_timeout"].concat();
-        let offenders: Vec<&str> = src
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.starts_with("//"))
-            .filter(|l| l.contains(&needle) && !l.contains(&guard))
-            .collect();
+    fn no_socket_write_is_unbounded() {
+        let sources: [(&str, &str); 3] = [
+            ("main.rs", include_str!("main.rs")),
+            ("port80.rs", include_str!("port80.rs")),
+            ("tls.rs", include_str!("tls.rs")),
+        ];
+        let mut unbounded = Vec::new();
+        for (name, src) in sources {
+            unbounded.extend(unbounded_writes(name, src));
+        }
         assert!(
-            offenders.is_empty(),
-            "these write to a next hop without the timeout: {offenders:?}"
+            unbounded.is_empty(),
+            "these socket writes carry no bounded marker: {unbounded:#?}"
         );
     }
 
-    /// A write that lands one second inside the deadline does not close it.
+    /// The check catches each of the eight writes the relay actually has, one
+    /// at a time, in the shape each one has in the source.
+    ///
+    /// Eight, not the two that were reported: the exit's two to its
+    /// destination, the protocol byte and its flush, the port 80 pair and its
+    /// shutdown, and the shutdown that rejects an unexpected protocol byte.
+    #[test]
+    fn the_write_check_catches_every_shape_it_has_to() {
+        let shapes: [(&str, &str); 8] = [
+            ("exit payload", "        dl.write_all(payload).await?;"),
+            ("exit flush", "        dl.flush().await"),
+            ("preamble", "        stream.write_all(&[PROTO_RELAY]).await?;"),
+            ("preamble flush", "        stream.flush().await"),
+            ("port 80 head", "        sock.write_all(response.as_bytes()).await?;"),
+            ("port 80 body", "        sock.write_all(body).await?;"),
+            ("port 80 shutdown", "        sock.shutdown().await"),
+            (
+                "reject shutdown",
+                "            let _ = tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, w.shutdown()).await;",
+            ),
+        ];
+
+        for (what, line) in shapes {
+            let planted = format!("fn f() {{\n{line}\n}}\n");
+            let found = unbounded_writes("planted.rs", &planted);
+            assert_eq!(
+                found.len(),
+                1,
+                "the check did not catch the {what} write: {found:?}"
+            );
+
+            // And with the marker it is accepted, so the check is not simply
+            // flagging everything.
+            let marked = format!("fn f() {{\n    // bounded: SOME_TIMEOUT\n{line}\n}}\n");
+            assert!(
+                unbounded_writes("planted.rs", &marked).is_empty(),
+                "the {what} write was flagged even with a marker"
+            );
+        }
+    }
+
+    /// A write that lands one second inside the deadline does not close it.    /// A write that lands one second inside the deadline does not close it.    /// A write that lands one second inside the deadline does not close it.
     #[tokio::test(start_paused = true)]
     async fn a_write_that_lands_inside_the_deadline_does_not_close_the_link() {
         let shared = Arc::new(LinkShared::new(LinkRole::Responder, link::Budget::new()));

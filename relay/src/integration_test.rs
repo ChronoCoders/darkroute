@@ -139,6 +139,7 @@ fn make_config(
         replay_window_ttl: 86_400,
         max_circuits: 16,
         max_link_buffer_bytes: over.max_link_buffer_bytes,
+        max_circuits_per_relay_link: 256,
         node_id: format!("test-relay-{role}"),
         decodo_proxy_url: if role == Role::Exit {
             over.decodo_proxy_url
@@ -225,6 +226,9 @@ fn parse_hour(rfc3339: &str) -> i64 {
 /// pin to handshake with it.
 struct SpawnedRelay {
     addr: SocketAddr,
+    /// The relay's own byte budget, so a test can assert what it holds instead
+    /// of inferring it from a refusal that may never come.
+    budget: crate::link::Budget,
     static_pubkey: [u8; STATIC_KEY_LEN],
     /// Needed because a link's frame size follows the relay's role.
     role: Role,
@@ -255,6 +259,7 @@ async fn spawn_relay(
     let replay = Arc::new(ReplayWindow::new(Duration::from_secs(86_400)));
     let cfg = make_config(role, over, key_path, keydir.join(format!("{role}-state")));
     let shutdown = Arc::new(Notify::new());
+    let budget = crate::link::Budget::new();
     tokio::spawn(super::accept_loop(
         listener,
         server_config.clone(),
@@ -266,10 +271,12 @@ async fn spawn_relay(
         connector,
         Arc::new(kp),
         registry,
-        crate::link::Budget::new(),
+        budget.clone(),
+        Arc::new(crate::linkreg::Registry::new()),
     ));
     SpawnedRelay {
         addr,
+        budget,
         static_pubkey,
         role,
     }
@@ -918,6 +925,7 @@ async fn wrong_static_key_fails_the_handshake() {
 
         // The impostor key belongs to the exit, not the guard.
         let impostor = SpawnedRelay {
+            budget: crate::link::Budget::new(),
             addr: fleet.guard.addr,
             static_pubkey: fleet.exit.static_pubkey,
             role: Role::Guard,
@@ -1483,7 +1491,6 @@ async fn a_stalled_circuit_does_not_stall_the_others_on_its_link() {
         // frames reaches the cap once and 1624 never does, so FILLER leaves
         // room for a machine whose buffers are larger.
         const FILLER: usize = 8000;
-        let queue_full_before = crate::metrics::dropped_count("queue_full");
         let filler = Cell::new(CellType::Data, vec![0x5C; 64]).expect("cell");
         for _ in 0..FILLER {
             client.send(a, &filler).await;
@@ -1496,16 +1503,17 @@ async fn a_stalled_circuit_does_not_stall_the_others_on_its_link() {
             .await
             .expect("B stopped carrying data while A was stalled");
 
-        // A is destroyed for exceeding what its queue can hold, and the frame
+        // A is destroyed for exceeding what can be held for it, and the frame
         // naming it says so.
+        //
+        // Protocol, whichever queue fills. A per-circuit queue holds 1024 and
+        // a compliant peer cannot put more than 1010 frames in one in steady
+        // state, so reaching the cap means the peer sent past its window
+        // (docs/DECISIONS.md entry 31). FILLER is 8000, far past it.
         // The stall has to have happened, or everything below passes without
-        // exercising anything. No other test fills a circuit queue, so the
-        // counter moving is this test's doing.
-        assert!(
-            crate::metrics::dropped_count("queue_full") > queue_full_before,
-            "{FILLER} frames did not fill the queue, so this run never stalled a circuit \
-             and proves nothing about the ones beside it"
-        );
+        // exercising anything. The DESTROY asserted below is that evidence: it
+        // only arrives once the shared link to the stalled hop has no room left
+        // for A, which takes the whole FILLER burst.
 
         let mut a_destroyed = None;
         for _ in 0..8 {
@@ -1522,7 +1530,7 @@ async fn a_stalled_circuit_does_not_stall_the_others_on_its_link() {
         assert_eq!(
             a_destroyed,
             Some(DestroyReason::Protocol as u8),
-            "the stalled circuit was not destroyed with Protocol once its queue filled"
+            "a circuit whose queue filled was not destroyed with Protocol"
         );
 
         // The link and B both survived A being destroyed.
@@ -1740,7 +1748,11 @@ async fn at_the_budget_ceiling_creates_are_refused_and_open_circuits_carry_on() 
         let pki = make_pki();
         let server_config = make_server_config(&pki);
         let connector = Arc::new(make_connector(&pki));
-        const CEILING: u64 = 100_000;
+        // Measured: the burst below leaves about 48 KB queued on the guard at
+        // once, the rest having drained into the stalled hop's socket buffer.
+        // The ceiling sits under that, and the assertion further down fails the
+        // run if it was not actually crossed.
+        const CEILING: u64 = 20_000;
         let over = RelayOverride {
             max_link_buffer_bytes: CEILING,
             ..default_override()
@@ -1796,6 +1808,17 @@ async fn at_the_budget_ceiling_creates_are_refused_and_open_circuits_carry_on() 
         for _ in 0..900 {
             client.send(filler, &payload).await;
         }
+
+        // The ceiling has to have been crossed, or the refusal below is
+        // missing for a reason that has nothing to do with the budget. Asserted
+        // on what the guard actually holds, not inferred from a refusal that
+        // may never come.
+        assert!(
+            fleet.guard.budget.held() >= CEILING,
+            "the guard holds {} bytes against a {CEILING} ceiling, so this run never \
+             filled the budget and proves nothing about admission",
+            fleet.guard.budget.held()
+        );
 
         // A CREATE now has to meet a full budget.
         let m_raw: [u8; 32] = [0xB3; 32];
@@ -2610,6 +2633,7 @@ async fn run_adverse_delivery_test() {
 
     // Dial the guard through its proxy, still pinning the guard's real key.
     let guard_hop = SpawnedRelay {
+        budget: crate::link::Budget::new(),
         addr: guard_via,
         static_pubkey: guard.static_pubkey,
         role: Role::Guard,
@@ -2620,6 +2644,7 @@ async fn run_adverse_delivery_test() {
             addr: middle_via,
             static_pubkey: middle.static_pubkey,
             role: Role::Middle,
+            budget: crate::link::Budget::new(),
         })
         .await;
     client
@@ -2627,6 +2652,7 @@ async fn run_adverse_delivery_test() {
             addr: exit_via,
             static_pubkey: exit.static_pubkey,
             role: Role::Exit,
+            budget: crate::link::Budget::new(),
         })
         .await;
 

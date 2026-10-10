@@ -40,6 +40,8 @@ pub enum TlsError {
     Handshake(String, std::io::Error),
     #[error("tls accept: {0}")]
     Accept(std::io::Error),
+    #[error("dialing {0} did not connect and handshake inside {1:?}")]
+    DialTimeout(std::net::SocketAddr, std::time::Duration),
 }
 
 pub struct AcmeBundle {
@@ -139,20 +141,36 @@ pub fn outbound_connector() -> Result<TlsConnector, TlsError> {
 }
 
 /// TCP-connect then TLS-handshake with `sni`. No skip-verify path.
+/// Dial a peer and complete the TLS handshake, bounded as one operation.
+///
+/// The connect and the handshake are one question, whether a session can be
+/// established with this peer, so they share one deadline rather than each
+/// having their own. Neither was bounded before. That matters more than it
+/// looks: under ARCHITECTURE 5.10 this dial runs while the registry slot for
+/// that hop is opening, so every other circuit waiting for the hop waits
+/// behind it.
 pub async fn dial_tls(
     connector: &TlsConnector,
     addr: std::net::SocketAddr,
     sni: &str,
+    budget: std::time::Duration,
 ) -> Result<ClientTlsStream<TcpStream>, TlsError> {
-    let tcp = TcpStream::connect(addr)
-        .await
-        .map_err(|e| TlsError::Handshake(format!("tcp connect {addr}"), e))?;
-    tcp.set_nodelay(true)
-        .map_err(|e| TlsError::Handshake(format!("set_nodelay {addr}"), e))?;
     let server_name = ServerName::try_from(sni.to_string())
         .map_err(|_| TlsError::InvalidServerName(sni.to_string()))?;
-    connector
-        .connect(server_name, tcp)
-        .await
-        .map_err(|e| TlsError::Handshake(format!("tls handshake to {sni} at {addr}"), e))
+    match tokio::time::timeout(budget, async {
+        let tcp = TcpStream::connect(addr)
+            .await
+            .map_err(|e| TlsError::Handshake(format!("tcp connect {addr}"), e))?;
+        tcp.set_nodelay(true)
+            .map_err(|e| TlsError::Handshake(format!("set_nodelay {addr}"), e))?;
+        connector
+            .connect(server_name, tcp)
+            .await
+            .map_err(|e| TlsError::Handshake(format!("tls handshake to {sni} at {addr}"), e))
+    })
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => Err(TlsError::DialTimeout(addr, budget)),
+    }
 }

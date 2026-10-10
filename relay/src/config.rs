@@ -65,6 +65,10 @@ pub struct RelayConfig {
     /// Relay-wide ceiling on bytes held in per-circuit queues. A soft limit,
     /// checked only when a CREATE arrives (ARCHITECTURE 5.9).
     pub max_link_buffer_bytes: u64,
+    /// Circuits on one relay-to-relay link, inbound and outbound. Defaults to
+    /// `max_circuits`, because 64 was sized for a client link and a trunk
+    /// carrying most of a small fleet's traffic needs more (ARCHITECTURE 5.10).
+    pub max_circuits_per_relay_link: u32,
     pub node_id: String,
     /// Required when role == Exit.
     pub decodo_proxy_url: Option<String>,
@@ -121,6 +125,8 @@ impl RelayConfig {
         let replay_window_ttl = parse_u64(&get, "REPLAY_WINDOW_TTL", 86_400)?;
         let max_circuits = parse_u32_required(&get, "MAX_CIRCUITS")?;
         let max_link_buffer_bytes = parse_u64_required(&get, "MAX_LINK_BUFFER_BYTES")?;
+        let max_circuits_per_relay_link =
+            parse_u32(&get, "MAX_CIRCUITS_PER_RELAY_LINK", max_circuits)?;
         let node_id = required(&get, "NODE_ID")?;
 
         let decodo_proxy_url = get("DECODO_PROXY_URL");
@@ -191,6 +197,7 @@ impl RelayConfig {
             replay_window_ttl,
             max_circuits,
             max_link_buffer_bytes,
+            max_circuits_per_relay_link,
             node_id,
             decodo_proxy_url,
             allowed_exit_ports,
@@ -299,6 +306,21 @@ fn parse_u64<F: Fn(&str) -> Option<String>>(
         None => Ok(default),
         Some(s) if s.is_empty() => Ok(default),
         Some(s) => s.parse::<u64>().map_err(|e| ConfigError::Invalid {
+            var: key,
+            reason: e.to_string(),
+        }),
+    }
+}
+
+fn parse_u32<F: Fn(&str) -> Option<String>>(
+    get: &F,
+    key: &'static str,
+    default: u32,
+) -> Result<u32, ConfigError> {
+    match get(key) {
+        None => Ok(default),
+        Some(s) if s.is_empty() => Ok(default),
+        Some(s) => s.parse::<u32>().map_err(|e| ConfigError::Invalid {
             var: key,
             reason: e.to_string(),
         }),

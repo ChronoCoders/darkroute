@@ -17,6 +17,10 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
+/// Writing the redirect, matched to the read side: the whole exchange is a
+/// few hundred bytes and a client that will not take them is not waiting on us.
+const PORT80_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REQUEST_HEAD: usize = 4096;
 
@@ -82,9 +86,19 @@ async fn serve_redirect(mut sock: TcpStream, hostname: &str) -> std::io::Result<
          \r\n",
         len = body.len()
     );
-    sock.write_all(response.as_bytes()).await?;
-    sock.write_all(body).await?;
-    sock.shutdown().await?;
+    // bounded: PORT80_WRITE_TIMEOUT. A client that sends a request line and
+    // then stops reading would otherwise hold this task for ever
+    // (ARCHITECTURE 5.11).
+    tokio::time::timeout(PORT80_WRITE_TIMEOUT, async {
+        // bounded: PORT80_WRITE_TIMEOUT, by the block around this
+        sock.write_all(response.as_bytes()).await?;
+        // bounded: PORT80_WRITE_TIMEOUT
+        sock.write_all(body).await?;
+        // bounded: PORT80_WRITE_TIMEOUT
+        sock.shutdown().await
+    })
+    .await
+    .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "port 80 write timeout"))??;
     Ok(())
 }
 
