@@ -9,7 +9,7 @@
 //! reasoning behind the id lifecycle is docs/DECISIONS.md entry 22.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -17,6 +17,7 @@ use quiethop_crypto::circid::{self, CircId, CircIdError, LinkRole};
 use quiethop_crypto::flow::{AfterDelivery, FlowError, Windows};
 use quiethop_crypto::link::DestroyReason;
 use quiethop_crypto::noise::Transport;
+use tracing::{info, warn};
 
 /// Circuits one link will carry. A create beyond it is answered with DESTROY.
 /// Provisional until the step 5 measurement (ARCHITECTURE 5.8).
@@ -45,7 +46,26 @@ pub const MAX_CONTROL_QUEUE: usize = MAX_CIRCUITS_PER_LINK;
 /// Handed to each link rather than kept in a static, so a test gets its own and
 /// can assert exact byte counts while the rest of the suite runs beside it.
 #[derive(Debug, Clone, Default)]
-pub struct Budget(Arc<AtomicU64>);
+pub struct Budget(Arc<BudgetState>);
+
+#[derive(Debug)]
+struct BudgetState {
+    held: AtomicU64,
+    /// Whether the relay is admitting circuits, relay-wide rather than per
+    /// link. The counter is one number for the whole relay, so a per-link
+    /// answer lets a link that never saw the ceiling keep admitting between the
+    /// resume mark and the ceiling while another refuses (ARCHITECTURE 5.9).
+    admitting: AtomicBool,
+}
+
+impl Default for BudgetState {
+    fn default() -> Self {
+        Self {
+            held: AtomicU64::new(0),
+            admitting: AtomicBool::new(true),
+        }
+    }
+}
 
 impl Budget {
     pub fn new() -> Self {
@@ -54,32 +74,65 @@ impl Budget {
 
     /// Bytes held in per-circuit queues right now.
     pub fn held(&self) -> u64 {
-        self.0.load(Ordering::Relaxed)
+        self.0.held.load(Ordering::Relaxed)
     }
 
-    /// Whether a new circuit may be admitted, given the ceiling and the gap
-    /// that keeps a full relay from admitting and refusing alternately.
+    /// Whether a new circuit may be admitted.
     ///
-    /// `admitting` is the caller's current answer, carried across calls so the
-    /// hysteresis has something to remember.
-    pub fn may_admit(&self, ceiling: u64, admitting: bool) -> bool {
+    /// Admission closes at the ceiling and reopens under the resume mark, nine
+    /// tenths of it, so a relay sitting at the limit does not admit and refuse
+    /// alternately as single frames come and go. Each transition is claimed by
+    /// a compare and exchange, so with several links asking at once exactly one
+    /// of them makes the change and logs it.
+    pub fn may_admit(&self, ceiling: u64) -> bool {
         let held = self.held();
-        if admitting {
-            held < ceiling
-        } else {
-            // Back under the resume mark, nine tenths of the ceiling, before
-            // admitting again (ARCHITECTURE 5.9).
-            held < ceiling / 10 * 9
+        let admitting = self.0.admitting.load(Ordering::Relaxed);
+
+        if admitting && held >= ceiling {
+            if self
+                .0
+                .admitting
+                .compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                warn!(
+                    held,
+                    ceiling, "link buffer budget reached, refusing new circuits"
+                );
+            }
+            return false;
         }
+
+        if !admitting && held < resume_mark(ceiling) {
+            if self
+                .0
+                .admitting
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                info!(
+                    held,
+                    "link buffer budget recovered, admitting circuits again"
+                );
+            }
+            return true;
+        }
+
+        admitting
     }
 
     fn take(&self, n: usize) {
-        self.0.fetch_add(n as u64, Ordering::Relaxed);
+        self.0.held.fetch_add(n as u64, Ordering::Relaxed);
     }
 
     fn release(&self, n: usize) {
-        self.0.fetch_sub(n as u64, Ordering::Relaxed);
+        self.0.held.fetch_sub(n as u64, Ordering::Relaxed);
     }
+}
+
+/// Where admission reopens: nine tenths of the ceiling.
+fn resume_mark(ceiling: u64) -> u64 {
+    ceiling / 10 * 9
 }
 
 /// A frame counted against the relay-wide budget for as long as it is queued.
@@ -532,37 +585,110 @@ mod tests {
     /// mark, not at the ceiling itself (ARCHITECTURE 5.9).
     #[test]
     fn the_budget_refuses_at_its_ceiling_and_resumes_at_ninety_percent() {
-        // A 1000 byte ceiling, so the resume mark is 900.
+        // A 1000 byte ceiling, so the resume mark is 900. Frames of 50 bytes,
+        // so the level can be put either side of both marks exactly.
         const CEILING: u64 = 1000;
+        const FRAME: usize = 50;
         let budget = Budget::new();
         let mut t = LinkTable::new(LinkRole::Responder, budget.clone());
         let x = id(0x70);
         t.accept_create(x, transport(), Instant::now())
             .expect("room on the link");
 
-        assert!(budget.may_admit(CEILING, true), "empty, so there is room");
+        assert!(budget.may_admit(CEILING), "empty, so there is room");
 
-        t.push_out(x, vec![0u8; 950]).expect("room in the queue");
+        for _ in 0..19 {
+            t.push_out(x, vec![0u8; FRAME]).expect("room in the queue");
+        }
         assert_eq!(budget.held(), 950);
         assert!(
-            budget.may_admit(CEILING, true),
-            "950 under a 1000 ceiling must not refuse while already admitting"
+            budget.may_admit(CEILING),
+            "950 under a 1000 ceiling still admits, because the ceiling is what closes it"
         );
+
+        for _ in 0..2 {
+            t.push_out(x, vec![0u8; FRAME]).expect("room in the queue");
+        }
+        assert_eq!(budget.held(), 1050);
+        assert!(!budget.may_admit(CEILING), "1050 is past the ceiling");
+
+        // Back to 950. Above the 900 resume mark, so it stays closed: this is
+        // the gap, and without it admission would reopen here.
+        for _ in 0..2 {
+            assert!(t.pop_next_out().is_some());
+        }
+        assert_eq!(budget.held(), 950);
         assert!(
-            !budget.may_admit(CEILING, false),
+            !budget.may_admit(CEILING),
             "950 is above the 900 resume mark, so admission stays closed"
         );
 
-        t.push_out(x, vec![0u8; 100]).expect("room in the queue");
-        assert_eq!(budget.held(), 1050);
-        assert!(!budget.may_admit(CEILING, true), "1050 is past the ceiling");
-
-        while t.pop_next_out().is_some() {}
-        assert_eq!(budget.held(), 0, "the queue drained to nothing");
+        // Under the mark, admission reopens.
+        for _ in 0..2 {
+            assert!(t.pop_next_out().is_some());
+        }
+        assert_eq!(budget.held(), 850);
         assert!(
-            budget.may_admit(CEILING, false),
-            "back under the resume mark, so admission reopens"
+            budget.may_admit(CEILING),
+            "850 is under the resume mark, so admission reopens"
         );
+    }
+
+    /// The admitting state is one answer for the whole relay, not one per link.
+    ///
+    /// The counter is relay-wide, so a per-link flag would let a link that
+    /// never saw the ceiling keep admitting between the resume mark and the
+    /// ceiling while another link refused, and a link opened after the refusal
+    /// would start by admitting. The relay would flap as a whole even though no
+    /// single link did (ARCHITECTURE 5.9).
+    #[test]
+    fn the_admitting_state_is_relay_wide_and_not_per_link() {
+        const CEILING: u64 = 1000;
+        const FRAME: usize = 50;
+        let budget = Budget::new();
+
+        // Link A crosses the ceiling and starts refusing.
+        let mut a = LinkTable::new(LinkRole::Responder, budget.clone());
+        let x = id(0x90);
+        a.accept_create(x, transport(), Instant::now())
+            .expect("room on the link");
+        for _ in 0..21 {
+            a.push_out(x, vec![0u8; FRAME]).expect("room in the queue");
+        }
+        assert_eq!(budget.held(), 1050);
+        assert!(!budget.may_admit(CEILING), "A is past the ceiling");
+
+        // Held falls to 950, which is 95 percent of the ceiling.
+        for _ in 0..2 {
+            assert!(a.pop_next_out().is_some());
+        }
+        assert_eq!(budget.held(), 950);
+
+        // A second link, opened only now, after the refusal began. Its own
+        // view of the budget is the same view, so it refuses too.
+        let mut b = LinkTable::new(LinkRole::Responder, budget.clone());
+        let y = id(0x91);
+        b.accept_create(y, transport(), Instant::now())
+            .expect("room on the link");
+        assert!(
+            !b.budget.may_admit(CEILING),
+            "a link opened after the refusal began must not admit at 95 percent"
+        );
+        assert!(
+            !budget.may_admit(CEILING),
+            "and neither does the link that was already refusing"
+        );
+
+        // Under the resume mark, both links admit again.
+        for _ in 0..2 {
+            assert!(a.pop_next_out().is_some());
+        }
+        assert_eq!(budget.held(), 850);
+        assert!(
+            b.budget.may_admit(CEILING),
+            "the newer link admits again once the relay is under the mark"
+        );
+        assert!(budget.may_admit(CEILING), "and so does the older one");
     }
 
     /// Every byte a circuit held is released when it is destroyed, including

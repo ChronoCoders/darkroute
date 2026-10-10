@@ -633,11 +633,8 @@ struct LinkShared {
     /// so it asks the reader to, and the reader owns the teardown.
     close: Notify,
     closing: AtomicBool,
-    /// Whether this link is currently admitting circuits. Kept so the budget's
-    /// resume mark is remembered between creates rather than recomputed from
-    /// the ceiling alone, which is what makes the hysteresis work.
-    admitting: AtomicBool,
-    /// Shared with every other link on this relay.
+    /// Shared with every other link on this relay, and it carries the
+    /// admitting state too, which is relay-wide (ARCHITECTURE 5.9).
     budget: link::Budget,
 }
 
@@ -667,27 +664,8 @@ impl LinkShared {
             wake: Notify::new(),
             close: Notify::new(),
             closing: AtomicBool::new(false),
-            admitting: AtomicBool::new(true),
             budget,
         }
-    }
-
-    /// Whether a CREATE may be admitted under the relay-wide byte budget.
-    fn may_admit(&self, ceiling: u64) -> bool {
-        let was = self.admitting.load(Ordering::Relaxed);
-        let now = self.budget.may_admit(ceiling, was);
-        if now != was {
-            self.admitting.store(now, Ordering::Relaxed);
-            if now {
-                info!(held = self.budget.held(), "admitting circuits again");
-            } else {
-                warn!(
-                    held = self.budget.held(),
-                    ceiling, "link buffer budget reached, refusing new circuits"
-                );
-            }
-        }
-        now
     }
 
     /// Ask the link to end. Idempotent, and safe from any circuit task.
@@ -1001,7 +979,7 @@ async fn open_inbound_circuit(
     // The relay-wide budget is checked here and nowhere else. A circuit
     // already open keeps its full queue allowance whatever the total reaches,
     // so what this bounds is growth (ARCHITECTURE 5.9).
-    if !shared.may_admit(ctx.cfg.max_link_buffer_bytes) {
+    if !shared.budget.may_admit(ctx.cfg.max_link_buffer_bytes) {
         metrics::record_frame_dropped(metrics::DropReason::BufferBudget);
         send_destroy(shared, id, layers, DestroyReason::Resource);
         return Ok(());
