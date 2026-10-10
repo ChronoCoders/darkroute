@@ -1178,6 +1178,11 @@ fn dispatch_outbound(shared: &Arc<LinkShared>, wire: &[u8], layers: Layers) {
     let id = frame.circ_id;
     match frame.command {
         link_frame::LinkCommand::Created | link_frame::LinkCommand::Data => {
+            // Both go to the circuit whole. Which of them is expected depends
+            // on whether the circuit has had its CREATED, and only the circuit
+            // task knows that in order: it is the one that opens the circuit
+            // when the CREATED arrives, so a decision made here would race it
+            // and drop the first real DATA behind a prompt CREATED.
             let tx = {
                 let st = shared.lock();
                 st.handles.get(&id).map(|h| h.frames.clone())
@@ -1946,21 +1951,49 @@ async fn extend_to_next_hop(
         return Err(HandleError::Handshake);
     }
 
-    let wire = match tokio::time::timeout(HANDSHAKE_READ_TIMEOUT, frames.recv()).await {
-        Ok(Some(w)) => w.take(),
-        // The link went, or the hop never answered.
-        _ => {
+    // One deadline for the whole wait, not one per frame, so a hop that sends
+    // DATA on a loop cannot hold a pending circuit open indefinitely.
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_READ_TIMEOUT;
+    let noise_msg2 = loop {
+        let wire = match tokio::time::timeout_at(deadline, frames.recv()).await {
+            Ok(Some(w)) => w.take(),
+            // The link went, or the hop never answered.
+            _ => {
+                shared.forget(circ_id);
+                return Err(HandleError::Handshake);
+            }
+        };
+        let back = match link_frame::decode(&wire, frame_layers, LinkRole::Responder) {
+            Ok(f) => f,
+            Err(e) => {
+                shared.forget(circ_id);
+                return Err(e.into());
+            }
+        };
+        if back.command == link_frame::LinkCommand::Data {
+            // DATA for a circuit this side has not seen acknowledged belongs to
+            // whatever held the id before, so it is dropped and counted here,
+            // never peeled and never forwarded (docs/DECISIONS.md entry 22).
+            // Nothing is sent back either: answering would confirm the id to
+            // whoever guessed it, which is why a colliding CREATE is met with
+            // silence too.
+            metrics::record_frame_dropped(metrics::DropReason::BeforeCreated);
+            continue;
+        }
+        if back.command != link_frame::LinkCommand::Created || back.circ_id != circ_id {
             shared.forget(circ_id);
             return Err(HandleError::Handshake);
         }
+        let mut msg2 = [0u8; NOISE_MSG_LEN];
+        match link_frame::payload(back.body, NOISE_MSG_LEN) {
+            Ok(p) => msg2.copy_from_slice(p),
+            Err(e) => {
+                shared.forget(circ_id);
+                return Err(e.into());
+            }
+        }
+        break msg2;
     };
-    let back = link_frame::decode(&wire, frame_layers, LinkRole::Responder)?;
-    if back.command != link_frame::LinkCommand::Created || back.circ_id != circ_id {
-        shared.forget(circ_id);
-        return Err(HandleError::Handshake);
-    }
-    let mut noise_msg2 = [0u8; NOISE_MSG_LEN];
-    noise_msg2.copy_from_slice(link_frame::payload(back.body, NOISE_MSG_LEN)?);
 
     // No transport here: this hop's session belongs to the client and this
     // relay only couriers the handshake, so the phase moves to Open with none.

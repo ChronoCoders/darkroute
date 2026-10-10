@@ -1071,6 +1071,17 @@ struct RecordingMiddle {
 /// writing to it blocks after a few frames rather than after a megabyte.
 const STALLED_RECV_BUF: u32 = 4096;
 
+/// DATA frames a hop writes around its CREATED, for the one thing a cooperating
+/// hop never does: speak for a circuit before it has acknowledged it.
+///
+/// Each value is the byte the frame's body is filled with, so a test can tell
+/// the two frames apart wherever they end up.
+#[derive(Clone, Copy, Default)]
+struct HandshakeExtras {
+    before_created: Option<u8>,
+    after_created: Option<u8>,
+}
+
 impl RecordingMiddle {
     const LAYERS: Layers = CLIENT_LAYERS.peeled();
 
@@ -1087,6 +1098,13 @@ impl RecordingMiddle {
         Self::spawn_gated_for(server_config, 1).await
     }
 
+    /// Reads as soon as it is connected, and writes DATA around its CREATED.
+    async fn spawn_with_extras(server_config: Arc<ServerConfig>, extras: HandshakeExtras) -> Self {
+        let m = Self::spawn_gated_with(server_config, 1, extras).await;
+        m.open();
+        m
+    }
+
     /// Completes `creates` handshakes on the one link the upstream relay opens,
     /// then reads nothing until `open` is called.
     ///
@@ -1095,6 +1113,14 @@ impl RecordingMiddle {
     /// this hop arrives on one connection and the CREATEs come in a row before
     /// the test sends any data.
     async fn spawn_gated_for(server_config: Arc<ServerConfig>, creates: usize) -> Self {
+        Self::spawn_gated_with(server_config, creates, HandshakeExtras::default()).await
+    }
+
+    async fn spawn_gated_with(
+        server_config: Arc<ServerConfig>,
+        creates: usize,
+        extras: HandshakeExtras,
+    ) -> Self {
         let keypair = generate_static_keypair().expect("keygen");
         let static_pubkey = keypair.public;
         // A small receive buffer, set explicitly so the kernel stops autotuning
@@ -1159,8 +1185,26 @@ impl RecordingMiddle {
                         ) else {
                             return;
                         };
+                        // Written before the CREATED on purpose: a frame for a
+                        // circuit this hop has not acknowledged yet.
+                        if let Some(fill) = extras.before_created {
+                            if Self::write_data(&mut sock, create.circ_id, fill)
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
                         if sock.write_all(&created).await.is_err() || sock.flush().await.is_err() {
                             return;
+                        }
+                        if let Some(fill) = extras.after_created {
+                            if Self::write_data(&mut sock, create.circ_id, fill)
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
                     }
 
@@ -1188,6 +1232,19 @@ impl RecordingMiddle {
             frames,
             gate,
         }
+    }
+
+    /// One DATA frame for `circ_id`, body filled with `fill`.
+    async fn write_data<W: tokio::io::AsyncWrite + Unpin>(
+        sock: &mut W,
+        circ_id: CircId,
+        fill: u8,
+    ) -> std::io::Result<()> {
+        let body = vec![fill; link_cell_len(Self::LAYERS)];
+        let frame = link_frame::encode(Self::LAYERS, circ_id, link_frame::LinkCommand::Data, &body)
+            .expect("encode data");
+        sock.write_all(&frame).await?;
+        sock.flush().await
     }
 
     /// Let the frame loop run. A permit left here before the task reaches the
@@ -1307,6 +1364,122 @@ async fn a_forwarded_destroy_carries_destroyed_and_not_the_reason_received() {
             "the reason the client chose crossed the relay, which is the side channel \
              tor-spec forbids"
         );
+    })
+    .await
+    .expect("test timed out");
+}
+
+/// DATA arriving for a circuit the next hop has not acknowledged yet is
+/// dropped and counted, and the circuit still completes once CREATED comes.
+///
+/// Reachable only since outbound links became shared and dispatched (34ab1c3):
+/// the relay now holds a Pending circuit on a real link while it waits for
+/// CREATED, which is the window this frame lands in. The frame belongs to
+/// whatever used that id before, so it must not be decrypted, delivered or
+/// answered (docs/DECISIONS.md entry 22).
+///
+/// The harness is the smallest thing that can produce it: a published middle
+/// that writes one DATA frame for the circuit before its CREATED, and another
+/// after, each body filled with its own byte so the two cannot be confused
+/// wherever they arrive. No cooperating hop does this, so no existing mock
+/// could.
+#[tokio::test]
+async fn data_before_created_is_dropped_and_the_circuit_still_completes() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        ensure_crypto_provider();
+        let keydir = tempfile::tempdir().expect("keydir");
+        let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let pki = make_pki();
+        let server_config = make_server_config(&pki);
+        let connector = Arc::new(make_connector(&pki));
+        let over = default_override();
+        let fleet = spawn_fleet(
+            &auth_priv,
+            &over,
+            server_config.clone(),
+            connector.clone(),
+            keydir.path(),
+        )
+        .await;
+
+        const EARLY: u8 = 0xE1;
+        const REPLY: u8 = 0xD2;
+        let mut middle = RecordingMiddle::spawn_with_extras(
+            server_config,
+            HandshakeExtras {
+                before_created: Some(EARLY),
+                after_created: Some(REPLY),
+            },
+        )
+        .await;
+        let (after, fresh, until) = current_window();
+        fleet.publish(document_from(
+            &[
+                ("guard", fleet.guard.addr, fleet.guard.static_pubkey),
+                ("middle", middle.addr, middle.static_pubkey),
+                ("exit", fleet.exit.addr, fleet.exit.static_pubkey),
+            ],
+            &after,
+            &fresh,
+            &until,
+        ));
+
+        let dropped_before = crate::metrics::dropped_count("before_created");
+        let mut client =
+            MockClient::connect_with_token(&connector, &fleet.guard, &auth_priv, [0xF4; 32]).await;
+
+        // The extend has to complete. A relay that let the early frame reach
+        // the circuit would fail the handshake on it instead.
+        assert!(
+            client
+                .try_extend_to(middle.addr, middle.static_pubkey)
+                .await,
+            "the circuit did not complete, so the frame that arrived before CREATED \
+             was not dropped"
+        );
+        assert_eq!(
+            crate::metrics::dropped_count("before_created"),
+            dropped_before + 1,
+            "the early frame was not counted as dropped before CREATED"
+        );
+
+        // The frame that came after CREATED is the one the client gets, and the
+        // only one. Peeling the guard's layer gives back exactly the bytes the
+        // middle wrote, so nothing of the early frame reached here.
+        let wire = tokio::time::timeout(Duration::from_secs(10), client.read_frame())
+            .await
+            .expect("no frame reached the client after the handshake")
+            .expect("the client could not read the frame");
+        let peeled = peel(&mut client.keys.guard, &wire, CLIENT_LAYERS).expect("peel guard");
+        let Peeled::Forward(body) = peeled else {
+            panic!("the guard delivered a cell to the client where it should have forwarded");
+        };
+        assert_eq!(
+            body,
+            vec![REPLY; link_cell_len(RecordingMiddle::LAYERS)],
+            "the client got a body that is not the one the middle sent after CREATED"
+        );
+        assert!(
+            !body.contains(&EARLY),
+            "a byte of the early frame reached the client"
+        );
+
+        // The circuit carries data the other way too, and the first thing the
+        // middle sees from the guard is that data rather than a DESTROY.
+        let payload = Cell::new(CellType::Data, b"after the handshake".to_vec()).expect("cell");
+        let wire = client.seal_for_depth(&payload, 2);
+        client.write_frame(&wire).await;
+        let forwarded = middle.next_frame().await;
+        let frame = link_frame::decode(&forwarded, RecordingMiddle::LAYERS, LinkRole::Initiator)
+            .expect("decode the frame the guard forwarded");
+        assert_eq!(
+            frame.command,
+            link_frame::LinkCommand::Data,
+            "the guard answered the early frame with {:?} instead of carrying the \
+             circuit's data",
+            frame.command
+        );
+        assert_eq!(frame.circ_id.raw() & 0x8000_0000, 0x8000_0000);
     })
     .await
     .expect("test timed out");
