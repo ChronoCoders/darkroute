@@ -2026,10 +2026,14 @@ mod tests {
             }
         }
 
-        // Every queue deep before the writer starts, so every turn it takes is
-        // a turn where it had all four to choose from.
-        for _ in 0..ROTATIONS {
-            for (i, id) in ids.iter().enumerate() {
+        // Filled in blocks, one circuit at a time, which is the point. Filling
+        // them interleaved puts the frames in rotation order on arrival, so a
+        // writer serving one shared FIFO in arrival order produces the same
+        // output as a fair one and passes. In blocks, arrival order is
+        // 0 eight times then 1 eight times, and only a writer that rotates
+        // produces the order asserted below.
+        for (i, id) in ids.iter().enumerate() {
+            for _ in 0..ROTATIONS {
                 shared
                     .push_out(*id, vec![i as u8; 4])
                     .expect("room in the queue");
