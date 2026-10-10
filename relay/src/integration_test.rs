@@ -1067,6 +1067,10 @@ struct RecordingMiddle {
     gate: Arc<Notify>,
 }
 
+/// Receive buffer on a gated hop's socket, small enough that an upstream relay
+/// writing to it blocks after a few frames rather than after a megabyte.
+const STALLED_RECV_BUF: u32 = 4096;
+
 impl RecordingMiddle {
     const LAYERS: Layers = CLIENT_LAYERS.peeled();
 
@@ -1077,11 +1081,31 @@ impl RecordingMiddle {
         m
     }
 
-    /// Completes the handshake and then reads nothing until `open` is called.
+    /// Completes one circuit's handshake and then reads nothing until `open` is
+    /// called.
     async fn spawn_gated(server_config: Arc<ServerConfig>) -> Self {
+        Self::spawn_gated_for(server_config, 1).await
+    }
+
+    /// Completes `creates` handshakes on the one link the upstream relay opens,
+    /// then reads nothing until `open` is called.
+    ///
+    /// More than one matters for any test that needs several circuits stalled
+    /// behind the same socket: outbound links are shared, so every circuit to
+    /// this hop arrives on one connection and the CREATEs come in a row before
+    /// the test sends any data.
+    async fn spawn_gated_for(server_config: Arc<ServerConfig>, creates: usize) -> Self {
         let keypair = generate_static_keypair().expect("keygen");
         let static_pubkey = keypair.public;
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        // A small receive buffer, set explicitly so the kernel stops autotuning
+        // it. Without this a stalled hop absorbs however much the kernel feels
+        // like on the day, and a test that needs a backlog upstream of here
+        // gets one only sometimes. Accepted sockets inherit it.
+        let sock = tokio::net::TcpSocket::new_v4().expect("socket");
+        sock.set_recv_buffer_size(STALLED_RECV_BUF).expect("rcvbuf");
+        sock.bind("127.0.0.1:0".parse().expect("a literal address"))
+            .expect("bind");
+        let listener = sock.listen(16).expect("listen");
         let addr = listener.local_addr().expect("addr");
         let (tx, frames) = mpsc::unbounded_channel();
         let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
@@ -1105,35 +1129,39 @@ impl RecordingMiddle {
                     }
                     let frame_len = link_frame::link_frame_len(Self::LAYERS);
 
-                    // CREATE from the guard, carrying the client's message 1.
-                    let mut buf = vec![0u8; frame_len];
-                    if sock.read_exact(&mut buf).await.is_err() {
-                        return;
-                    }
-                    let Ok(create) = link_frame::decode(&buf, Self::LAYERS, LinkRole::Initiator)
-                    else {
-                        return;
-                    };
-                    let Ok(msg1_bytes) =
-                        link_frame::payload(create.body, link_frame::CREATE_RELAY_BODY_LEN)
-                    else {
-                        return;
-                    };
-                    let mut msg1 = [0u8; NOISE_MSG_LEN];
-                    msg1.copy_from_slice(msg1_bytes);
-                    let Ok((_transport, msg2)) = respond(&private, &msg1) else {
-                        return;
-                    };
-                    let Ok(created) = link_frame::encode(
-                        Self::LAYERS,
-                        create.circ_id,
-                        link_frame::LinkCommand::Created,
-                        &msg2,
-                    ) else {
-                        return;
-                    };
-                    if sock.write_all(&created).await.is_err() || sock.flush().await.is_err() {
-                        return;
+                    // CREATE from the guard, carrying the client's message 1,
+                    // once per circuit the test asked for.
+                    for _ in 0..creates {
+                        let mut buf = vec![0u8; frame_len];
+                        if sock.read_exact(&mut buf).await.is_err() {
+                            return;
+                        }
+                        let Ok(create) =
+                            link_frame::decode(&buf, Self::LAYERS, LinkRole::Initiator)
+                        else {
+                            return;
+                        };
+                        let Ok(msg1_bytes) =
+                            link_frame::payload(create.body, link_frame::CREATE_RELAY_BODY_LEN)
+                        else {
+                            return;
+                        };
+                        let mut msg1 = [0u8; NOISE_MSG_LEN];
+                        msg1.copy_from_slice(msg1_bytes);
+                        let Ok((_transport, msg2)) = respond(&private, &msg1) else {
+                            return;
+                        };
+                        let Ok(created) = link_frame::encode(
+                            Self::LAYERS,
+                            create.circ_id,
+                            link_frame::LinkCommand::Created,
+                            &msg2,
+                        ) else {
+                            return;
+                        };
+                        if sock.write_all(&created).await.is_err() || sock.flush().await.is_err() {
+                            return;
+                        }
                     }
 
                     // Nothing is read past the handshake until the test says
@@ -1748,11 +1776,14 @@ async fn at_the_budget_ceiling_creates_are_refused_and_open_circuits_carry_on() 
         let pki = make_pki();
         let server_config = make_server_config(&pki);
         let connector = Arc::new(make_connector(&pki));
-        // Measured: the burst below leaves about 48 KB queued on the guard at
-        // once, the rest having drained into the stalled hop's socket buffer.
-        // The ceiling sits under that, and the assertion further down fails the
-        // run if it was not actually crossed.
+        // The ceiling has to sit under what this test can hold queued at once,
+        // which is whatever the stalled hop's socket buffer does not absorb.
+        // How much that is varies per run, so the fill below is driven by the
+        // counter rather than by a frame count, and the assertion after it
+        // fails the run if the ceiling was not actually crossed.
         const CEILING: u64 = 20_000;
+        /// Circuits the fill spreads over, each inside its own window.
+        const FILLERS: usize = 8;
         let over = RelayOverride {
             max_link_buffer_bytes: CEILING,
             ..default_override()
@@ -1767,7 +1798,7 @@ async fn at_the_budget_ceiling_creates_are_refused_and_open_circuits_carry_on() 
         .await;
 
         let mut live = RecordingMiddle::spawn(server_config.clone()).await;
-        let stalled = RecordingMiddle::spawn_gated(server_config).await;
+        let stalled = RecordingMiddle::spawn_gated_for(server_config, FILLERS).await;
         let (after, fresh, until) = current_window();
         fleet.publish(document_from(
             &[
@@ -1786,13 +1817,22 @@ async fn at_the_budget_ceiling_creates_are_refused_and_open_circuits_carry_on() 
         let keeper = client
             .open(&fleet.guard, &auth_priv, [0xB1; 32], 0x8000_0050)
             .await;
-        let filler = client
-            .open(&fleet.guard, &auth_priv, [0xB2; 32], 0x8000_0051)
-            .await;
+        let mut fillers = Vec::with_capacity(FILLERS);
+        for i in 0..FILLERS {
+            let c = client
+                .open(
+                    &fleet.guard,
+                    &auth_priv,
+                    [0xC0 + i as u8; 32],
+                    0x8000_0051 + i as u32,
+                )
+                .await;
+            fillers.push(c);
+        }
         client.extend(keeper, live.addr, live.static_pubkey).await;
-        client
-            .extend(filler, stalled.addr, stalled.static_pubkey)
-            .await;
+        for c in &fillers {
+            client.extend(*c, stalled.addr, stalled.static_pubkey).await;
+        }
 
         // Control: the keeper works before the budget is anywhere near full.
         let hello = Cell::new(CellType::Data, b"before".to_vec()).expect("cell");
@@ -1801,12 +1841,29 @@ async fn at_the_budget_ceiling_creates_are_refused_and_open_circuits_carry_on() 
             .await
             .expect("the keeper did not carry data even with an empty budget");
 
-        // Fill the budget through the stalled hop. The socket absorbs the first
-        // few hundred frames; after it blocks they stay queued and counted.
+        // Fill the budget through the stalled hop. The socket absorbs frames
+        // until it blocks, and only after that do they stay queued and counted,
+        // so this sends until the counter says the ceiling is crossed.
+        //
+        // It takes several circuits. A fixed 900 frames on one circuit failed
+        // about one run in ten, because the socket can absorb more than the
+        // 492 KB that is, leaving nothing queued. Sending more than 900 on one
+        // circuit is no answer either: the window is 1000, and a client past it
+        // is destroyed for a protocol violation, which frees the bytes this
+        // test needs held. So the frames spread across FILLERS circuits, each
+        // staying inside its own window.
         let payload = Cell::new(CellType::Data, vec![0x9A; 400]).expect("cell");
         let refusals_before = crate::metrics::dropped_count("buffer_budget");
-        for _ in 0..900 {
-            client.send(filler, &payload).await;
+        const PER_FILLER: usize = 900;
+        let mut sent = 0;
+        'fill: for _ in 0..PER_FILLER {
+            for c in &fillers {
+                if fleet.guard.budget.held() >= CEILING {
+                    break 'fill;
+                }
+                client.send(*c, &payload).await;
+                sent += 1;
+            }
         }
 
         // The ceiling has to have been crossed, or the refusal below is
@@ -1815,9 +1872,19 @@ async fn at_the_budget_ceiling_creates_are_refused_and_open_circuits_carry_on() 
         // may never come.
         assert!(
             fleet.guard.budget.held() >= CEILING,
-            "the guard holds {} bytes against a {CEILING} ceiling, so this run never \
-             filled the budget and proves nothing about admission",
+            "the guard holds {} bytes against a {CEILING} ceiling after {sent} frames \
+             over {FILLERS} circuits, so this run never filled the budget and proves \
+             nothing about admission",
             fleet.guard.budget.held()
+        );
+        // How close this run came to running out of frames. The kernel absorbs
+        // most of them before anything stays queued, and how many varies, so a
+        // run that only just made it is a warning that the next one may not.
+        const AVAILABLE: usize = PER_FILLER * FILLERS;
+        assert!(
+            sent * 5 <= AVAILABLE * 4,
+            "the fill needed {sent} of {AVAILABLE} frames to cross the ceiling, which \
+             leaves too little margin for the next run; raise FILLERS"
         );
 
         // A CREATE now has to meet a full budget.

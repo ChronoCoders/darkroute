@@ -14,13 +14,18 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use quiethop_crypto::circid::{self, CircId, CircIdError, LinkRole};
-use quiethop_crypto::flow::{AfterDelivery, FlowError, Windows};
+use quiethop_crypto::flow::{self, AfterDelivery, FlowError, Windows};
 use quiethop_crypto::link::DestroyReason;
 use quiethop_crypto::noise::Transport;
 use tracing::{info, warn};
 
-/// Circuits one link will carry. A create beyond it is answered with DESTROY.
-/// Provisional until the step 5 measurement (ARCHITECTURE 5.8).
+/// Circuits one client link will carry. A create beyond it is answered with
+/// DESTROY. Provisional until the step 5 measurement (ARCHITECTURE 5.8).
+///
+/// Relay-to-relay links carry `MAX_CIRCUITS_PER_RELAY_LINK` instead, which is
+/// configured and defaults to the whole of `MAX_CIRCUITS`, because one relay
+/// link stands in for every client behind the relay on the other end
+/// (ARCHITECTURE 5.10).
 pub const MAX_CIRCUITS_PER_LINK: usize = 64;
 
 /// Frames one circuit may have queued for one direction. Over it, that circuit
@@ -28,20 +33,41 @@ pub const MAX_CIRCUITS_PER_LINK: usize = 64;
 /// flow-control window or a correct fast circuit would be torn down.
 pub const MAX_CIRCUIT_QUEUE: usize = 1024;
 
-/// How many link level control frames may wait on one link.
+/// EXTEND frames in one circuit's life: one for the middle hop, one for the
+/// exit. The first hop is reached by CREATE, not EXTEND.
+const EXTENDS_PER_CIRCUIT: usize = 2;
+
+/// Frames a circuit sends exactly once: CREATE when this side opens it on an
+/// outbound link, CONNECT at the exit, and CLOSE_REQUEST at the end.
+const ONE_SHOT_FRAMES_PER_CIRCUIT: usize = 3;
+
+/// The most frames one circuit can have queued for one direction while its
+/// peer stays inside the flow-control window.
 ///
-/// DESTROY outlives the circuit it names, so it cannot wait in that circuit's
-/// queue: destroying the circuit discards the queue. It waits here instead.
-/// Each circuit is destroyed once and a refused CREATE answers once, so one
-/// frame per circuit slot is the ceiling.
-pub const MAX_CONTROL_QUEUE: usize = MAX_CIRCUITS_PER_LINK;
+/// DATA is bounded by the window, SENDMEs by how many may be outstanding at
+/// once, and the rest are the control frames above, each sent once in the
+/// circuit's life. The margin to `MAX_CIRCUIT_QUEUE` is what makes a full
+/// queue mean the peer sent past its window, which is why that answers DESTROY
+/// with Protocol rather than Resource (docs/DECISIONS.md entry 31).
+pub const WORST_CASE_CIRCUIT_QUEUE: usize = flow::WINDOW_START as usize
+    + flow::MAX_OUTSTANDING_SENDMES
+    + EXTENDS_PER_CIRCUIT
+    + ONE_SHOT_FRAMES_PER_CIRCUIT;
+
+/// Adding a frame type or widening the window must fail the build rather than
+/// quietly erode that margin, because the Protocol reason depends on it.
+const _: () = assert!(
+    WORST_CASE_CIRCUIT_QUEUE < MAX_CIRCUIT_QUEUE,
+    "a compliant peer can now fill a circuit queue, so a full queue no longer \
+     means the peer sent past its window and Protocol is the wrong reason"
+);
 
 /// Bytes held in per-circuit queues, shared by every link on one relay.
 ///
 /// Relay-wide, because every other bound here is per circuit or per link and
-/// nothing bounded their product (ARCHITECTURE 5.9). Control frames are not
-/// counted: there are at most MAX_CONTROL_QUEUE of them per link and they are
-/// bounded separately.
+/// nothing bounded their product (ARCHITECTURE 5.9). Control frames are
+/// counted too: they are bounded per link at the link's circuit capacity while
+/// the number of links is not bounded at all.
 ///
 /// Handed to each link rather than kept in a static, so a test gets its own and
 /// can assert exact byte counts while the rest of the suite runs beside it.
@@ -237,7 +263,7 @@ pub enum Disposition {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreateRefusal {
-    /// MAX_CIRCUITS_PER_LINK reached. The caller answers DESTROY.
+    /// This link's circuit capacity is reached. The caller answers DESTROY.
     LinkFull,
     /// The id is already open. The caller sends nothing.
     Collision,
@@ -248,6 +274,10 @@ pub enum CreateRefusal {
 /// Circuits on one link, with their ids and their outbound queues.
 pub struct LinkTable {
     role: LinkRole,
+    /// Circuits this link will carry at once. Fixed when the link is accepted
+    /// or dialed, from the link's type rather than from a single constant
+    /// (ARCHITECTURE 5.10).
+    capacity: usize,
     circuits: HashMap<CircId, Circuit>,
     /// Destroyed ids and when they were destroyed, oldest first.
     quarantine: VecDeque<(CircId, Instant)>,
@@ -260,10 +290,12 @@ pub struct LinkTable {
 
 impl LinkTable {
     /// `role` is this side's role on the link, which fixes the half of the id
-    /// space this side allocates from.
-    pub fn new(role: LinkRole, budget: Budget) -> Self {
+    /// space this side allocates from. `capacity` is how many circuits this
+    /// link carries, which differs between a client link and a relay link.
+    pub fn new(role: LinkRole, capacity: usize, budget: Budget) -> Self {
         Self {
             role,
+            capacity,
             circuits: HashMap::new(),
             quarantine: VecDeque::new(),
             rotation: VecDeque::new(),
@@ -273,6 +305,13 @@ impl LinkTable {
 
     pub fn len(&self) -> usize {
         self.circuits.len()
+    }
+
+    /// Circuits this link carries at once, which also bounds its control
+    /// queue: each circuit is destroyed once and a refused CREATE answers
+    /// once, so one control frame per circuit slot is the ceiling.
+    pub fn capacity(&self) -> usize {
+        self.capacity
     }
 
     pub fn get_mut(&mut self, id: CircId) -> Option<&mut Circuit> {
@@ -346,7 +385,7 @@ impl LinkTable {
         if self.circuits.contains_key(&id) {
             return Err(CreateRefusal::Collision);
         }
-        if self.circuits.len() >= MAX_CIRCUITS_PER_LINK {
+        if self.circuits.len() >= self.capacity {
             return Err(CreateRefusal::LinkFull);
         }
         self.circuits.insert(id, Circuit::new(phase, transport));
@@ -521,7 +560,7 @@ mod tests {
     use quiethop_crypto::noise::{generate_static_keypair, respond, Initiator};
 
     fn table() -> LinkTable {
-        LinkTable::new(LinkRole::Responder, Budget::new())
+        LinkTable::new(LinkRole::Responder, MAX_CIRCUITS_PER_LINK, Budget::new())
     }
 
     /// An RNG that returns a scripted sequence of u32 values.
@@ -590,7 +629,7 @@ mod tests {
         const CEILING: u64 = 1000;
         const FRAME: usize = 50;
         let budget = Budget::new();
-        let mut t = LinkTable::new(LinkRole::Responder, budget.clone());
+        let mut t = LinkTable::new(LinkRole::Responder, MAX_CIRCUITS_PER_LINK, budget.clone());
         let x = id(0x70);
         t.accept_create(x, transport(), Instant::now())
             .expect("room on the link");
@@ -648,7 +687,7 @@ mod tests {
         let budget = Budget::new();
 
         // Link A crosses the ceiling and starts refusing.
-        let mut a = LinkTable::new(LinkRole::Responder, budget.clone());
+        let mut a = LinkTable::new(LinkRole::Responder, MAX_CIRCUITS_PER_LINK, budget.clone());
         let x = id(0x90);
         a.accept_create(x, transport(), Instant::now())
             .expect("room on the link");
@@ -666,7 +705,7 @@ mod tests {
 
         // A second link, opened only now, after the refusal began. Its own
         // view of the budget is the same view, so it refuses too.
-        let mut b = LinkTable::new(LinkRole::Responder, budget.clone());
+        let mut b = LinkTable::new(LinkRole::Responder, MAX_CIRCUITS_PER_LINK, budget.clone());
         let y = id(0x91);
         b.accept_create(y, transport(), Instant::now())
             .expect("room on the link");
@@ -696,7 +735,7 @@ mod tests {
     #[test]
     fn destroying_a_circuit_releases_the_bytes_it_held() {
         let budget = Budget::new();
-        let mut t = LinkTable::new(LinkRole::Responder, budget.clone());
+        let mut t = LinkTable::new(LinkRole::Responder, MAX_CIRCUITS_PER_LINK, budget.clone());
         let x = id(0x71);
         t.accept_create(x, transport(), Instant::now())
             .expect("room on the link");
@@ -718,7 +757,7 @@ mod tests {
     #[test]
     fn releasing_every_circuit_returns_the_counter_to_zero() {
         let budget = Budget::new();
-        let mut t = LinkTable::new(LinkRole::Responder, budget.clone());
+        let mut t = LinkTable::new(LinkRole::Responder, MAX_CIRCUITS_PER_LINK, budget.clone());
         for i in 0..8u32 {
             let c = id(0x80 + i);
             t.accept_create(c, transport(), Instant::now())
@@ -777,7 +816,32 @@ mod tests {
         );
     }
 
-    /// The link bound is enforced at its limit and one past it.
+    /// A relay link carries its own configured capacity, not the client link's
+    /// 64, and the bound is enforced at its limit and one past it.
+    ///
+    #[test]
+    fn a_relay_link_is_full_at_its_own_capacity_not_the_client_links() {
+        /// Above the client link cap on purpose: a table that fell back to the
+        /// constant refuses before reaching this.
+        const RELAY_CAP: usize = 100;
+        const _: () = assert!(RELAY_CAP > MAX_CIRCUITS_PER_LINK);
+        let mut t = LinkTable::new(LinkRole::Responder, RELAY_CAP, Budget::new());
+
+        for i in 0..RELAY_CAP {
+            t.accept_create(id(i as u32 + 1), transport(), Instant::now())
+                .unwrap_or_else(|e| {
+                    panic!("circuit {i} within this link's capacity was refused: {e:?}")
+                });
+        }
+        assert_eq!(t.len(), RELAY_CAP);
+        assert_eq!(
+            t.accept_create(id(RELAY_CAP as u32 + 1), transport(), Instant::now()),
+            Err(CreateRefusal::LinkFull)
+        );
+        assert_eq!(t.capacity(), RELAY_CAP, "the link reports its own capacity");
+    }
+
+    /// The client link bound is enforced at its limit and one past it.
     #[test]
     fn the_link_is_full_at_max_circuits_per_link() {
         let mut t = table();
@@ -854,7 +918,7 @@ mod tests {
     /// held id, which would let a deleted skip pass unnoticed.
     #[test]
     fn the_allocator_skips_a_quarantined_id() {
-        let mut t = LinkTable::new(LinkRole::Initiator, Budget::new());
+        let mut t = LinkTable::new(LinkRole::Initiator, MAX_CIRCUITS_PER_LINK, Budget::new());
         let t0 = Instant::now();
 
         let held = id(0x8000_0005);
@@ -876,7 +940,7 @@ mod tests {
     /// fails the create rather than scanning for a free one.
     #[test]
     fn a_quarantined_id_counts_toward_the_collision_bound() {
-        let mut t = LinkTable::new(LinkRole::Initiator, Budget::new());
+        let mut t = LinkTable::new(LinkRole::Initiator, MAX_CIRCUITS_PER_LINK, Budget::new());
         let t0 = Instant::now();
         let held = id(0x8000_0005);
         t.insert_pending(held).unwrap();

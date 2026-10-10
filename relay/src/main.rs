@@ -494,8 +494,10 @@ enum HandleError {
     DestroyedByPeer,
     #[error("the next hop destroyed this circuit")]
     DestroyedByNextHop,
-    #[error("a socket write made no progress inside CELL_WRITE_TIMEOUT")]
-    WriteTimeout,
+    #[error("the link to the next hop ended: {0:?}")]
+    NextLinkEnded(DestroyReason),
+    #[error("the inbound link ended: {0:?}")]
+    LinkEnded(DestroyReason),
     #[error("the destination made no progress inside DEST_WRITE_TIMEOUT")]
     DestWriteTimeout,
     #[error("next hop: {0}")]
@@ -621,6 +623,19 @@ fn inbound_layers(role: Role) -> Layers {
     }
 }
 
+/// Circuits an inbound link to this role carries at once.
+///
+/// A guard's inbound link comes from one client, so it keeps the client link
+/// cap. A middle's or an exit's comes from the relay upstream and stands in for
+/// every client behind it, so it takes the configured relay link cap
+/// (ARCHITECTURE 5.10).
+fn inbound_capacity(role: Role, relay_cap: usize) -> usize {
+    match role {
+        Role::Guard => link::MAX_CIRCUITS_PER_LINK,
+        Role::Middle | Role::Exit => relay_cap,
+    }
+}
+
 /// How many AEAD layers this role's outbound relay link carries, if it has
 /// one. One fewer than inbound, because this role peeled its own.
 ///
@@ -665,26 +680,47 @@ struct LinkShared {
     budget: link::Budget,
 }
 
+/// Why a circuit is ending, as told to the circuit's own task.
+///
+/// The reason is carried rather than inferred. It used to be read off the
+/// link's closing flag once the circuit's channel had closed, so whether a
+/// circuit named LinkLost or Requested depended on the order of two calls in
+/// the teardown, and swapping them left every test passing (STATUS_REPORT
+/// section 5, mutant M6b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CircuitEnd {
+    /// Nothing has ended this circuit.
+    Live,
+    /// The peer on this link sent DESTROY for it.
+    Destroyed,
+    /// The link itself ended and took the circuit with it, for this reason.
+    Link(DestroyReason),
+}
+
 /// What the link reader holds for one circuit.
 ///
-/// The destroy signal is deliberately not a message on `frames`. On that
-/// channel it would be dropped whenever the queue is full, which a peer inside
-/// its 1000 cell window can legitimately cause against a 1024 slot queue, and
-/// even when it fit it would wait behind every frame already queued while the
+/// The end signal is deliberately not a message on `frames`. On that channel
+/// it would be dropped whenever the queue is full, which a peer inside its
+/// 1000 cell window can legitimately cause against a 1024 slot queue, and even
+/// when it fit it would wait behind every frame already queued while the
 /// circuit went on forwarding data the peer had already destroyed.
 ///
-/// A `watch` keeps the signal after its sender is dropped, so removing the
-/// circuit from the table cannot lose a signal already sent.
+/// A `watch` keeps the value after its sender is dropped, so clearing the
+/// handles cannot lose a reason already sent, whichever order the two happen
+/// in.
 struct CircuitHandle {
     frames: mpsc::Sender<link::Queued>,
-    destroy: watch::Sender<bool>,
+    end: watch::Sender<CircuitEnd>,
 }
 
 impl LinkShared {
-    fn new(role: LinkRole, budget: link::Budget) -> Self {
+    /// `capacity` is how many circuits this link carries: the client link cap
+    /// for a client link, the configured relay link cap for a relay link
+    /// (ARCHITECTURE 5.10).
+    fn new(role: LinkRole, capacity: usize, budget: link::Budget) -> Self {
         Self {
             state: std::sync::Mutex::new(LinkState {
-                table: link::LinkTable::new(role, budget.clone()),
+                table: link::LinkTable::new(role, capacity, budget.clone()),
                 handles: HashMap::new(),
                 control: VecDeque::new(),
             }),
@@ -709,10 +745,19 @@ impl LinkShared {
         self.closing.load(Ordering::Relaxed)
     }
 
-    /// Release every circuit on the link, as a link loss does. Returns how
-    /// many were released.
-    fn release_all(&self) -> usize {
+    /// Release every circuit on the link, telling each one why the link ended.
+    /// Returns how many were released.
+    ///
+    /// The reason goes out before the handles are cleared, and a `watch` keeps
+    /// it after its sender drops, so a circuit reads the reason it was given
+    /// whenever it wakes.
+    fn release_all(&self, reason: DestroyReason) -> usize {
         let mut st = self.lock();
+        for h in st.handles.values() {
+            // Fails only when the circuit task has already ended, which means
+            // there is nobody left to tell.
+            let _ = h.end.send(CircuitEnd::Link(reason));
+        }
         st.handles.clear();
         st.table.destroy_all(Instant::now())
     }
@@ -736,13 +781,13 @@ impl LinkShared {
     fn push_control(&self, frame: Vec<u8>) -> bool {
         {
             let mut st = self.lock();
-            if st.control.len() >= link::MAX_CONTROL_QUEUE {
+            if st.control.len() >= st.table.capacity() {
                 return false;
             }
             // Counted like any other queued frame. It is bounded per link at
-            // MAX_CONTROL_QUEUE, and the number of inbound links is not
-            // bounded, so leaving it out would have left the budget covering
-            // the per-circuit queues and not these (ARCHITECTURE 5.9).
+            // the link's circuit capacity, and the number of inbound links is
+            // not bounded, so leaving it out would have left the budget
+            // covering the per-circuit queues and not these (ARCHITECTURE 5.9).
             st.control.push_back(link::Queued::new(frame, &self.budget));
         }
         self.wake.notify_one();
@@ -788,10 +833,13 @@ impl LinkShared {
     /// hold of the link's lock so no other caller can take the same id.
     fn open_outbound_circuit(
         &self,
-        cap: usize,
-    ) -> Option<(CircId, mpsc::Receiver<link::Queued>, watch::Receiver<bool>)> {
+    ) -> Option<(
+        CircId,
+        mpsc::Receiver<link::Queued>,
+        watch::Receiver<CircuitEnd>,
+    )> {
         let mut st = self.lock();
-        if st.table.len() >= cap {
+        if st.table.len() >= st.table.capacity() {
             return None;
         }
         let id = st
@@ -800,15 +848,15 @@ impl LinkShared {
             .ok()?;
         st.table.insert_pending(id).ok()?;
         let (tx, rx) = mpsc::channel::<link::Queued>(link::MAX_CIRCUIT_QUEUE);
-        let (dtx, drx) = watch::channel(false);
+        let (etx, erx) = watch::channel(CircuitEnd::Live);
         st.handles.insert(
             id,
             CircuitHandle {
                 frames: tx,
-                destroy: dtx,
+                end: etx,
             },
         );
-        Some((id, rx, drx))
+        Some((id, rx, erx))
     }
 
     /// Remove a circuit and quarantine its id. Returns whether it was there.
@@ -833,7 +881,11 @@ async fn run_link(
     let frame_len = link_frame::link_frame_len(layers);
     // This side did not open the inbound link, so the peer owns the half of the
     // id space with the top bit set and this side validates creates against it.
-    let shared = Arc::new(LinkShared::new(LinkRole::Responder, ctx.budget.clone()));
+    let shared = Arc::new(LinkShared::new(
+        LinkRole::Responder,
+        inbound_capacity(role, ctx.cfg.max_circuits_per_relay_link as usize),
+        ctx.budget.clone(),
+    ));
 
     let writer = tokio::spawn(run_link_writer(shared.clone(), w));
 
@@ -862,7 +914,10 @@ async fn run_link(
 
     // The link is going. Every circuit on it fails, and each task forwards
     // DESTROY on its own downstream link as it winds up (SECURITY_MODEL 6.3).
-    let released = shared.release_all();
+    // The peer closed the link this circuit came in on, so Requested is what
+    // each circuit names on the DESTROY it owes upstream, which goes nowhere
+    // because upstream is the link that just ended.
+    let released = shared.release_all(DestroyReason::Requested);
     writer.abort();
     if released > 0 {
         info!(peer = %peer, role = %role, released, "link closed, circuits released");
@@ -940,6 +995,7 @@ async fn dial_outbound_link(
     addr: SocketAddr,
     tls_name: &str,
     layers: Layers,
+    capacity: usize,
     budget: &link::Budget,
 ) -> Result<OutboundLink, HandleError> {
     let mut stream = tls::dial_tls(connector, addr, tls_name, TLS_HANDSHAKE_TIMEOUT).await?;
@@ -960,7 +1016,11 @@ async fn dial_outbound_link(
     }
     let (read, write) = tokio::io::split(stream);
 
-    let shared = Arc::new(LinkShared::new(LinkRole::Initiator, budget.clone()));
+    let shared = Arc::new(LinkShared::new(
+        LinkRole::Initiator,
+        capacity,
+        budget.clone(),
+    ));
     let writer = tokio::spawn(run_link_writer(shared.clone(), write));
     Ok(OutboundLink {
         shared,
@@ -1088,15 +1148,20 @@ async fn write_to_destination<W: AsyncWrite + Unpin>(
     }
 }
 
-/// Wind up a shared outbound link: mark it closing, then release its circuits.
+/// Wind up a shared outbound link: stop its writer, then release its circuits
+/// with the reason they carry upstream.
 ///
-/// The order is the point. A circuit learns its link is gone when its frame
-/// channel closes, and the only way it can tell a stalled link from an ordinary
-/// one is the flag being set by then. Released after, so no circuit can see a
-/// closed channel on a link that is not yet marked (ARCHITECTURE 5.11).
+/// Every way a shared outbound link ends is a loss toward the next hop. The
+/// writer gave up on a peer that takes no bytes, the control queue filled, the
+/// reader timed out, or the socket failed. None of them is the peer asking, so
+/// each circuit on the link names LinkLost (ARCHITECTURE 5.11).
+///
+/// The reason is passed rather than read back off the link, because a circuit
+/// that woke after the flag moved would name the wrong one and no test could
+/// see the difference (STATUS_REPORT section 5, mutant M6b).
 fn end_outbound_link(shared: &Arc<LinkShared>) -> usize {
     shared.request_close();
-    shared.release_all()
+    shared.release_all(DestroyReason::LinkLost)
 }
 
 /// Act on one frame from a next hop.
@@ -1131,7 +1196,9 @@ fn dispatch_outbound(shared: &Arc<LinkShared>, wire: &[u8], layers: Layers) {
         link_frame::LinkCommand::Destroy => {
             let signalled = {
                 let st = shared.lock();
-                st.handles.get(&id).map(|h| h.destroy.send(true).is_ok())
+                st.handles
+                    .get(&id)
+                    .map(|h| h.end.send(CircuitEnd::Destroyed).is_ok())
             };
             match signalled {
                 Some(true) => {}
@@ -1213,7 +1280,9 @@ async fn dispatch_frame(
                 let st = shared.lock();
                 // send only fails when every receiver is gone, which means the
                 // task has already ended and the circuit with it.
-                st.handles.get(&id).map(|h| h.destroy.send(true).is_ok())
+                st.handles
+                    .get(&id)
+                    .map(|h| h.end.send(CircuitEnd::Destroyed).is_ok())
             };
             match signalled {
                 Some(true) => {
@@ -1285,7 +1354,7 @@ async fn open_inbound_circuit(
     }
 
     let (tx, rx) = mpsc::channel::<link::Queued>(link::MAX_CIRCUIT_QUEUE);
-    let (destroy_tx, destroy_rx) = watch::channel(false);
+    let (end_tx, end_rx) = watch::channel(CircuitEnd::Live);
     {
         let mut st = shared.lock();
         match st.table.accept_create(id, transport, Instant::now()) {
@@ -1294,7 +1363,7 @@ async fn open_inbound_circuit(
                     id,
                     CircuitHandle {
                         frames: tx,
-                        destroy: destroy_tx,
+                        end: end_tx,
                     },
                 );
             }
@@ -1346,7 +1415,7 @@ async fn open_inbound_circuit(
             id,
             transport,
             rx,
-            destroy_rx,
+            end_rx,
             layers,
             role,
             task_ctx,
@@ -1414,8 +1483,10 @@ fn destroy_reason_for_outcome(result: &Result<(), HandleError>) -> DestroyReason
             DestroyReason::Protocol
         }
         Err(HandleError::IllegalCellForRole(_, _)) => DestroyReason::Protocol,
-        // The next hop stopped reading, which is a link loss toward it.
-        Err(HandleError::WriteTimeout) => DestroyReason::LinkLost,
+        // The link said why it ended when it released this circuit, so the
+        // reason is carried here rather than inferred from link state that may
+        // have moved on (ARCHITECTURE 5.11).
+        Err(HandleError::NextLinkEnded(reason)) | Err(HandleError::LinkEnded(reason)) => *reason,
         // The destination stopped reading. Not Protocol, the peer did nothing
         // wrong, and not Resource, which would say the relay is out of capacity
         // when tearing down is what frees it (ARCHITECTURE 5.11).
@@ -1429,6 +1500,50 @@ fn destroy_reason_for_outcome(result: &Result<(), HandleError>) -> DestroyReason
         }
         Err(_) => DestroyReason::Internal,
         Ok(()) => DestroyReason::Requested,
+    }
+}
+
+/// What the next hop did, so one future covers both of its channels.
+enum NextEvent {
+    Destroyed,
+    /// The link ended and said why on this circuit's own signal, so the reason
+    /// this circuit names upstream does not depend on when it happens to wake
+    /// (ARCHITECTURE 5.11).
+    Ended(DestroyReason),
+    Frame(link::Queued),
+}
+
+/// Wait for whichever of the next hop's two channels speaks first.
+///
+/// A free function rather than a block inside the select, so a test can drive
+/// it against a link it ended itself: the reason a circuit carries upstream is
+/// decided here.
+async fn next_hop_event(nl: &mut NextLinkState) -> NextEvent {
+    tokio::select! {
+        biased;
+        // First, so an end does not wait behind frames already queued for this
+        // circuit.
+        changed = nl.end.changed() => {
+            let _ = changed;
+            next_from_signal(&mut nl.end)
+        }
+        frame = nl.frames.recv() => match frame {
+            Some(q) => NextEvent::Frame(q),
+            // The channel closed, so the link went. The watch still holds
+            // whatever reason the teardown gave it.
+            None => next_from_signal(&mut nl.end),
+        },
+    }
+}
+
+/// Read the reason off a circuit's end signal.
+fn next_from_signal(end: &mut watch::Receiver<CircuitEnd>) -> NextEvent {
+    match *end.borrow_and_update() {
+        CircuitEnd::Destroyed => NextEvent::Destroyed,
+        CircuitEnd::Link(reason) => NextEvent::Ended(reason),
+        // The handle went without a reason. Nothing in the teardown does that,
+        // so this is a circuit forgotten on its own, which the peer asked for.
+        CircuitEnd::Live => NextEvent::Ended(DestroyReason::Requested),
     }
 }
 
@@ -1446,22 +1561,11 @@ async fn run_circuit(
     id: CircId,
     mut transport: Transport,
     mut rx: mpsc::Receiver<link::Queued>,
-    mut destroy_rx: watch::Receiver<bool>,
+    mut end_rx: watch::Receiver<CircuitEnd>,
     layers: Layers,
     role: Role,
     ctx: ConnCtx,
 ) -> Result<(), HandleError> {
-    /// What the next hop did, so one future covers both of its channels.
-    enum NextEvent {
-        Destroyed,
-        /// The link ended because a write to it made no progress, so this
-        /// circuit forwards DESTROY upstream with LinkLost rather than the
-        /// Requested a normal close would give (ARCHITECTURE 5.11).
-        LinkLost,
-        LinkGone,
-        Frame(link::Queued),
-    }
-
     let mut next_link: Option<NextLinkState> = None;
     let mut dest_link: Option<TcpStream> = None;
     let out_layers = outbound_layers(role);
@@ -1476,14 +1580,18 @@ async fn run_circuit(
             biased;
             // First, so a destroyed circuit stops forwarding at the next turn
             // of the loop rather than after the queue behind it drains.
-            changed = destroy_rx.changed() => {
-                match changed {
+            changed = end_rx.changed() => {
+                // Whether the sender was dropped or not, the watch still holds
+                // the last value it was given, so the reason is read the same
+                // way on both paths.
+                let _ = changed;
+                match *end_rx.borrow_and_update() {
                     // The reader saw a DESTROY for this circuit.
-                    Ok(()) if *destroy_rx.borrow_and_update() => {
-                        break Err(HandleError::DestroyedByPeer);
-                    }
-                    // Every handle went, so the link did.
-                    _ => break Err(HandleError::PeerClosed),
+                    CircuitEnd::Destroyed => break Err(HandleError::DestroyedByPeer),
+                    CircuitEnd::Link(reason) => break Err(HandleError::LinkEnded(reason)),
+                    // The handle went without a reason, which is the circuit
+                    // being forgotten rather than the link ending.
+                    CircuitEnd::Live => break Err(HandleError::PeerClosed),
                 }
             }
             msg = rx.recv() => {
@@ -1610,32 +1718,16 @@ async fn run_circuit(
                 }
             }
 
-            // The next hop destroyed this circuit. First, so it does not wait
-            // behind frames already queued for this circuit.
             // One future over the next hop, so `next_link` is borrowed once.
-            // The destroy signal is first inside it, so it does not wait behind
-            // frames already queued for this circuit.
             event = async {
-                let Some(nl) = next_link.as_mut() else {
-                    return std::future::pending().await;
-                };
-                tokio::select! {
-                    biased;
-                    changed = nl.destroy.changed() => match changed {
-                        Ok(()) if *nl.destroy.borrow_and_update() => NextEvent::Destroyed,
-                        _ => NextEvent::LinkGone,
-                    },
-                    frame = nl.frames.recv() => match frame {
-                        Some(q) => NextEvent::Frame(q),
-                        None if nl.link.link.shared.closing() => NextEvent::LinkLost,
-                        None => NextEvent::LinkGone,
-                    },
+                match next_link.as_mut() {
+                    Some(nl) => next_hop_event(nl).await,
+                    None => std::future::pending().await,
                 }
             } => {
                 let queued = match event {
                     NextEvent::Destroyed => break Err(HandleError::DestroyedByNextHop),
-                    NextEvent::LinkLost => break Err(HandleError::WriteTimeout),
-                    NextEvent::LinkGone => break Err(HandleError::PeerClosed),
+                    NextEvent::Ended(reason) => break Err(HandleError::NextLinkEnded(reason)),
                     NextEvent::Frame(q) => q,
                 };
                 let wire = queued.take();
@@ -1698,11 +1790,21 @@ async fn run_circuit(
     }
     .await;
 
-    // This side is ending the circuit, so it names its own reason upstream and
-    // forwards DESTROYED downstream.
-    // Every violation a peer can cause maps to Protocol: a frame that does not
-    // parse, a cell that does not decode, a layer that does not peel, and every
-    // FlowError through destroy_reason_for (SECURITY_MODEL 6.4).
+    finish_circuit(shared, id, layers, next_link, result)
+}
+
+/// Tell both neighbours the circuit is over, and return what ended it.
+///
+/// Separate from the loop so a test can hand it an outcome and read the frames
+/// it leaves on each link, which is the only place the chosen reason becomes
+/// visible to a peer.
+fn finish_circuit(
+    shared: &Arc<LinkShared>,
+    id: CircId,
+    layers: Layers,
+    mut next_link: Option<NextLinkState>,
+    result: Result<(), HandleError>,
+) -> Result<(), HandleError> {
     // The peer destroyed this circuit, so it already knows. Forward DESTROYED
     // downstream, discard anything still queued by dropping the receiver, and
     // send nothing back upstream (SECURITY_MODEL 6.3). Before this was its own
@@ -1722,6 +1824,11 @@ async fn run_circuit(
         return Ok(());
     }
 
+    // Otherwise this side names its own reason upstream and forwards DESTROYED
+    // downstream. Every violation a peer can cause maps to Protocol: a frame
+    // that does not parse, a cell that does not decode, a layer that does not
+    // peel, and every FlowError through destroy_reason_for
+    // (SECURITY_MODEL 6.4).
     let reason = destroy_reason_for_outcome(&result);
     send_destroy(shared, id, layers, reason);
     forward_destroy(&mut next_link);
@@ -1770,9 +1877,10 @@ struct NextLinkState {
     /// Frames from the next hop for this circuit, whole, so the circuit decides
     /// whether it is waiting for CREATED or carrying DATA.
     frames: mpsc::Receiver<link::Queued>,
-    /// Raised when the next hop destroys this circuit, out of band so it cannot
-    /// wait behind queued data (docs/DECISIONS.md entry 25).
-    destroy: watch::Receiver<bool>,
+    /// Why this circuit ended on the shared link, out of band so it cannot
+    /// wait behind queued data (docs/DECISIONS.md entry 25). The next hop's
+    /// DESTROY and the link's own teardown both arrive here.
+    end: watch::Receiver<CircuitEnd>,
 }
 
 /// Put this circuit on the shared link to its next hop, opening that link if
@@ -1810,7 +1918,7 @@ async fn extend_to_next_hop(
     let acquired = ctx
         .links
         .acquire(key, cap, move || async move {
-            dial_outbound_link(&connector, addr, &tls_name, frame_layers, &budget).await
+            dial_outbound_link(&connector, addr, &tls_name, frame_layers, cap, &budget).await
         })
         .await
         .map_err(HandleError::NextHop)?;
@@ -1823,8 +1931,8 @@ async fn extend_to_next_hop(
     }
 
     let shared = acquired.link.link.shared.clone();
-    let (circ_id, mut frames, destroy) = shared
-        .open_outbound_circuit(cap)
+    let (circ_id, mut frames, end) = shared
+        .open_outbound_circuit()
         .ok_or(HandleError::NextHop(linkreg::AcquireError::LinkFull))?;
 
     let create = link_frame::encode(
@@ -1864,7 +1972,7 @@ async fn extend_to_next_hop(
             _reservation: acquired.reservation,
             circ_id,
             frames,
-            destroy,
+            end,
         },
         noise_msg2,
     ))
@@ -1981,8 +2089,12 @@ mod tests {
     /// full queue can do is refuse, and the caller counts the refusal.
     #[test]
     fn the_control_queue_fills_at_its_bound_and_refuses_past_it() {
-        let shared = Arc::new(LinkShared::new(LinkRole::Responder, link::Budget::new()));
-        for i in 0..link::MAX_CONTROL_QUEUE {
+        let shared = Arc::new(LinkShared::new(
+            LinkRole::Responder,
+            link::MAX_CIRCUITS_PER_LINK,
+            link::Budget::new(),
+        ));
+        for i in 0..link::MAX_CIRCUITS_PER_LINK {
             assert!(
                 shared.push_control(vec![i as u8]),
                 "control frame {i} within the bound was refused"
@@ -1992,15 +2104,19 @@ mod tests {
             !shared.push_control(vec![0xFF]),
             "the bound did not hold at one past MAX_CONTROL_QUEUE"
         );
-        assert_eq!(shared.lock().control.len(), link::MAX_CONTROL_QUEUE);
+        assert_eq!(shared.lock().control.len(), link::MAX_CIRCUITS_PER_LINK);
     }
 
     /// At the bound the link carries on. Nothing has gone wrong yet: 64
     /// control frames queued is a peer that is behind, not a peer that is gone.
     #[test]
     fn the_control_queue_at_its_bound_does_not_close_the_link() {
-        let shared = Arc::new(LinkShared::new(LinkRole::Responder, link::Budget::new()));
-        for i in 0..link::MAX_CONTROL_QUEUE {
+        let shared = Arc::new(LinkShared::new(
+            LinkRole::Responder,
+            link::MAX_CIRCUITS_PER_LINK,
+            link::Budget::new(),
+        ));
+        for i in 0..link::MAX_CIRCUITS_PER_LINK {
             assert!(shared.push_control(vec![i as u8]));
         }
         assert!(
@@ -2014,9 +2130,13 @@ mod tests {
     /// circuits those frames name are still alive (DECISIONS 23).
     #[test]
     fn a_refused_destroy_closes_the_link_and_is_counted() {
-        let shared = Arc::new(LinkShared::new(LinkRole::Responder, link::Budget::new()));
+        let shared = Arc::new(LinkShared::new(
+            LinkRole::Responder,
+            link::MAX_CIRCUITS_PER_LINK,
+            link::Budget::new(),
+        ));
         let id = CircId::new(0x4000_0002).expect("a nonzero id");
-        for i in 0..link::MAX_CONTROL_QUEUE {
+        for i in 0..link::MAX_CIRCUITS_PER_LINK {
             assert!(shared.push_control(vec![i as u8]));
         }
         let before = metrics::dropped_count("control_queue_full");
@@ -2031,7 +2151,7 @@ mod tests {
             before + 1,
             "a DESTROY did not reach the peer without the counter moving"
         );
-        assert_eq!(shared.lock().control.len(), link::MAX_CONTROL_QUEUE);
+        assert_eq!(shared.lock().control.len(), link::MAX_CIRCUITS_PER_LINK);
     }
 
     /// Closing the link releases every circuit on it and quarantines each id,
@@ -2039,7 +2159,11 @@ mod tests {
     /// reach for an id this side has just let go.
     #[test]
     fn closing_the_link_releases_every_circuit_and_quarantines_its_id() {
-        let shared = Arc::new(LinkShared::new(LinkRole::Responder, link::Budget::new()));
+        let shared = Arc::new(LinkShared::new(
+            LinkRole::Responder,
+            link::MAX_CIRCUITS_PER_LINK,
+            link::Budget::new(),
+        ));
         let ids: Vec<CircId> = (1..=3)
             .map(|i| CircId::new(0x4000_0010 + i).expect("a nonzero id"))
             .collect();
@@ -2053,7 +2177,7 @@ mod tests {
         }
         assert_eq!(shared.lock().table.len(), ids.len());
 
-        assert_eq!(shared.release_all(), ids.len());
+        assert_eq!(shared.release_all(DestroyReason::Requested), ids.len());
 
         let now = Instant::now();
         let st = shared.lock();
@@ -2072,8 +2196,12 @@ mod tests {
     /// backpressure rather than a permanent close.
     #[test]
     fn a_drained_control_frame_frees_one_slot() {
-        let shared = Arc::new(LinkShared::new(LinkRole::Responder, link::Budget::new()));
-        for i in 0..link::MAX_CONTROL_QUEUE {
+        let shared = Arc::new(LinkShared::new(
+            LinkRole::Responder,
+            link::MAX_CIRCUITS_PER_LINK,
+            link::Budget::new(),
+        ));
+        for i in 0..link::MAX_CIRCUITS_PER_LINK {
             assert!(shared.push_control(vec![i as u8]));
         }
         assert_eq!(
@@ -2095,7 +2223,11 @@ mod tests {
     /// to the peer while the circuit it names is already gone.
     #[test]
     fn control_frames_precede_circuit_data() {
-        let shared = Arc::new(LinkShared::new(LinkRole::Responder, link::Budget::new()));
+        let shared = Arc::new(LinkShared::new(
+            LinkRole::Responder,
+            link::MAX_CIRCUITS_PER_LINK,
+            link::Budget::new(),
+        ));
         let id = CircId::new(0x4000_0001).expect("a nonzero id");
         {
             let mut st = shared.lock();
@@ -2187,7 +2319,11 @@ mod tests {
     /// Time is paused, so the 120 seconds are accounted and not waited for.
     #[tokio::test(start_paused = true)]
     async fn a_write_that_never_progresses_closes_the_link() {
-        let shared = Arc::new(LinkShared::new(LinkRole::Responder, link::Budget::new()));
+        let shared = Arc::new(LinkShared::new(
+            LinkRole::Responder,
+            link::MAX_CIRCUITS_PER_LINK,
+            link::Budget::new(),
+        ));
         assert!(shared.push_control(vec![0xAA; 8]));
         assert!(!shared.closing(), "nothing has stalled yet");
 
@@ -2225,7 +2361,11 @@ mod tests {
         const CONTROL: usize = 4;
 
         let budget = link::Budget::new();
-        let shared = Arc::new(LinkShared::new(LinkRole::Initiator, budget.clone()));
+        let shared = Arc::new(LinkShared::new(
+            LinkRole::Initiator,
+            link::MAX_CIRCUITS_PER_LINK,
+            budget.clone(),
+        ));
         let ids: Vec<CircId> = (1..=3)
             .map(|i| CircId::new(0x8000_0300 + i).expect("a nonzero id"))
             .collect();
@@ -2275,45 +2415,222 @@ mod tests {
         );
     }
 
-    /// Winding up an outbound link marks it closing before its circuits see
-    /// their channels close, which is what lets them name LinkLost.
+    /// Winding up an outbound link hands every circuit on it the reason, so
+    /// each one names LinkLost upstream.
     ///
-    /// Without the order, a circuit sees a closed channel on a link that is not
-    /// marked and reports Requested, which says the peer asked when the truth
-    /// is the link stalled.
+    /// The reason is read off the signal after the handles are gone, which is
+    /// the state a woken circuit finds. It used to be inferred from the link's
+    /// closing flag, and then releasing before marking turned LinkLost into
+    /// Requested with every test still passing (mutant M6b).
     #[test]
-    fn ending_an_outbound_link_marks_it_before_releasing_its_circuits() {
-        let shared = Arc::new(LinkShared::new(LinkRole::Initiator, link::Budget::new()));
-        let id = CircId::new(0x8000_0400).expect("a nonzero id");
-        let rx = {
-            let mut st = shared.lock();
-            st.table
-                .accept_create(id, test_transport(), Instant::now())
-                .expect("room on the link");
-            let (tx, rx) = mpsc::channel::<link::Queued>(4);
-            let (dtx, _drx) = watch::channel(false);
-            st.handles.insert(
-                id,
-                CircuitHandle {
-                    frames: tx,
-                    destroy: dtx,
-                },
-            );
-            rx
-        };
-        assert!(!shared.closing());
+    fn ending_an_outbound_link_tells_every_circuit_the_link_was_lost() {
+        let shared = Arc::new(LinkShared::new(
+            LinkRole::Initiator,
+            link::MAX_CIRCUITS_PER_LINK,
+            link::Budget::new(),
+        ));
+        let opened: Vec<(
+            CircId,
+            mpsc::Receiver<link::Queued>,
+            watch::Receiver<CircuitEnd>,
+        )> = (0..3)
+            .map(|_| shared.open_outbound_circuit().expect("room on the link"))
+            .collect();
 
         let released = end_outbound_link(&shared);
 
-        assert_eq!(released, 1, "the circuit was not released");
-        assert!(
-            shared.closing(),
-            "the link was not marked closing, so its circuits cannot tell a stalled \
-             link from an ordinary close and would report Requested instead of LinkLost"
+        assert_eq!(released, opened.len(), "a circuit was not released");
+        for (id, frames, mut end) in opened {
+            assert_eq!(
+                *end.borrow_and_update(),
+                CircuitEnd::Link(DestroyReason::LinkLost),
+                "{:#010x} was not told the link was lost, so it would name the wrong \
+                 reason upstream",
+                id.raw()
+            );
+            assert!(
+                frames.is_closed(),
+                "{:#010x} kept a live channel on a link that ended",
+                id.raw()
+            );
+        }
+    }
+
+    /// A guard's inbound link is a client link and keeps 64. A middle's and an
+    /// exit's come from the relay upstream and take the configured relay cap.
+    #[test]
+    fn inbound_capacity_follows_the_kind_of_link_the_role_accepts() {
+        const RELAY_CAP: usize = 300;
+        assert_eq!(
+            inbound_capacity(Role::Guard, RELAY_CAP),
+            link::MAX_CIRCUITS_PER_LINK,
+            "a client link took the relay cap, so one client could take a trunk's worth"
         );
+        for role in [Role::Middle, Role::Exit] {
+            assert_eq!(
+                inbound_capacity(role, RELAY_CAP),
+                RELAY_CAP,
+                "{role} kept the client link cap on a link that stands in for every \
+                 client behind the relay upstream"
+            );
+        }
+    }
+
+    /// The control queue is bounded by the link's own capacity, so a trunk is
+    /// not closed by a bound sized for a client link.
+    #[test]
+    fn the_control_queue_bound_follows_the_links_capacity() {
+        const CAP: usize = 70;
+        let shared = Arc::new(LinkShared::new(
+            LinkRole::Responder,
+            CAP,
+            link::Budget::new(),
+        ));
+        for i in 0..CAP {
+            assert!(
+                shared.push_control(vec![i as u8]),
+                "control frame {i} within this link's capacity was refused"
+            );
+        }
         assert!(
-            rx.is_closed(),
-            "the circuit's channel outlived the link, so it would never notice"
+            !shared.push_control(vec![0xFF]),
+            "the control queue took more than the link's capacity"
+        );
+        assert_eq!(shared.lock().control.len(), CAP);
+    }
+
+    /// The inbound teardown names Requested instead, because there the peer
+    /// closed the link rather than the link failing under this relay.
+    #[test]
+    fn releasing_an_inbound_link_names_the_reason_it_is_given() {
+        let shared = Arc::new(LinkShared::new(
+            LinkRole::Initiator,
+            link::MAX_CIRCUITS_PER_LINK,
+            link::Budget::new(),
+        ));
+        let (_id, _frames, mut end) = shared.open_outbound_circuit().expect("room on the link");
+
+        assert_eq!(shared.release_all(DestroyReason::Requested), 1);
+
+        assert_eq!(
+            *end.borrow_and_update(),
+            CircuitEnd::Link(DestroyReason::Requested)
+        );
+    }
+
+    /// What a circuit task does with that signal: the reason it was given is
+    /// the reason it reports, for both values the teardown uses.
+    #[tokio::test]
+    async fn a_circuit_reports_the_reason_its_next_link_was_ended_with() {
+        for reason in [DestroyReason::LinkLost, DestroyReason::Requested] {
+            let (out, mut nl) = test_next_link(link::MAX_CIRCUITS_PER_LINK).await;
+            out.release_all(reason);
+
+            let event = next_hop_event(&mut nl).await;
+
+            let NextEvent::Ended(got) = event else {
+                panic!("a released circuit did not see its link end");
+            };
+            assert_eq!(got, reason);
+            assert_eq!(
+                destroy_reason_for_outcome(&Err(HandleError::NextLinkEnded(got))),
+                reason,
+                "the reason carried from the link was not the one sent upstream"
+            );
+        }
+    }
+
+    /// A DESTROY from the next hop still outranks the link's own end, and a
+    /// frame is still a frame.
+    #[tokio::test]
+    async fn the_next_hop_signal_separates_a_destroy_from_a_link_end() {
+        let (out, mut nl) = test_next_link(link::MAX_CIRCUITS_PER_LINK).await;
+        {
+            let st = out.lock();
+            let h = st
+                .handles
+                .get(&nl.circ_id)
+                .expect("the circuit is on the link");
+            assert!(h.end.send(CircuitEnd::Destroyed).is_ok());
+        }
+        assert!(matches!(
+            next_hop_event(&mut nl).await,
+            NextEvent::Destroyed
+        ));
+
+        let (out2, mut nl2) = test_next_link(link::MAX_CIRCUITS_PER_LINK).await;
+        {
+            let st = out2.lock();
+            let h = st
+                .handles
+                .get(&nl2.circ_id)
+                .expect("the circuit is on the link");
+            h.frames
+                .try_send(link::Queued::new(vec![7u8; 4], &out2.budget))
+                .expect("room in the queue");
+        }
+        assert!(matches!(
+            next_hop_event(&mut nl2).await,
+            NextEvent::Frame(_)
+        ));
+    }
+
+    /// The composed path: a stalled outbound link ends, and the circuit on it
+    /// leaves a DESTROY carrying LinkLost on its upstream link and DESTROYED
+    /// on the link that failed.
+    #[tokio::test(start_paused = true)]
+    async fn a_circuit_on_a_stalled_outbound_link_sends_link_lost_upstream() {
+        let layers = Layers::new(3);
+        let upstream = Arc::new(LinkShared::new(
+            LinkRole::Responder,
+            link::MAX_CIRCUITS_PER_LINK,
+            link::Budget::new(),
+        ));
+        let id = CircId::new(0x4000_0501).expect("a nonzero id");
+        upstream
+            .lock()
+            .table
+            .accept_create(id, test_transport(), Instant::now())
+            .expect("room on the link");
+
+        let (out, mut nl) = test_next_link(link::MAX_CIRCUITS_PER_LINK).await;
+        let next_id = nl.circ_id;
+        // Give the stalled writer something to carry, then let it give up.
+        out.push_out(next_id, vec![0xEE; 8]).expect("queue");
+        let writer = tokio::time::timeout(
+            CELL_WRITE_TIMEOUT * 3,
+            run_link_writer(out.clone(), StalledWriter),
+        )
+        .await;
+        assert!(writer.is_ok(), "the writer never gave up on a stalled peer");
+        assert_eq!(end_outbound_link(&out), 1, "the circuit was not released");
+
+        let event = next_hop_event(&mut nl).await;
+        let NextEvent::Ended(reason) = event else {
+            panic!("the circuit did not see its next link end");
+        };
+        let result = finish_circuit(
+            &upstream,
+            id,
+            layers,
+            Some(nl),
+            Err(HandleError::NextLinkEnded(reason)),
+        );
+        assert!(matches!(
+            result,
+            Err(HandleError::NextLinkEnded(DestroyReason::LinkLost))
+        ));
+
+        assert_eq!(
+            destroy_reason_on(&upstream, layers, id),
+            Some(DestroyReason::LinkLost as u8),
+            "the client was told the circuit was closed on request when the link to \
+             the next hop had failed"
+        );
+        assert_eq!(
+            destroy_reason_on(&out, TEST_NEXT_LAYERS, next_id),
+            Some(DestroyReason::Destroyed as u8),
+            "the next hop was told a reason other than DESTROYED"
         );
     }
 
@@ -2326,7 +2643,11 @@ mod tests {
     /// ordinary close gives (ARCHITECTURE 5.11).
     #[tokio::test(start_paused = true)]
     async fn a_stalled_outbound_link_closes_and_releases_its_circuits() {
-        let shared = Arc::new(LinkShared::new(LinkRole::Initiator, link::Budget::new()));
+        let shared = Arc::new(LinkShared::new(
+            LinkRole::Initiator,
+            link::MAX_CIRCUITS_PER_LINK,
+            link::Budget::new(),
+        ));
         let ids: Vec<CircId> = (1..=3)
             .map(|i| CircId::new(0x8000_0200 + i).expect("a nonzero id"))
             .collect();
@@ -2354,8 +2675,8 @@ mod tests {
             "a stalled outbound write left the link open"
         );
 
-        // What the link's own task then does: release everything.
-        let released = shared.release_all();
+        // What the link's own task then does: end the link.
+        let released = end_outbound_link(&shared);
         assert_eq!(released, 3, "every circuit on the link must be released");
         assert_eq!(shared.lock().table.len(), 0);
         let now = Instant::now();
@@ -2476,7 +2797,11 @@ mod tests {
     /// A write that lands one second inside the deadline does not close it.    /// A write that lands one second inside the deadline does not close it.    /// A write that lands one second inside the deadline does not close it.
     #[tokio::test(start_paused = true)]
     async fn a_write_that_lands_inside_the_deadline_does_not_close_the_link() {
-        let shared = Arc::new(LinkShared::new(LinkRole::Responder, link::Budget::new()));
+        let shared = Arc::new(LinkShared::new(
+            LinkRole::Responder,
+            link::MAX_CIRCUITS_PER_LINK,
+            link::Budget::new(),
+        ));
         assert!(shared.push_control(vec![0xBB; 8]));
 
         let w = SlowWriter::after(CELL_WRITE_TIMEOUT - Duration::from_secs(1));
@@ -2556,7 +2881,11 @@ mod tests {
         const CIRCUITS: u8 = 4;
         const ROTATIONS: usize = 8;
 
-        let shared = Arc::new(LinkShared::new(LinkRole::Responder, link::Budget::new()));
+        let shared = Arc::new(LinkShared::new(
+            LinkRole::Responder,
+            link::MAX_CIRCUITS_PER_LINK,
+            link::Budget::new(),
+        ));
         let ids: Vec<CircId> = (0..CIRCUITS)
             .map(|i| CircId::new(0x4000_0100 + i as u32).expect("a nonzero id"))
             .collect();
@@ -2602,6 +2931,63 @@ mod tests {
 
     /// A completed Noise session, so a circuit can occupy a table slot without
     /// a link. Both halves are generated here and the initiator is discarded.
+    /// Layers on the outbound link a test builds: a guard's downstream count.
+    const TEST_NEXT_LAYERS: Layers = Layers::new(2);
+
+    /// A next hop link with no socket behind it, plus one circuit on it.
+    ///
+    /// It goes through the registry rather than around it, because that is the
+    /// only thing that hands out a reservation, and the reservation is what
+    /// keeps the circuit counted on the link.
+    async fn test_next_link(capacity: usize) -> (Arc<LinkShared>, NextLinkState) {
+        let registry = Arc::new(OutboundRegistry::new());
+        let key = linkreg::LinkKey {
+            relay_id: "test-next-hop".to_string(),
+            addr: "127.0.0.1:443".parse().expect("a literal address"),
+            tls_name: "next.example".to_string(),
+        };
+        let acquired = registry
+            .acquire(key, capacity, || async {
+                Ok::<_, HandleError>(OutboundLink {
+                    shared: Arc::new(LinkShared::new(
+                        LinkRole::Initiator,
+                        capacity,
+                        link::Budget::new(),
+                    )),
+                    layers: TEST_NEXT_LAYERS,
+                    reader: std::sync::Mutex::new(None),
+                    writer: std::sync::Mutex::new(None),
+                })
+            })
+            .await
+            .expect("the first caller dials");
+        let shared = acquired.link.link.shared.clone();
+        let (circ_id, frames, end) = shared
+            .open_outbound_circuit()
+            .expect("room on a fresh link");
+        let nl = NextLinkState {
+            link: acquired.link,
+            _reservation: acquired.reservation,
+            circ_id,
+            frames,
+            end,
+        };
+        (shared, nl)
+    }
+
+    /// The reason on the DESTROY this link holds for `id`, if it holds one.
+    fn destroy_reason_on(shared: &Arc<LinkShared>, layers: Layers, id: CircId) -> Option<u8> {
+        while let Some(wire) = shared.pop_next_out() {
+            let Ok(frame) = link_frame::decode(&wire, layers, LinkRole::Responder) else {
+                continue;
+            };
+            if frame.command == link_frame::LinkCommand::Destroy && frame.circ_id == id {
+                return frame.body.first().copied();
+            }
+        }
+        None
+    }
+
     fn test_transport() -> Transport {
         let kp = quiethop_crypto::noise::generate_static_keypair().expect("keygen");
         let (initiator, msg1) =
