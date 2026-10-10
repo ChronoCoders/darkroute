@@ -454,7 +454,14 @@ ck_fmt_staged() {
 # listed here, so a crate added later is covered without editing this file.
 ck_crate_roots() {
 	local m r
-	sed -n '/^members *= *\[/,/\]/p' "$CK_ROOT/Cargo.toml" |
+	# Only the members value. A line-range from `members = [` to the next `]`
+	# swallows whatever key comes after it when members is written on one line,
+	# and `exclude` is exactly that key, so an excluded crate was being read as
+	# a member. Comment tails go first, then the file is joined and the first
+	# bracketed value after `members =` is taken, which works whether members is
+	# on one line or several.
+	sed 's/#.*$//' "$CK_ROOT/Cargo.toml" | tr '\n' ' ' |
+		sed -n 's/.*members *= *\[\([^]]*\)\].*/\1/p' |
 		grep -o '"[^"]*"' | tr -d '"' |
 	while IFS= read -r m; do
 		[ -z "$m" ] && continue

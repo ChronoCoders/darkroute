@@ -1,3 +1,6 @@
+#![deny(warnings)]
+#![forbid(unsafe_code)]
+
 //! Does a default build of the SDK export the low level dialer?
 //!
 //! It must not: that dialer takes a caller supplied TLS connector and so is a
