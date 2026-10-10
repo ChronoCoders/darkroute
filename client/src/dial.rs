@@ -19,9 +19,10 @@ use quiethop_crypto::cell::{
     parse_extend_backward, Cell, CellType, ConnectPayload, ExtendForward, CELL_PAYLOAD_LEN,
 };
 use quiethop_crypto::circid::{self, CircId, LinkRole};
+use quiethop_crypto::flow::{AfterDelivery, FlowError, Windows};
 use quiethop_crypto::layer::{peel, seal_forward, seal_to_me, FrameReader, Peeled};
 use quiethop_crypto::layers::Layers;
-use quiethop_crypto::link::{self as link_frame, LinkCommand};
+use quiethop_crypto::link::{self as link_frame, DestroyReason, LinkCommand};
 use quiethop_crypto::noise::{Initiator, Transport, NOISE_MSG_LEN};
 use quiethop_crypto::wire::PROTO_CLIENT;
 
@@ -55,7 +56,25 @@ fn inbound_body(wire: &[u8], circ_id: CircId) -> Result<&[u8], ClientError> {
 
 /// Read from the user in whole cells. Each cell carries at most
 /// CELL_PAYLOAD_LEN bytes, so a larger write is split across cells.
+///
+/// Never read more than the package window can carry: a read is sized by what
+/// the user wrote, not by the window, so reading 32 cells with room for three
+/// would mean either dropping data or sending past the window.
 const USER_READ_BUF: usize = CELL_PAYLOAD_LEN * 32;
+
+/// The DESTROY reason a flow-control violation names.
+///
+/// Exhaustive on purpose, so a new `FlowError` fails to compile here rather
+/// than inheriting a reason that may not fit it. It has to agree with
+/// `destroy_reason_for` on the relay side, and the two are separate only until
+/// the shared link code moves into its own crate (docs/DECISIONS.md entry 37).
+fn destroy_reason_for(err: &FlowError) -> DestroyReason {
+    match err {
+        FlowError::PackageWindowExhausted
+        | FlowError::DeliverWindowNegative(_)
+        | FlowError::UnexpectedSendme(_) => DestroyReason::Protocol,
+    }
+}
 
 const DUPLEX_BUF: usize = 64 * 1024;
 
@@ -241,10 +260,28 @@ async fn circuit_task(
     // later read starting mid-cell.
     let mut inbound = FrameReader::new(tls_read, LINK_FRAME_LEN);
     let mut user_buf = vec![0u8; USER_READ_BUF];
+    // One pair of windows per circuit, the same module the exit uses, so the
+    // two ends cannot drift into two rules (SECURITY_MODEL 6.4).
+    let mut windows = Windows::new();
+    // Set when this side ends the circuit for a flow-control violation, so the
+    // teardown below names it to the guard instead of closing quietly.
+    let mut violation: Option<DestroyReason> = None;
 
     loop {
+        // Read at most what the window can carry, and nothing at all once it is
+        // empty: the window is the backpressure, so a user that writes faster
+        // than the exit acknowledges waits in its own socket rather than here.
+        let room = windows.package().max(0) as usize * CELL_PAYLOAD_LEN;
+        let room = room.min(USER_READ_BUF);
+
         tokio::select! {
-            res = from_user.read(&mut user_buf) => {
+            res = async {
+                if room == 0 {
+                    std::future::pending().await
+                } else {
+                    from_user.read(&mut user_buf[..room]).await
+                }
+            } => {
                 let n = match res {
                     Ok(0) | Err(_) => break,
                     Ok(n) => n,
@@ -254,6 +291,13 @@ async fn circuit_task(
                 // and no reassembly buffer is needed.
                 let mut failed = false;
                 for chunk in user_buf[..n].chunks(CELL_PAYLOAD_LEN) {
+                    // Cannot fail: the read above was capped at the window, so
+                    // there is room for every chunk it produced.
+                    if let Err(e) = windows.on_data_sent() {
+                        violation = Some(destroy_reason_for(&e));
+                        failed = true;
+                        break;
+                    }
                     let cell = match Cell::new(CellType::Data, chunk.to_vec()) {
                         Ok(c) => c,
                         Err(_) => { failed = true; break; }
@@ -293,11 +337,56 @@ async fn circuit_task(
                 };
                 match cell.cell_type {
                     CellType::Data => {
-                        // A zero-length DATA cell is legal and is a no-op.
+                        // Accounted before the write, as the exit does, so the
+                        // SENDME is owed on delivery rather than on the user
+                        // having taken the bytes.
+                        let owed = match windows.on_data_delivered() {
+                            Ok(o) => o,
+                            Err(e) => {
+                                violation = Some(destroy_reason_for(&e));
+                                break;
+                            }
+                        };
+                        if owed == AfterDelivery::SendmeOwed {
+                            let Ok(sendme) = Cell::new(CellType::Sendme, Vec::new()) else {
+                                break;
+                            };
+                            let Ok(wire) = hops.seal_for_exit(&sendme) else {
+                                break;
+                            };
+                            let Ok(frame) = link_frame::encode(
+                                CLIENT_LAYERS,
+                                circ_id,
+                                LinkCommand::Data,
+                                &wire,
+                            ) else {
+                                break;
+                            };
+                            if tls_write.write_all(&frame).await.is_err()
+                                || tls_write.flush().await.is_err()
+                            {
+                                break;
+                            }
+                            // Credit on send, never on delivery: a consumer that
+                            // stops reading stops granting credit, which is the
+                            // whole point of the window.
+                            windows.on_sendme_sent();
+                        }
+                        // A zero-length DATA cell is legal and is a no-op. It
+                        // still counts against the window above.
                         if cell.payload.is_empty() {
                             continue;
                         }
                         if to_user.write_all(&cell.payload).await.is_err() {
+                            break;
+                        }
+                    }
+                    CellType::Sendme => {
+                        // A SENDME this side did not owe is a violation rather
+                        // than something to absorb: crediting it would take the
+                        // package window past its start (SECURITY_MODEL 6.4).
+                        if let Err(e) = windows.on_sendme_received() {
+                            violation = Some(destroy_reason_for(&e));
                             break;
                         }
                     }
@@ -306,6 +395,23 @@ async fn circuit_task(
                 }
             }
         }
+    }
+
+    // A flow-control violation is named to the guard, which releases the
+    // circuit and tells the hops beyond it. Anything else is an ordinary close.
+    if let Some(reason) = violation {
+        if let Ok(frame) = link_frame::encode(
+            CLIENT_LAYERS,
+            circ_id,
+            LinkCommand::Destroy,
+            &[reason as u8],
+        ) {
+            let _ = tls_write.write_all(&frame).await;
+            let _ = tls_write.flush().await;
+        }
+        let _ = tls_write.shutdown().await;
+        let _ = to_user.shutdown().await;
+        return;
     }
 
     // Best effort teardown: ask the exit to close, then drop everything.

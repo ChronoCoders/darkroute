@@ -75,6 +75,7 @@ fn tokens_rejected() -> &'static IntCounterVec {
 
 static FRAMES_DROPPED: OnceLock<IntCounterVec> = OnceLock::new();
 static WRITER_TURNS: OnceLock<IntCounterVec> = OnceLock::new();
+static CIRCUIT_SENDMES: OnceLock<IntCounterVec> = OnceLock::new();
 
 /// Turns the link writer took, split by whether more than one circuit had a
 /// frame waiting at that moment.
@@ -114,6 +115,60 @@ pub fn record_writer_turn(contended: bool) {
 pub fn writer_turn_count(contended: bool) -> u64 {
     let label = if contended { "true" } else { "false" };
     writer_turns().with_label_values(&[label]).get()
+}
+
+/// Circuit-level SENDMEs this relay sent and received, which is how an operator
+/// sees whether flow control is engaging at all.
+///
+/// Only the exit's windows engage, so these count the exit's end of every
+/// circuit through this relay (SECURITY_MODEL 6.4).
+fn circuit_sendmes() -> &'static IntCounterVec {
+    CIRCUIT_SENDMES.get_or_init(|| {
+        let opts = Opts::new(
+            "quiethop_circuit_sendmes_total",
+            "Circuit-level SENDMEs since startup, labelled by direction",
+        );
+        let c = IntCounterVec::new(opts, &["direction"])
+            .expect("static counter vec name and labels are valid");
+        registry()
+            .register(Box::new(c.clone()))
+            .expect("static counter vec registration is unique");
+        for v in ["sent", "received"] {
+            c.with_label_values(&[v]);
+        }
+        c
+    })
+}
+
+/// Which way a SENDME went, from this relay's point of view.
+#[derive(Debug, Clone, Copy)]
+pub enum SendmeDirection {
+    /// Owed for data this relay delivered, so it acknowledges the peer's data.
+    Sent,
+    /// Received from the peer, acknowledging data this relay sent.
+    Received,
+}
+
+pub fn record_circuit_sendme(direction: SendmeDirection) {
+    let label = match direction {
+        SendmeDirection::Sent => "sent",
+        SendmeDirection::Received => "received",
+    };
+    circuit_sendmes().with_label_values(&[label]).inc();
+}
+
+/// Current value of the SENDME counter. Test only.
+///
+/// The full-window test asserts both directions rose, so a run that moved the
+/// bytes without a window boundary round trip fails rather than passing on
+/// nothing.
+#[cfg(test)]
+pub fn circuit_sendme_count(direction: SendmeDirection) -> u64 {
+    let label = match direction {
+        SendmeDirection::Sent => "sent",
+        SendmeDirection::Received => "received",
+    };
+    circuit_sendmes().with_label_values(&[label]).get()
 }
 
 /// Link frames dropped without being delivered, labelled by why.

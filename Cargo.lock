@@ -1558,6 +1558,7 @@ dependencies = [
  "futures-util",
  "num-bigint",
  "prometheus",
+ "quiethop-client-sdk",
  "quiethop-crypto",
  "rand 0.8.6",
  "rand_core 0.6.4",

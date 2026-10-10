@@ -12,6 +12,15 @@ mod tls;
 mod tokens;
 
 pub use auth::Session;
+/// Build one circuit from a token and a path, over a caller-supplied TLS
+/// connector.
+///
+/// [`QuietHopClient::dial`] is the usual way in and builds its connector from
+/// the host's native roots. This is the same dialer with the connector left to
+/// the caller, which is what an in-process integrator needs to pin its own
+/// roots, and what lets the circuit be tested against relays that are not on
+/// the public internet.
+pub use dial::dial;
 pub use dial::CircuitStream;
 pub use error::ClientError;
 pub use path::{NoPathReason, PathRules, SelectedPath};

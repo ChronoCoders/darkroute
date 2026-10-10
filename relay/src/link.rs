@@ -495,8 +495,16 @@ impl LinkTable {
     }
 
     /// Whether this circuit may send another DATA cell.
-    pub fn may_send(&self, id: CircId) -> bool {
-        self.circuits.get(&id).is_some_and(|c| c.windows.may_send())
+    /// Cells this circuit may still send before its package window closes.
+    ///
+    /// A caller that reads a buffer's worth at a time needs the number rather
+    /// than a yes or no, or it reads more than it can send and then has to
+    /// choose between dropping data and sending past the window
+    /// (SECURITY_MODEL 6.4).
+    pub fn package_room(&self, id: CircId) -> usize {
+        self.circuits
+            .get(&id)
+            .map_or(0, |c| c.windows.package().max(0) as usize)
     }
 
     /// Account for a DATA cell sent on this circuit.
@@ -1019,7 +1027,7 @@ mod tests {
                 Err(e) => panic!("within the window: {e:?}"),
             }
         }
-        assert!(t.may_send(a) && t.may_send(b));
+        assert!(t.package_room(a) > 0 && t.package_room(b) > 0);
 
         // b's window is untouched, so it absorbs a full window of its own.
         for _ in 0..1000 {
@@ -1027,8 +1035,8 @@ mod tests {
                 .expect("b is open")
                 .expect("within window");
         }
-        assert!(!t.may_send(b), "b stopped at its own window");
-        assert!(t.may_send(a), "a is unaffected by b");
+        assert_eq!(t.package_room(b), 0, "b stopped at its own window");
+        assert!(t.package_room(a) > 0, "a is unaffected by b");
     }
 
     /// An unowed SENDME surfaces as a violation through the table, which is how
@@ -1055,7 +1063,7 @@ mod tests {
         assert!(t.on_data_delivered(x).is_none());
         assert!(t.on_sendme_received(x).is_none());
         assert!(t.on_data_sent(x).is_none());
-        assert!(!t.may_send(x));
+        assert_eq!(t.package_room(x), 0);
     }
 
     /// Both circuits backlogged: the writer must strictly alternate, which is

@@ -2117,6 +2117,164 @@ async fn at_the_budget_ceiling_creates_are_refused_and_open_circuits_carry_on() 
     .expect("test timed out");
 }
 
+/// The real SDK carries a full window in both directions, which is the
+/// condition for merging this branch to main.
+///
+/// `client/src/dial.rs` rather than `MockClient`, because the mock implements
+/// no flow control and so cannot reach either of the two thresholds that the
+/// SDK used to fail at: an upload torn down at 50,900 bytes when the exit's
+/// first SENDME arrived, and a download stalled at 509,000 when the exit's
+/// package window reached zero (docs/DECISIONS.md entry 37).
+///
+/// The traffic is sized past both. 1200 cells each way is 610,800 bytes, which
+/// crosses twelve SENDME boundaries per direction, and the counts below assert
+/// that the boundaries were actually crossed rather than inferring it from the
+/// byte total: a run that moved the bytes without a SENDME round trip proves
+/// nothing and must fail.
+#[tokio::test]
+async fn the_real_sdk_carries_a_full_window_in_both_directions() {
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        ensure_crypto_provider();
+        // An echo server behind a SOCKS5 stub, so the exit's dial path runs for
+        // real without reaching the internet.
+        let echo_listener = TcpListener::bind("127.0.0.1:0").await.expect("echo bind");
+        let echo_addr = echo_listener.local_addr().expect("echo addr");
+        tokio::spawn(run_echo_server(echo_listener));
+        let socks_listener = TcpListener::bind("127.0.0.1:0").await.expect("socks bind");
+        let socks_addr = socks_listener.local_addr().expect("socks addr");
+        tokio::spawn(run_socks5_stub(socks_listener, echo_addr));
+
+        let keydir = tempfile::tempdir().expect("keydir");
+        let auth_priv = RsaPrivateKey::new(&mut rand_core::OsRng, 2048).expect("rsa keygen");
+        let pki = make_pki();
+        let server_config = make_server_config(&pki);
+        let connector = Arc::new(make_connector(&pki));
+        let over = RelayOverride {
+            decodo_proxy_url: Some(format!("socks5://user:pass@{socks_addr}")),
+            allowed_exit_ports: vec![echo_addr.port()],
+            ..default_override()
+        };
+        let fleet = spawn_fleet(
+            &auth_priv,
+            &over,
+            server_config,
+            connector.clone(),
+            keydir.path(),
+        )
+        .await;
+        let (after, fresh, until) = current_window();
+        let doc = document_from(
+            &[
+                ("guard", fleet.guard.addr, fleet.guard.static_pubkey),
+                ("middle", fleet.middle.addr, fleet.middle.static_pubkey),
+                ("exit", fleet.exit.addr, fleet.exit.static_pubkey),
+            ],
+            &after,
+            &fresh,
+            &until,
+        );
+        fleet.publish(doc.clone());
+
+        // The path is built from the document's own entries rather than taken
+        // from the real selector, because the selector refuses this fleet and is
+        // right to: every relay here listens on 127.0.0.1, and SECURITY_MODEL
+        // 5.3 forbids two hops in one IPv4 /16 whatever the operator rules say.
+        // Binding the fleet across 127.x /16s would break the registry's
+        // inbound check, which matches a peer's source address against the
+        // address published for its role, and a loopback connection's source is
+        // the interface address rather than the destination. So selector and
+        // dialer stay covered separately, which STATUS_REPORT records.
+        let entry_for = |role: &str| -> quiethop_client::RelayEntry {
+            doc.document
+                .relays
+                .iter()
+                .find(|r| r.role == role)
+                .expect("the published document carries one relay per role")
+                .clone()
+        };
+        let route = quiethop_client::SelectedPath {
+            guard: entry_for("guard"),
+            middle: entry_for("middle"),
+            exit: entry_for("exit"),
+            operator_span: 3,
+        };
+
+        let m_raw: [u8; 32] = [0x7C; 32];
+        let token = raw_sign(&m_raw, &auth_priv);
+        let sent_before =
+            crate::metrics::circuit_sendme_count(crate::metrics::SendmeDirection::Sent);
+        let received_before =
+            crate::metrics::circuit_sendme_count(crate::metrics::SendmeDirection::Received);
+
+        let circuit = quiethop_client::dial(
+            &connector,
+            &route,
+            &m_raw,
+            &token,
+            &echo_addr.ip().to_string(),
+            echo_addr.port(),
+        )
+        .await
+        .expect("the SDK could not build a circuit");
+
+        // 1200 cells up, echoed back, so each direction crosses twelve
+        // boundaries at WINDOW_INCREMENT of 100.
+        const CELLS: usize = 1200;
+        const TOTAL: usize = CELLS * CELL_PAYLOAD_LEN;
+        let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+
+        let (mut read_half, mut write_half) = tokio::io::split(circuit);
+        let sender = tokio::spawn({
+            let payload = payload.clone();
+            async move {
+                write_half.write_all(&payload).await?;
+                write_half.flush().await
+            }
+        });
+
+        let mut got = vec![0u8; TOTAL];
+        let read_all =
+            tokio::time::timeout(Duration::from_secs(60), read_half.read_exact(&mut got)).await;
+
+        assert!(
+            read_all.is_ok(),
+            "the circuit stalled before returning {TOTAL} bytes, which is what a client \
+             that never sends a SENDME does at 509,000"
+        );
+        assert_eq!(
+            read_all.expect("checked above").expect("read"),
+            TOTAL,
+            "short read"
+        );
+        assert_eq!(got, payload, "the bytes came back changed");
+        sender
+            .await
+            .expect("the sending task panicked")
+            .expect("the upload failed, which is what a client that breaks on a SENDME does");
+
+        // The precondition: SENDMEs actually crossed. Without this the test
+        // could pass on a window that was never exhausted and would say
+        // nothing about flow control at all.
+        let sent = crate::metrics::circuit_sendme_count(crate::metrics::SendmeDirection::Sent)
+            - sent_before;
+        let received =
+            crate::metrics::circuit_sendme_count(crate::metrics::SendmeDirection::Received)
+                - received_before;
+        assert!(
+            sent >= 2,
+            "the exit sent {sent} SENDMEs, so the upload never crossed a window boundary \
+             and this run says nothing about the client crediting one"
+        );
+        assert!(
+            received >= 2,
+            "the exit received {received} SENDMEs, so the download never crossed a window \
+             boundary and this run says nothing about the client sending one"
+        );
+    })
+    .await
+    .expect("test timed out");
+}
+
 /// A DESTROY from the peer is not answered back to that peer.
 ///
 /// The peer already knows it destroyed the circuit, so a DESTROY in reply tells

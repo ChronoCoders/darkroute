@@ -27,6 +27,13 @@ rustls-native-certs = { workspace = true }
 futures-util = { workspace = true }
 
 [dev-dependencies]
+# The merge condition is an end-to-end test driven by the real SDK rather than
+# a mock client, and the harness that stands up three relays in-process lives in
+# this crate. The relay is a binary, so nothing here can be imported from a test
+# crate elsewhere; a dev dependency is what lets the SDK reach the harness
+# without reaching the shipped binary. No cycle: the SDK does not depend on the
+# relay (STATUS_REPORT, the client design report).
+quiethop-client-sdk = { path = "../client" }
 rcgen = "0.13"
 rand_core = { workspace = true }
 tempfile = "3"

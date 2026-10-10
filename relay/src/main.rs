@@ -821,8 +821,9 @@ impl LinkShared {
         self.lock().table.on_sendme_received(id)
     }
 
-    fn may_send(&self, id: CircId) -> bool {
-        self.lock().table.may_send(id)
+    /// Cells this circuit may still send before its window closes.
+    fn package_room(&self, id: CircId) -> usize {
+        self.lock().table.package_room(id)
     }
 
     fn on_data_sent(&self, id: CircId) -> Option<Result<(), FlowError>> {
@@ -1684,6 +1685,9 @@ async fn run_circuit(
                                             break Err(HandleError::PeerClosed);
                                         }
                                         shared.on_sendme_sent(id);
+                                        metrics::record_circuit_sendme(
+                                            metrics::SendmeDirection::Sent,
+                                        );
                                     }
                                     AfterDelivery::Nothing => {}
                                 }
@@ -1707,6 +1711,9 @@ async fn run_circuit(
                             // (SECURITY_MODEL 6.4, Tor parity).
                             if let Some(outcome) = shared.on_sendme_received(id) {
                                 outcome?;
+                                metrics::record_circuit_sendme(
+                                    metrics::SendmeDirection::Received,
+                                );
                             }
                         }
                         (CellType::CloseRequest, _) => {
@@ -1764,9 +1771,15 @@ async fn run_circuit(
                 // zero this branch is pending, so the relay stops reading the
                 // destination until a SENDME arrives rather than buffering
                 // without bound (SECURITY_MODEL 6.4).
+                // Sized by the window, not only gated on it. A read is sized
+                // by what the destination wrote, so reading 32 cells with room
+                // for three would mean either dropping data or sending past the
+                // window, and on_data_sent would end a circuit that did nothing
+                // wrong (docs/DECISIONS.md entry 37).
+                let room = shared.package_room(id) * cell::CELL_PAYLOAD_LEN;
                 match dest_link.as_mut() {
-                    Some(dl) if shared.may_send(id) => {
-                        let mut buf = vec![0u8; DEST_READ_BUF];
+                    Some(dl) if room > 0 => {
+                        let mut buf = vec![0u8; room.min(DEST_READ_BUF)];
                         let n = dl.read(&mut buf).await?;
                         buf.truncate(n);
                         Ok::<_, std::io::Error>(buf)
