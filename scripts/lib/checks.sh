@@ -172,7 +172,7 @@ ck_step() {
 # a clean tree.
 ck_sdk_dial_gated() {
 	local manifest="probes/sdk-default-build/Cargo.toml"
-	local out rc
+	local out rc want
 	[ -r "$manifest" ] || { echo "the probe is missing at $manifest" >&2; return 1; }
 
 	out=$(cargo check --manifest-path "$manifest" 2>&1); rc=$?
@@ -180,11 +180,23 @@ ck_sdk_dial_gated() {
 		echo "a default build of the SDK exports the low level dial" >&2
 		return 1
 	fi
-	printf '%s\n' "$out" | grep -q "dial" || {
-		echo "the default build failed for a reason other than the absent symbol" >&2
-		printf '%s\n' "$out" | tail -8 >&2
-		return 1
-	}
+	# A failed build is not yet an absent symbol. Any compile error inside
+	# client/src/dial.rs prints that path, so matching the word dial would read
+	# a broken SDK as a gated one. These three strings together say the probe
+	# itself was reached and failed on the name: an error in the SDK stops the
+	# build at quiethop-client-sdk, and the probe is then never compiled.
+	for want in \
+		'could not compile `sdk-default-build-probe`' \
+		'error[E0423]: expected value, found module `quiethop_client::dial`' \
+		'error[E0603]: module `dial` is private'
+	do
+		if ! printf '%s\n' "$out" | grep -qF "$want"; then
+			echo "the default build failed for a reason other than the absent symbol" >&2
+			echo "    nothing in the output matched: $want" >&2
+			printf '%s\n' "$out" | tail -8 >&2
+			return 1
+		fi
+	done
 
 	out=$(cargo check --manifest-path "$manifest" --features with-test-util 2>&1); rc=$?
 	if [ "$rc" -ne 0 ]; then
@@ -192,7 +204,7 @@ ck_sdk_dial_gated() {
 		printf '%s\n' "$out" | tail -8 >&2
 		return 1
 	fi
-	return 0
+	echo "the default build failed on the absent symbol and the gated build succeeded"
 }
 
 ck_naming_self_test() {
@@ -681,11 +693,27 @@ ck_accepted_file_self_test() {
 ck_cargo_audit() {
 	ck_require cargo cargo-audit python3 || return 1
 	[ -r "$CK_ACCEPTED" ] || { echo "accepted advisory file unreadable at $CK_ACCEPTED" >&2; return 1; }
-	local json
-	json=$(cd "$CK_ROOT" && cargo audit --json 2>/dev/null) || true
-	[ -n "$json" ] || { echo "cargo audit produced no json output" >&2; return 1; }
-	printf '%s' "$json" | ACCEPTED="$(ck_accepted_ids)" \
-		python3 "$CK_ROOT/scripts/lib/audit_filter.py" cargo
+	# Every tracked lock file, enumerated from git rather than listed here. The
+	# probe crate sits outside the workspace on purpose, so its dependencies are
+	# absent from the workspace lock and auditing that one alone would leave
+	# them unread. Anything out of workspace added later is covered the day its
+	# lock is tracked.
+	local locks probe="probes/sdk-default-build/Cargo.lock"
+	locks=$(cd "$CK_ROOT" && git ls-files -- 'Cargo.lock' '*/Cargo.lock')
+	[ -n "$locks" ] || { echo "no tracked Cargo.lock to audit" >&2; return 1; }
+	printf '%s\n' "$locks" | grep -qxF "$probe" || {
+		echo "the sdk probe's lock is untracked, so nothing audits it: $probe" >&2
+		return 1
+	}
+	local lock json rc=0
+	while read -r lock; do
+		echo "$lock"
+		json=$(cd "$CK_ROOT" && cargo audit --json --file "$lock" 2>/dev/null) || true
+		[ -n "$json" ] || { echo "cargo audit produced no json for $lock" >&2; rc=1; continue; }
+		printf '%s' "$json" | ACCEPTED="$(ck_accepted_ids)" \
+			python3 "$CK_ROOT/scripts/lib/audit_filter.py" cargo || rc=1
+	done <<<"$locks"
+	return "$rc"
 }
 
 ck_npm_audit() {

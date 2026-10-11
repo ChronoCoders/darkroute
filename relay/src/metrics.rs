@@ -14,7 +14,8 @@
 //! a port that handles low-rate operator traffic only.
 
 use std::io;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use prometheus::{Encoder, IntCounter, IntCounterVec, Opts, Registry, TextEncoder};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -149,26 +150,59 @@ pub enum SendmeDirection {
     Received,
 }
 
-pub fn record_circuit_sendme(direction: SendmeDirection) {
-    let label = match direction {
+fn sendme_label(direction: SendmeDirection) -> &'static str {
+    match direction {
         SendmeDirection::Sent => "sent",
         SendmeDirection::Received => "received",
-    };
-    circuit_sendmes().with_label_values(&[label]).inc();
+    }
 }
 
-/// Current value of the SENDME counter. Test only.
+/// One relay's SENDME tally, which records to the process counter as it counts.
 ///
-/// The full-window test asserts both directions rose, so a run that moved the
-/// bytes without a window boundary round trip fails rather than passing on
-/// nothing.
-#[cfg(test)]
-pub fn circuit_sendme_count(direction: SendmeDirection) -> u64 {
-    let label = match direction {
-        SendmeDirection::Sent => "sent",
-        SendmeDirection::Received => "received",
-    };
-    circuit_sendmes().with_label_values(&[label]).get()
+/// The exported counter is per process, which is what an operator wants and
+/// what a test cannot attribute: every relay a test binary starts adds to the
+/// same counter, so a before and after delta can be another test's traffic.
+/// A tally belongs to one relay, and going through it is the only path to the
+/// metric, so the two cannot drift apart.
+#[derive(Clone, Default)]
+pub struct SendmeTally {
+    counts: Arc<SendmeCounts>,
+}
+
+#[derive(Default)]
+struct SendmeCounts {
+    sent: AtomicU64,
+    received: AtomicU64,
+}
+
+impl SendmeTally {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record(&self, direction: SendmeDirection) {
+        self.slot(direction).fetch_add(1, Ordering::Relaxed);
+        circuit_sendmes()
+            .with_label_values(&[sendme_label(direction)])
+            .inc();
+    }
+
+    /// SENDMEs this relay has recorded in one direction. Test only.
+    ///
+    /// The full-window test asserts both directions moved on the exit it
+    /// started, so a run that carried the bytes without crossing a window
+    /// boundary fails rather than passing on nothing.
+    #[cfg(test)]
+    pub fn count(&self, direction: SendmeDirection) -> u64 {
+        self.slot(direction).load(Ordering::Relaxed)
+    }
+
+    fn slot(&self, direction: SendmeDirection) -> &AtomicU64 {
+        match direction {
+            SendmeDirection::Sent => &self.counts.sent,
+            SendmeDirection::Received => &self.counts.received,
+        }
+    }
 }
 
 /// Link frames dropped without being delivered, labelled by why.

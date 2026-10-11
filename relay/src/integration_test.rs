@@ -229,6 +229,10 @@ struct SpawnedRelay {
     /// The relay's own byte budget, so a test can assert what it holds instead
     /// of inferring it from a refusal that may never come.
     budget: crate::link::Budget,
+    /// This relay's own SENDME tally. The exported counter is per process and
+    /// every relay in this binary raises it, so a test that read the metric
+    /// could pass on another test's SENDMEs.
+    sendmes: crate::metrics::SendmeTally,
     static_pubkey: [u8; STATIC_KEY_LEN],
     /// Needed because a link's frame size follows the relay's role.
     role: Role,
@@ -260,6 +264,7 @@ async fn spawn_relay(
     let cfg = make_config(role, over, key_path, keydir.join(format!("{role}-state")));
     let shutdown = Arc::new(Notify::new());
     let budget = crate::link::Budget::new();
+    let sendmes = crate::metrics::SendmeTally::new();
     tokio::spawn(super::accept_loop(
         listener,
         server_config.clone(),
@@ -272,11 +277,13 @@ async fn spawn_relay(
         Arc::new(kp),
         registry,
         budget.clone(),
+        sendmes.clone(),
         Arc::new(crate::linkreg::Registry::new()),
     ));
     SpawnedRelay {
         addr,
         budget,
+        sendmes,
         static_pubkey,
         role,
     }
@@ -926,6 +933,7 @@ async fn wrong_static_key_fails_the_handshake() {
         // The impostor key belongs to the exit, not the guard.
         let impostor = SpawnedRelay {
             budget: crate::link::Budget::new(),
+            sendmes: crate::metrics::SendmeTally::new(),
             addr: fleet.guard.addr,
             static_pubkey: fleet.exit.static_pubkey,
             role: Role::Guard,
@@ -2201,11 +2209,6 @@ async fn the_real_sdk_carries_a_full_window_in_both_directions() {
 
         let m_raw: [u8; 32] = [0x7C; 32];
         let token = raw_sign(&m_raw, &auth_priv);
-        let sent_before =
-            crate::metrics::circuit_sendme_count(crate::metrics::SendmeDirection::Sent);
-        let received_before =
-            crate::metrics::circuit_sendme_count(crate::metrics::SendmeDirection::Received);
-
         let circuit = quiethop_client::dial(
             &connector,
             &route,
@@ -2259,11 +2262,19 @@ async fn the_real_sdk_carries_a_full_window_in_both_directions() {
         // The precondition: SENDMEs actually crossed. Without this the test
         // could pass on a window that was never exhausted and would say
         // nothing about flow control at all.
-        let sent = crate::metrics::circuit_sendme_count(crate::metrics::SendmeDirection::Sent)
-            - sent_before;
-        let received =
-            crate::metrics::circuit_sendme_count(crate::metrics::SendmeDirection::Received)
-                - received_before;
+        //
+        // Read off the exit this test started rather than off the exported
+        // counter. That counter is per process, so any other test in this
+        // binary that moves a window's worth of data raises it too, and a
+        // before and after delta would pass on SENDMEs this circuit never sent.
+        let sent = fleet
+            .exit
+            .sendmes
+            .count(crate::metrics::SendmeDirection::Sent);
+        let received = fleet
+            .exit
+            .sendmes
+            .count(crate::metrics::SendmeDirection::Received);
         assert!(
             sent >= 2,
             "the exit sent {sent} SENDMEs, so the upload never crossed a window boundary \
@@ -3036,6 +3047,7 @@ async fn run_adverse_delivery_test() {
     // Dial the guard through its proxy, still pinning the guard's real key.
     let guard_hop = SpawnedRelay {
         budget: crate::link::Budget::new(),
+        sendmes: crate::metrics::SendmeTally::new(),
         addr: guard_via,
         static_pubkey: guard.static_pubkey,
         role: Role::Guard,
@@ -3047,6 +3059,7 @@ async fn run_adverse_delivery_test() {
             static_pubkey: middle.static_pubkey,
             role: Role::Middle,
             budget: crate::link::Budget::new(),
+            sendmes: crate::metrics::SendmeTally::new(),
         })
         .await;
     client
@@ -3055,6 +3068,7 @@ async fn run_adverse_delivery_test() {
             static_pubkey: exit.static_pubkey,
             role: Role::Exit,
             budget: crate::link::Budget::new(),
+            sendmes: crate::metrics::SendmeTally::new(),
         })
         .await;
 

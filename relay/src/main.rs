@@ -314,6 +314,7 @@ async fn main() -> ExitCode {
         static_key.clone(),
         registry.clone(),
         link::Budget::new(),
+        metrics::SendmeTally::new(),
         Arc::new(OutboundRegistry::new()),
     ));
     let metrics_handle = tokio::spawn(metrics_accept_loop(metrics_listener, shutdown.clone()));
@@ -380,6 +381,7 @@ async fn accept_loop(
     static_key: Arc<StaticKeypair>,
     registry: RegistryHandle,
     budget: link::Budget,
+    sendmes: metrics::SendmeTally,
     links: Arc<OutboundRegistry>,
 ) {
     loop {
@@ -393,6 +395,7 @@ async fn accept_loop(
                     let ctx = ConnCtx {
                         cfg: cfg.clone(),
                         budget: budget.clone(),
+                        sendmes: sendmes.clone(),
                         links: links.clone(),
                         authority: authority.clone(),
                         replay: replay.clone(),
@@ -447,6 +450,8 @@ struct ConnCtx {
     cfg: Arc<RelayConfig>,
     /// One per relay process, shared by every link (ARCHITECTURE 5.9).
     budget: link::Budget,
+    /// This relay's own SENDME tally, which also feeds the process counter.
+    sendmes: metrics::SendmeTally,
     /// The outbound links this relay holds, one per next hop
     /// (ARCHITECTURE 5.10).
     links: Arc<OutboundRegistry>,
@@ -1685,9 +1690,7 @@ async fn run_circuit(
                                             break Err(HandleError::PeerClosed);
                                         }
                                         shared.on_sendme_sent(id);
-                                        metrics::record_circuit_sendme(
-                                            metrics::SendmeDirection::Sent,
-                                        );
+                                        ctx.sendmes.record(metrics::SendmeDirection::Sent);
                                     }
                                     AfterDelivery::Nothing => {}
                                 }
@@ -1711,9 +1714,7 @@ async fn run_circuit(
                             // (SECURITY_MODEL 6.4, Tor parity).
                             if let Some(outcome) = shared.on_sendme_received(id) {
                                 outcome?;
-                                metrics::record_circuit_sendme(
-                                    metrics::SendmeDirection::Received,
-                                );
+                                ctx.sendmes.record(metrics::SendmeDirection::Received);
                             }
                         }
                         (CellType::CloseRequest, _) => {
