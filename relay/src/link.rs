@@ -286,13 +286,21 @@ pub struct LinkTable {
     rotation: VecDeque<CircId>,
     /// Shared with every other link on this relay.
     budget: Budget,
+    /// Shared with every other link on this relay, like the budget.
+    turns: crate::metrics::WriterTurnTally,
 }
 
 impl LinkTable {
     /// `role` is this side's role on the link, which fixes the half of the id
     /// space this side allocates from. `capacity` is how many circuits this
     /// link carries, which differs between a client link and a relay link.
-    pub fn new(role: LinkRole, capacity: usize, budget: Budget) -> Self {
+    /// `turns` is the relay's writer turn tally, which every link on it shares.
+    pub fn new(
+        role: LinkRole,
+        capacity: usize,
+        budget: Budget,
+        turns: crate::metrics::WriterTurnTally,
+    ) -> Self {
         Self {
             role,
             capacity,
@@ -300,7 +308,23 @@ impl LinkTable {
             quarantine: VecDeque::new(),
             rotation: VecDeque::new(),
             budget,
+            turns,
         }
+    }
+
+    /// A table whose writer turns go to a tally of its own.
+    ///
+    /// Test only. A relay shares one tally across its links, so a test that
+    /// does not read the count does not care which tally it got, and the
+    /// production path cannot reach this.
+    #[cfg(test)]
+    pub fn for_test(role: LinkRole, capacity: usize, budget: Budget) -> Self {
+        Self::new(
+            role,
+            capacity,
+            budget,
+            crate::metrics::WriterTurnTally::new(),
+        )
     }
 
     pub fn len(&self) -> usize {
@@ -522,7 +546,7 @@ impl LinkTable {
         // circuit with something queued, so its length here is how many
         // circuits the writer could have chosen between.
         if !self.rotation.is_empty() {
-            crate::metrics::record_writer_turn(self.rotation.len() > 1);
+            self.turns.record(self.rotation.len() > 1);
         }
         while let Some(id) = self.rotation.pop_front() {
             let Some(c) = self.circuits.get_mut(&id) else {
@@ -568,7 +592,7 @@ mod tests {
     use quiethop_crypto::noise::{generate_static_keypair, respond, Initiator};
 
     fn table() -> LinkTable {
-        LinkTable::new(LinkRole::Responder, MAX_CIRCUITS_PER_LINK, Budget::new())
+        LinkTable::for_test(LinkRole::Responder, MAX_CIRCUITS_PER_LINK, Budget::new())
     }
 
     /// An RNG that returns a scripted sequence of u32 values.
@@ -637,7 +661,7 @@ mod tests {
         const CEILING: u64 = 1000;
         const FRAME: usize = 50;
         let budget = Budget::new();
-        let mut t = LinkTable::new(LinkRole::Responder, MAX_CIRCUITS_PER_LINK, budget.clone());
+        let mut t = LinkTable::for_test(LinkRole::Responder, MAX_CIRCUITS_PER_LINK, budget.clone());
         let x = id(0x70);
         t.accept_create(x, transport(), Instant::now())
             .expect("room on the link");
@@ -695,7 +719,7 @@ mod tests {
         let budget = Budget::new();
 
         // Link A crosses the ceiling and starts refusing.
-        let mut a = LinkTable::new(LinkRole::Responder, MAX_CIRCUITS_PER_LINK, budget.clone());
+        let mut a = LinkTable::for_test(LinkRole::Responder, MAX_CIRCUITS_PER_LINK, budget.clone());
         let x = id(0x90);
         a.accept_create(x, transport(), Instant::now())
             .expect("room on the link");
@@ -713,7 +737,7 @@ mod tests {
 
         // A second link, opened only now, after the refusal began. Its own
         // view of the budget is the same view, so it refuses too.
-        let mut b = LinkTable::new(LinkRole::Responder, MAX_CIRCUITS_PER_LINK, budget.clone());
+        let mut b = LinkTable::for_test(LinkRole::Responder, MAX_CIRCUITS_PER_LINK, budget.clone());
         let y = id(0x91);
         b.accept_create(y, transport(), Instant::now())
             .expect("room on the link");
@@ -743,7 +767,7 @@ mod tests {
     #[test]
     fn destroying_a_circuit_releases_the_bytes_it_held() {
         let budget = Budget::new();
-        let mut t = LinkTable::new(LinkRole::Responder, MAX_CIRCUITS_PER_LINK, budget.clone());
+        let mut t = LinkTable::for_test(LinkRole::Responder, MAX_CIRCUITS_PER_LINK, budget.clone());
         let x = id(0x71);
         t.accept_create(x, transport(), Instant::now())
             .expect("room on the link");
@@ -765,7 +789,7 @@ mod tests {
     #[test]
     fn releasing_every_circuit_returns_the_counter_to_zero() {
         let budget = Budget::new();
-        let mut t = LinkTable::new(LinkRole::Responder, MAX_CIRCUITS_PER_LINK, budget.clone());
+        let mut t = LinkTable::for_test(LinkRole::Responder, MAX_CIRCUITS_PER_LINK, budget.clone());
         for i in 0..8u32 {
             let c = id(0x80 + i);
             t.accept_create(c, transport(), Instant::now())
@@ -833,7 +857,7 @@ mod tests {
         /// constant refuses before reaching this.
         const RELAY_CAP: usize = 100;
         const _: () = assert!(RELAY_CAP > MAX_CIRCUITS_PER_LINK);
-        let mut t = LinkTable::new(LinkRole::Responder, RELAY_CAP, Budget::new());
+        let mut t = LinkTable::for_test(LinkRole::Responder, RELAY_CAP, Budget::new());
 
         for i in 0..RELAY_CAP {
             t.accept_create(id(i as u32 + 1), transport(), Instant::now())
@@ -926,7 +950,7 @@ mod tests {
     /// held id, which would let a deleted skip pass unnoticed.
     #[test]
     fn the_allocator_skips_a_quarantined_id() {
-        let mut t = LinkTable::new(LinkRole::Initiator, MAX_CIRCUITS_PER_LINK, Budget::new());
+        let mut t = LinkTable::for_test(LinkRole::Initiator, MAX_CIRCUITS_PER_LINK, Budget::new());
         let t0 = Instant::now();
 
         let held = id(0x8000_0005);
@@ -948,7 +972,7 @@ mod tests {
     /// fails the create rather than scanning for a free one.
     #[test]
     fn a_quarantined_id_counts_toward_the_collision_bound() {
-        let mut t = LinkTable::new(LinkRole::Initiator, MAX_CIRCUITS_PER_LINK, Budget::new());
+        let mut t = LinkTable::for_test(LinkRole::Initiator, MAX_CIRCUITS_PER_LINK, Budget::new());
         let t0 = Instant::now();
         let held = id(0x8000_0005);
         t.insert_pending(held).unwrap();

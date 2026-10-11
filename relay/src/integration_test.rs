@@ -59,6 +59,11 @@ use crate::token::{raw_sign, ReplayWindow};
 
 const TEST_HOSTNAME: &str = "localhost";
 const TEST_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long the full-window test waits for the exit to read the last SENDMEs of
+/// the download, which the client writes before the bytes they acknowledge
+/// reach the test. A deadline rather than a sleep, so a count that never
+/// arrives fails the test instead of being accepted as whatever it reached.
+const SENDME_SETTLE: Duration = Duration::from_secs(10);
 
 static CRYPTO_PROVIDER_INSTALL: OnceLock<()> = OnceLock::new();
 
@@ -233,6 +238,8 @@ struct SpawnedRelay {
     /// every relay in this binary raises it, so a test that read the metric
     /// could pass on another test's SENDMEs.
     sendmes: crate::metrics::SendmeTally,
+    /// This relay's own writer turn tally, for the same reason.
+    turns: crate::metrics::WriterTurnTally,
     static_pubkey: [u8; STATIC_KEY_LEN],
     /// Needed because a link's frame size follows the relay's role.
     role: Role,
@@ -265,6 +272,7 @@ async fn spawn_relay(
     let shutdown = Arc::new(Notify::new());
     let budget = crate::link::Budget::new();
     let sendmes = crate::metrics::SendmeTally::new();
+    let turns = crate::metrics::WriterTurnTally::new();
     tokio::spawn(super::accept_loop(
         listener,
         server_config.clone(),
@@ -278,12 +286,14 @@ async fn spawn_relay(
         registry,
         budget.clone(),
         sendmes.clone(),
+        turns.clone(),
         Arc::new(crate::linkreg::Registry::new()),
     ));
     SpawnedRelay {
         addr,
         budget,
         sendmes,
+        turns,
         static_pubkey,
         role,
     }
@@ -934,6 +944,7 @@ async fn wrong_static_key_fails_the_handshake() {
         let impostor = SpawnedRelay {
             budget: crate::link::Budget::new(),
             sendmes: crate::metrics::SendmeTally::new(),
+            turns: crate::metrics::WriterTurnTally::new(),
             addr: fleet.guard.addr,
             static_pubkey: fleet.exit.static_pubkey,
             role: Role::Guard,
@@ -1865,16 +1876,17 @@ async fn two_backlogged_circuits_on_one_link_both_progress() {
         /// The longest a single circuit may hold the writer. Empirical: three
         /// times the worst skew measured under parallel load.
         const MAX_RUN: usize = 200;
-        /// Writer turns across the sends and the reads that must have had more
-        /// than one circuit queued. Measured floor over twelve runs was 1435,
-        /// so this sits about 30 percent under it. A run where no backlog
-        /// formed shows near zero (docs/DECISIONS.md entry 27).
+        /// Turns of the guard's writer that had more than one circuit queued.
+        /// Measured on the guard's own tally over five runs: 10512, 10582,
+        /// 10589, 10591, 10618, so the floor sits ten times above this bound.
+        /// A run where no backlog formed shows near zero, and a relay that
+        /// stops recording shows exactly zero, which is what the mutant for
+        /// this bound produces (docs/DECISIONS.md entries 27 and 41).
+        ///
+        /// The 1435 this comment carried before was a delta on the process wide
+        /// counter, a different quantity from a different commit, and it does
+        /// not describe the count read here.
         const MIN_CONTENDED_TURNS: u64 = 1000;
-        // Sampled here, before the sends. The socket absorbs megabytes, so the
-        // writer pops and orders almost every frame while this client is still
-        // sending; read from after the sends the counter shows zero and the
-        // test looks vacuous when it is not.
-        let contended_before = crate::metrics::writer_turn_count(true);
         let payload = Cell::new(CellType::Data, vec![0x3C; 400]).expect("data cell");
         for _ in 0..PER_CIRCUIT {
             for which in 0..CIRCUITS {
@@ -1914,7 +1926,13 @@ async fn two_backlogged_circuits_on_one_link_both_progress() {
         // A contended turn is one where the rotation held at least two
         // circuits, so with one frame queued at a time every writer looks fair
         // and the bound below is satisfied by a writer that never rotated.
-        let contended = crate::metrics::writer_turn_count(true) - contended_before;
+        // The guard's own tally, not the exported counter. That counter is per
+        // process, and a contended turn is recorded on any link holding more
+        // than one circuit, so the eight circuit budget test raises it too and
+        // a before and after delta here could be met by turns this test never
+        // caused. The guard is the relay whose writer chose the order the
+        // client read above, which is the order this test asserts on.
+        let contended = fleet.guard.turns.count(true);
         assert!(
             contended >= MIN_CONTENDED_TURNS,
             "only {contended} of the writer's turns had more than one circuit queued, \
@@ -2259,31 +2277,64 @@ async fn the_real_sdk_carries_a_full_window_in_both_directions() {
             .expect("the sending task panicked")
             .expect("the upload failed, which is what a client that breaks on a SENDME does");
 
-        // The precondition: SENDMEs actually crossed. Without this the test
-        // could pass on a window that was never exhausted and would say
-        // nothing about flow control at all.
+        // The precondition: every SENDME the window implies actually crossed,
+        // counted exactly. Without it the test could pass on a window that was
+        // never exhausted and would say nothing about flow control at all.
         //
         // Read off the exit this test started rather than off the exported
         // counter. That counter is per process, so any other test in this
         // binary that moves a window's worth of data raises it too, and a
         // before and after delta would pass on SENDMEs this circuit never sent.
-        let sent = fleet
-            .exit
-            .sendmes
-            .count(crate::metrics::SendmeDirection::Sent);
-        let received = fleet
-            .exit
-            .sendmes
-            .count(crate::metrics::SendmeDirection::Received);
+        //
+        // One SENDME per WINDOW_INCREMENT cells delivered, each way, derived
+        // from the two constants rather than written down.
+        const EXPECTED_SENDMES: u64 = (CELLS / flow::WINDOW_INCREMENT as usize) as u64;
+        let sent_now = || {
+            fleet
+                .exit
+                .sendmes
+                .count(crate::metrics::SendmeDirection::Sent)
+        };
+        let received_now = || {
+            fleet
+                .exit
+                .sendmes
+                .count(crate::metrics::SendmeDirection::Received)
+        };
+
+        // The last SENDMEs of the download are written by the client before the
+        // bytes they acknowledge reach this test, so read_exact can return
+        // while the exit has not read them yet. Waiting for the count is not
+        // the same as loosening it: the deadline fails the test rather than
+        // accepting a smaller number.
+        let settled = tokio::time::timeout(SENDME_SETTLE, async {
+            while sent_now() < EXPECTED_SENDMES || received_now() < EXPECTED_SENDMES {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
         assert!(
-            sent >= 2,
-            "the exit sent {sent} SENDMEs, so the upload never crossed a window boundary \
-             and this run says nothing about the client crediting one"
+            settled.is_ok(),
+            "after {TOTAL} bytes each way the exit had {} sent and {} received SENDMEs \
+             inside {SENDME_SETTLE:?}, under the {EXPECTED_SENDMES} each way that {CELLS} \
+             cells at a {} cell increment imply",
+            sent_now(),
+            received_now(),
+            flow::WINDOW_INCREMENT
         );
-        assert!(
-            received >= 2,
-            "the exit received {received} SENDMEs, so the download never crossed a window \
-             boundary and this run says nothing about the client sending one"
+        assert_eq!(
+            sent_now(),
+            EXPECTED_SENDMES,
+            "the exit sent {} SENDMEs for {CELLS} cells delivered to the destination, \
+             not the {EXPECTED_SENDMES} the window implies",
+            sent_now()
+        );
+        assert_eq!(
+            received_now(),
+            EXPECTED_SENDMES,
+            "the exit received {} SENDMEs for {CELLS} cells the client delivered, not the \
+             {EXPECTED_SENDMES} the window implies",
+            received_now()
         );
     })
     .await
@@ -3048,6 +3099,7 @@ async fn run_adverse_delivery_test() {
     let guard_hop = SpawnedRelay {
         budget: crate::link::Budget::new(),
         sendmes: crate::metrics::SendmeTally::new(),
+        turns: crate::metrics::WriterTurnTally::new(),
         addr: guard_via,
         static_pubkey: guard.static_pubkey,
         role: Role::Guard,
@@ -3060,6 +3112,7 @@ async fn run_adverse_delivery_test() {
             role: Role::Middle,
             budget: crate::link::Budget::new(),
             sendmes: crate::metrics::SendmeTally::new(),
+            turns: crate::metrics::WriterTurnTally::new(),
         })
         .await;
     client
@@ -3069,6 +3122,7 @@ async fn run_adverse_delivery_test() {
             role: Role::Exit,
             budget: crate::link::Budget::new(),
             sendmes: crate::metrics::SendmeTally::new(),
+            turns: crate::metrics::WriterTurnTally::new(),
         })
         .await;
 

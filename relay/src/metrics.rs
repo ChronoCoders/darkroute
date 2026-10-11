@@ -105,17 +105,49 @@ fn writer_turns() -> &'static IntCounterVec {
     })
 }
 
-/// One writer turn. `contended` means another circuit also had a frame waiting.
-pub fn record_writer_turn(contended: bool) {
-    let label = if contended { "true" } else { "false" };
-    writer_turns().with_label_values(&[label]).inc();
+/// One relay's writer turns, which record to the process counter as they count.
+///
+/// Same reason as `SendmeTally`: the exported counter is per process and every
+/// relay a test binary starts feeds it, so a test that reads the metric cannot
+/// tell its own links' turns from another test's.
+#[derive(Clone, Default)]
+pub struct WriterTurnTally {
+    counts: Arc<WriterTurnCounts>,
 }
 
-/// Current value of the writer turn counter. Test only.
-#[cfg(test)]
-pub fn writer_turn_count(contended: bool) -> u64 {
-    let label = if contended { "true" } else { "false" };
-    writer_turns().with_label_values(&[label]).get()
+#[derive(Default)]
+struct WriterTurnCounts {
+    contended: AtomicU64,
+    uncontended: AtomicU64,
+}
+
+impl WriterTurnTally {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// One writer turn. `contended` means another circuit also had a frame
+    /// waiting.
+    pub fn record(&self, contended: bool) {
+        self.slot(contended).fetch_add(1, Ordering::Relaxed);
+        writer_turns()
+            .with_label_values(&[if contended { "true" } else { "false" }])
+            .inc();
+    }
+
+    /// Turns this relay has recorded. Test only.
+    #[cfg(test)]
+    pub fn count(&self, contended: bool) -> u64 {
+        self.slot(contended).load(Ordering::Relaxed)
+    }
+
+    fn slot(&self, contended: bool) -> &AtomicU64 {
+        if contended {
+            &self.counts.contended
+        } else {
+            &self.counts.uncontended
+        }
+    }
 }
 
 /// Circuit-level SENDMEs this relay sent and received, which is how an operator

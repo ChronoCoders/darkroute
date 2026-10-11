@@ -315,6 +315,7 @@ async fn main() -> ExitCode {
         registry.clone(),
         link::Budget::new(),
         metrics::SendmeTally::new(),
+        metrics::WriterTurnTally::new(),
         Arc::new(OutboundRegistry::new()),
     ));
     let metrics_handle = tokio::spawn(metrics_accept_loop(metrics_listener, shutdown.clone()));
@@ -382,6 +383,7 @@ async fn accept_loop(
     registry: RegistryHandle,
     budget: link::Budget,
     sendmes: metrics::SendmeTally,
+    turns: metrics::WriterTurnTally,
     links: Arc<OutboundRegistry>,
 ) {
     loop {
@@ -396,6 +398,7 @@ async fn accept_loop(
                         cfg: cfg.clone(),
                         budget: budget.clone(),
                         sendmes: sendmes.clone(),
+                        turns: turns.clone(),
                         links: links.clone(),
                         authority: authority.clone(),
                         replay: replay.clone(),
@@ -452,6 +455,8 @@ struct ConnCtx {
     budget: link::Budget,
     /// This relay's own SENDME tally, which also feeds the process counter.
     sendmes: metrics::SendmeTally,
+    /// This relay's own writer turn tally, shared by every link it holds.
+    turns: metrics::WriterTurnTally,
     /// The outbound links this relay holds, one per next hop
     /// (ARCHITECTURE 5.10).
     links: Arc<OutboundRegistry>,
@@ -722,10 +727,15 @@ impl LinkShared {
     /// `capacity` is how many circuits this link carries: the client link cap
     /// for a client link, the configured relay link cap for a relay link
     /// (ARCHITECTURE 5.10).
-    fn new(role: LinkRole, capacity: usize, budget: link::Budget) -> Self {
+    fn new(
+        role: LinkRole,
+        capacity: usize,
+        budget: link::Budget,
+        turns: metrics::WriterTurnTally,
+    ) -> Self {
         Self {
             state: std::sync::Mutex::new(LinkState {
-                table: link::LinkTable::new(role, capacity, budget.clone()),
+                table: link::LinkTable::new(role, capacity, budget.clone(), turns),
                 handles: HashMap::new(),
                 control: VecDeque::new(),
             }),
@@ -734,6 +744,16 @@ impl LinkShared {
             closing: AtomicBool::new(false),
             budget,
         }
+    }
+
+    /// A link whose writer turns go to a tally of its own.
+    ///
+    /// Test only, for the same reason as `LinkTable::for_test`: a relay shares
+    /// one tally across its links, and a test that does not read the count does
+    /// not care which tally it got.
+    #[cfg(test)]
+    fn for_test(role: LinkRole, capacity: usize, budget: link::Budget) -> Self {
+        Self::new(role, capacity, budget, metrics::WriterTurnTally::new())
     }
 
     /// Ask the link to end. Idempotent, and safe from any circuit task.
@@ -891,6 +911,7 @@ async fn run_link(
         LinkRole::Responder,
         inbound_capacity(role, ctx.cfg.max_circuits_per_relay_link as usize),
         ctx.budget.clone(),
+        ctx.turns.clone(),
     ));
 
     let writer = tokio::spawn(run_link_writer(shared.clone(), w));
@@ -1003,6 +1024,7 @@ async fn dial_outbound_link(
     layers: Layers,
     capacity: usize,
     budget: &link::Budget,
+    turns: &metrics::WriterTurnTally,
 ) -> Result<OutboundLink, HandleError> {
     let mut stream = tls::dial_tls(connector, addr, tls_name, TLS_HANDSHAKE_TIMEOUT).await?;
     // bounded: TLS_HANDSHAKE_TIMEOUT, the same deadline as the dial. One byte,
@@ -1026,6 +1048,7 @@ async fn dial_outbound_link(
         LinkRole::Initiator,
         capacity,
         budget.clone(),
+        turns.clone(),
     ));
     let writer = tokio::spawn(run_link_writer(shared.clone(), write));
     Ok(OutboundLink {
@@ -1933,11 +1956,21 @@ async fn extend_to_next_hop(
     let cap = ctx.cfg.max_circuits_per_relay_link as usize;
     let connector = ctx.connector.clone();
     let budget = ctx.budget.clone();
+    let turns = ctx.turns.clone();
 
     let acquired = ctx
         .links
         .acquire(key, cap, move || async move {
-            dial_outbound_link(&connector, addr, &tls_name, frame_layers, cap, &budget).await
+            dial_outbound_link(
+                &connector,
+                addr,
+                &tls_name,
+                frame_layers,
+                cap,
+                &budget,
+                &turns,
+            )
+            .await
         })
         .await
         .map_err(HandleError::NextHop)?;
@@ -2136,7 +2169,7 @@ mod tests {
     /// full queue can do is refuse, and the caller counts the refusal.
     #[test]
     fn the_control_queue_fills_at_its_bound_and_refuses_past_it() {
-        let shared = Arc::new(LinkShared::new(
+        let shared = Arc::new(LinkShared::for_test(
             LinkRole::Responder,
             link::MAX_CIRCUITS_PER_LINK,
             link::Budget::new(),
@@ -2158,7 +2191,7 @@ mod tests {
     /// control frames queued is a peer that is behind, not a peer that is gone.
     #[test]
     fn the_control_queue_at_its_bound_does_not_close_the_link() {
-        let shared = Arc::new(LinkShared::new(
+        let shared = Arc::new(LinkShared::for_test(
             LinkRole::Responder,
             link::MAX_CIRCUITS_PER_LINK,
             link::Budget::new(),
@@ -2177,7 +2210,7 @@ mod tests {
     /// circuits those frames name are still alive (DECISIONS 23).
     #[test]
     fn a_refused_destroy_closes_the_link_and_is_counted() {
-        let shared = Arc::new(LinkShared::new(
+        let shared = Arc::new(LinkShared::for_test(
             LinkRole::Responder,
             link::MAX_CIRCUITS_PER_LINK,
             link::Budget::new(),
@@ -2206,7 +2239,7 @@ mod tests {
     /// reach for an id this side has just let go.
     #[test]
     fn closing_the_link_releases_every_circuit_and_quarantines_its_id() {
-        let shared = Arc::new(LinkShared::new(
+        let shared = Arc::new(LinkShared::for_test(
             LinkRole::Responder,
             link::MAX_CIRCUITS_PER_LINK,
             link::Budget::new(),
@@ -2243,7 +2276,7 @@ mod tests {
     /// backpressure rather than a permanent close.
     #[test]
     fn a_drained_control_frame_frees_one_slot() {
-        let shared = Arc::new(LinkShared::new(
+        let shared = Arc::new(LinkShared::for_test(
             LinkRole::Responder,
             link::MAX_CIRCUITS_PER_LINK,
             link::Budget::new(),
@@ -2270,7 +2303,7 @@ mod tests {
     /// to the peer while the circuit it names is already gone.
     #[test]
     fn control_frames_precede_circuit_data() {
-        let shared = Arc::new(LinkShared::new(
+        let shared = Arc::new(LinkShared::for_test(
             LinkRole::Responder,
             link::MAX_CIRCUITS_PER_LINK,
             link::Budget::new(),
@@ -2366,7 +2399,7 @@ mod tests {
     /// Time is paused, so the 120 seconds are accounted and not waited for.
     #[tokio::test(start_paused = true)]
     async fn a_write_that_never_progresses_closes_the_link() {
-        let shared = Arc::new(LinkShared::new(
+        let shared = Arc::new(LinkShared::for_test(
             LinkRole::Responder,
             link::MAX_CIRCUITS_PER_LINK,
             link::Budget::new(),
@@ -2408,7 +2441,7 @@ mod tests {
         const CONTROL: usize = 4;
 
         let budget = link::Budget::new();
-        let shared = Arc::new(LinkShared::new(
+        let shared = Arc::new(LinkShared::for_test(
             LinkRole::Initiator,
             link::MAX_CIRCUITS_PER_LINK,
             budget.clone(),
@@ -2471,7 +2504,7 @@ mod tests {
     /// Requested with every test still passing (mutant M6b).
     #[test]
     fn ending_an_outbound_link_tells_every_circuit_the_link_was_lost() {
-        let shared = Arc::new(LinkShared::new(
+        let shared = Arc::new(LinkShared::for_test(
             LinkRole::Initiator,
             link::MAX_CIRCUITS_PER_LINK,
             link::Budget::new(),
@@ -2528,7 +2561,7 @@ mod tests {
     #[test]
     fn the_control_queue_bound_follows_the_links_capacity() {
         const CAP: usize = 70;
-        let shared = Arc::new(LinkShared::new(
+        let shared = Arc::new(LinkShared::for_test(
             LinkRole::Responder,
             CAP,
             link::Budget::new(),
@@ -2550,7 +2583,7 @@ mod tests {
     /// closed the link rather than the link failing under this relay.
     #[test]
     fn releasing_an_inbound_link_names_the_reason_it_is_given() {
-        let shared = Arc::new(LinkShared::new(
+        let shared = Arc::new(LinkShared::for_test(
             LinkRole::Initiator,
             link::MAX_CIRCUITS_PER_LINK,
             link::Budget::new(),
@@ -2628,7 +2661,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_circuit_on_a_stalled_outbound_link_sends_link_lost_upstream() {
         let layers = Layers::new(3);
-        let upstream = Arc::new(LinkShared::new(
+        let upstream = Arc::new(LinkShared::for_test(
             LinkRole::Responder,
             link::MAX_CIRCUITS_PER_LINK,
             link::Budget::new(),
@@ -2690,7 +2723,7 @@ mod tests {
     /// ordinary close gives (ARCHITECTURE 5.11).
     #[tokio::test(start_paused = true)]
     async fn a_stalled_outbound_link_closes_and_releases_its_circuits() {
-        let shared = Arc::new(LinkShared::new(
+        let shared = Arc::new(LinkShared::for_test(
             LinkRole::Initiator,
             link::MAX_CIRCUITS_PER_LINK,
             link::Budget::new(),
@@ -2844,7 +2877,7 @@ mod tests {
     /// A write that lands one second inside the deadline does not close it.    /// A write that lands one second inside the deadline does not close it.    /// A write that lands one second inside the deadline does not close it.
     #[tokio::test(start_paused = true)]
     async fn a_write_that_lands_inside_the_deadline_does_not_close_the_link() {
-        let shared = Arc::new(LinkShared::new(
+        let shared = Arc::new(LinkShared::for_test(
             LinkRole::Responder,
             link::MAX_CIRCUITS_PER_LINK,
             link::Budget::new(),
@@ -2928,7 +2961,7 @@ mod tests {
         const CIRCUITS: u8 = 4;
         const ROTATIONS: usize = 8;
 
-        let shared = Arc::new(LinkShared::new(
+        let shared = Arc::new(LinkShared::for_test(
             LinkRole::Responder,
             link::MAX_CIRCUITS_PER_LINK,
             link::Budget::new(),
@@ -2996,7 +3029,7 @@ mod tests {
         let acquired = registry
             .acquire(key, capacity, || async {
                 Ok::<_, HandleError>(OutboundLink {
-                    shared: Arc::new(LinkShared::new(
+                    shared: Arc::new(LinkShared::for_test(
                         LinkRole::Initiator,
                         capacity,
                         link::Budget::new(),
